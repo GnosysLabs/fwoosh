@@ -104,6 +104,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::device_identity,
             commands::create_room,
+            commands::join_room,
             commands::send_clip,
             commands::recent_clips,
             commands::search_clips,

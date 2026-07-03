@@ -18,6 +18,7 @@
   let clips = $state<ClipDto[]>([]);
   let query = $state("");
   let pairingUri = $state("");
+  let joinUri = $state("");
   let showPairing = $state(false);
   let inRoom = $state(false);
   let toast = $state<ToastInfo | null>(null);
@@ -148,6 +149,21 @@
     if (s < 86400) return `${Math.floor(s / 3600)}h`;
     return `${Math.floor(s / 86400)}d`;
   }
+
+  async function joinRoom() {
+    if (!joinUri.trim()) return;
+    try {
+      await invoke("join_room", { uri: joinUri });
+      inRoom = true;
+      joinUri = "";
+      status = "ok";
+      statusMsg = "Joined room — listening for clips";
+      setTimeout(() => (status = "idle"), 2000);
+    } catch (e) {
+      status = "err";
+      statusMsg = String(e);
+    }
+  }
 </script>
 
 <svelte:window on:keydown={onKeydown} />
@@ -202,6 +218,13 @@
           <div class="room-actions">
             <button class="ghost" onclick={createRoom}>Create a room</button>
           </div>
+          <div class="divider"><span>or</span></div>
+          <input
+            class="join-input"
+            placeholder="Paste a pairing code…"
+            bind:value={joinUri}
+            onkeydown={(e) => e.key === "Enter" && joinRoom()} />
+          <button class="ghost" onclick={joinRoom} disabled={!joinUri.trim()}>Join room</button>
         </div>
       {/if}
     </div>
@@ -409,6 +432,33 @@
   }
   .room-actions {
     margin-top: 8px;
+  }
+  .divider {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 12px 0 8px;
+    color: #3f3f46;
+    font-size: 11px;
+  }
+  .divider::before,
+  .divider::after {
+    content: "";
+    flex: 1;
+    height: 1px;
+    background: #2a2a32;
+  }
+  .join-input {
+    background: #121217;
+    border: 1px solid #2a2a32;
+    border-radius: 8px;
+    color: #e4e4e7;
+    padding: 7px 10px;
+    font-size: 11px;
+    outline: none;
+    margin-bottom: 6px;
+    width: 100%;
+    box-sizing: border-box;
   }
   .ghost {
     background: transparent;

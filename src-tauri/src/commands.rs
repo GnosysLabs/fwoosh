@@ -35,6 +35,9 @@ pub struct AppState {
     pub last_msg_id: Mutex<Option<String>>,
     /// Handle to the subscriber task (so we can shut it down on topic change).
     pub subscriber_shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// A pending join: (topic, admin_pub) trusted from a pairing URI, until the
+    /// admin's signed genesis roster arrives and is verified.
+    pub pending_admin: Mutex<Option<(String, crate::crypto::Ed25519PubKey)>>,
 }
 
 /// A partially-received clip awaiting all its chunks.
@@ -53,6 +56,7 @@ impl AppState {
             pending: Mutex::new(HashMap::new()),
             last_msg_id: Mutex::new(None),
             subscriber_shutdown: Mutex::new(None),
+            pending_admin: Mutex::new(None),
         }
     }
 }
@@ -87,6 +91,7 @@ pub fn device_identity(state: State<'_, Arc<AppState>>) -> String {
 #[tauri::command]
 pub async fn create_room(
     state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
     label: String,
 ) -> Result<String, String> {
     let topic = roster::new_topic();
@@ -96,11 +101,69 @@ pub async fn create_room(
     let verified = VerifiedRoster::verify_first(signed).map_err(|e| e.to_string())?;
     *state.roster.lock().await = Some(verified);
 
+    // Spawn the subscriber so we receive clips from paired devices.
+    start_subscriber(&state, &app, &topic).await;
+
     let secret = crate::pairing::random_secret();
     let uri = crate::pairing::build_uri(&topic, &state.device.signing_pub, &secret);
     // NOTE: in a full impl, `secret` is stored briefly (single-use) so we can
     // verify incoming join proofs. For the MVP local-loop we return the URI.
     Ok(uri)
+}
+
+/// Spawn (or replace) the ntfy subscriber for the given topic. Messages are
+/// reassembled + verified + decrypted via `handle_relay_message`.
+async fn start_subscriber(state: &Arc<AppState>, app: &tauri::AppHandle, topic: &str) {
+    // Shut down any existing subscriber (e.g. on topic rotation).
+    if let Some(tx) = state.subscriber_shutdown.lock().await.take() {
+        let _ = tx.send(());
+    }
+
+    let base = state.ntfy_base.lock().await.clone();
+    let since = state.last_msg_id.lock().await.clone();
+    let cfg = ntfy::SubscribeConfig {
+        base,
+        topic: topic.to_string(),
+        since,
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<ntfy::RelayMessage>(64);
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    ntfy::spawn_subscriber(cfg, tx, shutdown_rx);
+
+    // Pump received messages into handle_relay_message, capturing the app
+    // handle + state for the task.
+    let state_clone = state.clone();
+    let app_clone = app.clone();
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if !msg.payload.is_empty() {
+                *state_clone.last_msg_id.lock().await = Some(msg.id.clone());
+                handle_relay_message(&state_clone, &app_clone, msg).await;
+            }
+        }
+    });
+
+    *state.subscriber_shutdown.lock().await = Some(shutdown_tx);
+}
+
+/// Join an existing room from a pairing URI. For the MVP this parses the URI,
+/// records the admin identity + topic, and starts the subscriber. The actual
+/// roster is adopted when the admin's signed genesis entry arrives over the
+/// relay (and is verified against `admin_pub` from the URI). The full HMAC
+/// proof-of-knowledge handshake is layered on top in a follow-up.
+#[tauri::command]
+pub async fn join_room(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    uri: String,
+) -> Result<(), String> {
+    let invite = crate::pairing::parse_uri(&uri).map_err(|e| e.to_string())?;
+    // Record the trusted admin identity so we can verify the genesis entry when
+    // it arrives. Stored separately from the roster (which stays None until the
+    // signed entry is received + verified).
+    *state.pending_admin.lock().await = Some((invite.topic.clone(), invite.admin_pub));
+    start_subscriber(&state, &app, &invite.topic).await;
+    Ok(())
 }
 
 /// Send a clip to all devices in the current roster. Manual-send only (no auto
@@ -118,6 +181,16 @@ pub async fn send_clip(
     let epoch = verified.epoch();
     let topic = verified.topic().to_string();
     drop(guard);
+
+    // Max-size guard: warn (don't hard-block) on very large clips. The chunking
+    // handles it, but huge clips eat the daily ntfy quota fast.
+    const MAX_RECOMMENDED_BYTES: usize = 100_000;
+    if text.len() > MAX_RECOMMENDED_BYTES {
+        return Err(format!(
+            "Clip is {} KB — that's a lot to sync over the free relay. Trim it or use a self-hosted server.",
+            text.len() / 1024
+        ));
+    }
 
     let policy = if private { StorePolicy::Private } else { StorePolicy::History };
     let now = std::time::SystemTime::now()
