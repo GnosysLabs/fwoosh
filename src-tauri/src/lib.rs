@@ -1,6 +1,7 @@
 pub mod crypto;
 pub mod keychain;
 pub mod ntfy;
+pub mod pairing;
 pub mod roster;
 pub mod store;
 

@@ -44,6 +44,7 @@ tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "sync", "macr
 tokio-tungstenite = { version = "0.29.0", features = ["native-tls"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "native-tls"] }
 futures-util = "0.3.32"
+hmac = "0.13.0"
 
 [patch.crates-io]
 # Replace tauri-winres with a no-op so the build does not require the MSVC
