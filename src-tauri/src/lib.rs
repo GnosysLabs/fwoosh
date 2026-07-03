@@ -1,5 +1,6 @@
 pub mod crypto;
 pub mod keychain;
+pub mod roster;
 pub mod store;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/

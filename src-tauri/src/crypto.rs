@@ -52,7 +52,7 @@ const CLIP_NONCE_LEN: usize = 24; // XChaCha20-Poly1305 nonce length (XNonce)
 const SIG_DOMAIN: &[u8] = b"ClipVault envelope v1";
 
 /// X25519 public key bytes (32). Wrapped for serde + newtype semantics.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct X25519PubKey(pub [u8; 32]);
 
