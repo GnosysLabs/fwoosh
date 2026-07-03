@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: clipvault-windows
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: clipvault-macos-arm64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: clipvault-macos-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install Linux system deps (Tauri)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev patchelf libssl-dev libglib2.0-dev libgtk-3-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install JS deps + build frontend
+        run: |
+          npm install
+          npm run build
+
+      - name: Build Tauri app
+        working-directory: src-tauri
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          # The no-op tauri-winres patch is only needed on the dev machine
+          # (missing MSVC headers). CI has a complete toolchain, so we drop
+          # the patch by not applying it — the real tauri-winres builds fine.
+          CARGO_NET_OFFLINE: "false"
+
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        run: |
+          mkdir -p out
+          cp src-tauri/target/x86_64-pc-windows-msvc/release/clipvault.exe out/
+          cd out && 7z a ../${{ matrix.artifact }}.zip clipvault.exe
+      - name: Package macOS
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p out
+          cp src-tauri/target/${{ matrix.target }}/release/clipvault out/
+          cd out && tar czf ../${{ matrix.artifact }}.tar.gz clipvault
+
+      - name: Generate SHA-256 checksum
+        shell: bash
+        run: |
+          if [ -f "${{ matrix.artifact }}.zip" ]; then
+            sha256sum ${{ matrix.artifact }}.zip > ${{ matrix.artifact }}.sha256
+          else
+            shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.sha256
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}.zip
+            ${{ matrix.artifact }}.tar.gz
+            ${{ matrix.artifact }}.sha256
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
