@@ -37,6 +37,13 @@ bytes = { version = "1.12.0", features = ["serde"] }
 hex = "0.4.3"
 keyring = "4.1.2"
 redb = "4.1.0"
+tokio = { version = "1.52.3", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
+# Use native-tls (Windows SChannel / macOS SecureTransport): uses the OS TLS
+# stack with NO C compilation. rustls's providers (ring, aws-lc-rs) both need a
+# C compile, which fails on this machine's incomplete VS C++ install.
+tokio-tungstenite = { version = "0.29.0", features = ["native-tls"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "native-tls"] }
+futures-util = "0.3.32"
 
 [patch.crates-io]
 # Replace tauri-winres with a no-op so the build does not require the MSVC
