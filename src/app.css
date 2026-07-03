@@ -1,0 +1,19 @@
+@import "tailwindcss";
+
+/* ClipVault popup styling. The window is borderless + transparent, so the
+   root provides the visible rounded card + drop shadow. */
+:root {
+  color-scheme: dark;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, system-ui,
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  overflow: hidden;
+  user-select: none;
+}
