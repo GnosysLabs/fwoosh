@@ -1,7 +1,0 @@
-[package]
-name = "tauri-winres"
-version = "0.3.6"
-edition = "2021"
-description = "No-op replacement for tauri-winres (skips Windows resource compilation)."
-
-[dependencies]

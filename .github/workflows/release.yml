@@ -46,9 +46,6 @@ jobs:
         working-directory: src-tauri
         run: cargo build --release --target ${{ matrix.target }}
         env:
-          # The no-op tauri-winres patch is only needed on the dev machine
-          # (missing MSVC headers). CI has a complete toolchain, so we drop
-          # the patch by not applying it — the real tauri-winres builds fine.
           CARGO_NET_OFFLINE: "false"
 
       - name: Package Windows

@@ -147,12 +147,19 @@ mod tests {
 
     #[test]
     fn db_key_roundtrips_when_available() {
-        // Use a per-test entry to avoid clobbering the real one.
-        let entry = Entry::new(SERVICE, "test-db-key").unwrap();
+        // Use a per-test entry to avoid clobbering the real one. If the OS has
+        // no usable credential store in this environment (e.g. headless test
+        // runner), skip gracefully rather than fail.
+        let entry = match Entry::new(SERVICE, "test-db-key") {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("skipping: no keychain backend available ({e})");
+                return;
+            }
+        };
         let key = [7u8; 32];
-        // Best-effort: if the platform has no keychain, skip gracefully.
         if entry.set_secret(&key).is_err() {
-            eprintln!("skipping: no keychain backend available");
+            eprintln!("skipping: keychain backend present but write failed");
             return;
         }
         let got = entry.get_secret().unwrap();

@@ -88,11 +88,11 @@ cd src-tauri && cargo build --release
 cd src-tauri && cargo test --lib
 ```
 
-> **Note on the dev environment:** the original development machine had an
-> incomplete VS 2026 install (missing MSVC headers). The build works around it
-> with a no-op `tauri-winres` patch and pure-Rust/native-TLS deps. CI builds
-> with a complete toolchain — prefer CI (`release.yml`) for distributable
-> binaries with proper icon/manifest embedding.
+> **Windows + Git Bash:** because Git Bash's `/usr/bin/link` (GNU coreutils)
+> shadows MSVC's `link.exe` in PATH, builds from Git Bash use
+> `src-tauri/cargo-dev.cmd` (which loads `vcvars64.bat`) and a linker pin in
+> `.cargo/config.toml`. This is purely a shell-PATH issue, not a project
+> workaround — PowerShell, cmd, and CI all build normally.
 
 ## Project layout
 
@@ -100,7 +100,7 @@ cd src-tauri && cargo test --lib
 src-tauri/src/
   crypto.rs    X25519+Ed25519+HPKE+XChaCha20Poly1305 signed envelopes
   roster.rs    admin-signed, hash-chained membership log (epochs, revoke)
-  store.rs     encrypted local history (redb, separate DB key)
+  store.rs     encrypted local history (SQLite, separate DB key)
   keychain.rs  OS credential storage (device keys + history key)
   ntfy.rs      TLS-enforced publish + WSS subscribe + reconnect
   pairing.rs   URI/QR encode + HMAC proof-of-knowledge

@@ -228,27 +228,27 @@ pub async fn send_clip(
 /// Get the most recent N clips from local history.
 #[tauri::command]
 pub fn recent_clips(state: State<'_, Arc<AppState>>, limit: Option<i64>) -> Result<Vec<ClipDto>, String> {
-    let clips = state.store.recent(limit.unwrap_or(50) as usize).map_err(|e| e.to_string())?;
+    let clips = state.store.recent(limit.unwrap_or(50)).map_err(|e| e.to_string())?;
     Ok(clips.into_iter().map(ClipDto::from).collect())
 }
 
 /// Search local history.
 #[tauri::command]
 pub fn search_clips(state: State<'_, Arc<AppState>>, query: String) -> Result<Vec<ClipDto>, String> {
-    let clips = state.store.search(&query, 50).map_err(|e| e.to_string())?;
+    let clips = state.store.search(&query, 50_i64).map_err(|e| e.to_string())?;
     Ok(clips.into_iter().map(ClipDto::from).collect())
 }
 
 /// Delete a clip from local history by id.
 #[tauri::command]
-pub fn delete_clip(state: State<'_, Arc<AppState>>, id: u64) -> Result<(), String> {
+pub fn delete_clip(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
     state.store.delete(id).map_err(|e| e.to_string())
 }
 
 /// A clip DTO for the frontend (no raw key bytes; sender shown as short hex).
 #[derive(serde::Serialize)]
 pub struct ClipDto {
-    pub id: u64,
+    pub id: i64,
     pub sender: String,
     pub ts: u64,
     pub text: String,
