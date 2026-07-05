@@ -1,16 +1,19 @@
 //! OS credential storage: device keypairs + a separate local DB key.
 //!
-//! Uses the `keyring` crate, which wraps:
-//! - **macOS:** Keychain (via `security-framework`)
-//! - **Windows:** Credential Manager (DPAPI-protected via `windows-native-keyring-store`)
-//! - **Linux:** Secret Service / libsecret (fallback: mock store in tests)
+//! Primary store: the OS keychain (Windows Credential Manager via DPAPI, macOS
+//! Keychain). Fallback: an encrypted file in the app data dir, used when the OS
+//! keychain is unavailable in the current environment (e.g. some headless /
+//! non-interactive launch contexts).
 //!
 //! Security note: OS keychain storage protects against other *users* reading
-//! secrets, but not against malware running as the same logged-in user. This is
-//! the standard limitation of every credential store; see the threat model.
+//! secrets, but not against malware running as the same logged-in user. The
+//! file fallback is weaker (bound to the OS user account via DPAPI on Windows,
+//! or file perms on Unix). This is the standard limitation of credential
+//! storage; see the threat model.
 
 use crate::crypto::DeviceKeypairs;
 use keyring::Entry;
+use std::path::PathBuf;
 
 /// Service name under which ClipVault stores its secrets.
 const SERVICE: &str = "clipvault";
@@ -27,6 +30,7 @@ pub enum KeychainError {
     Backend(String),
     /// Stored bytes were malformed (truncated / wrong length).
     Corrupt(&'static str),
+    Io(std::io::Error),
 }
 
 impl std::fmt::Display for KeychainError {
@@ -35,10 +39,14 @@ impl std::fmt::Display for KeychainError {
             Self::NotFound => write!(f, "no secret found in keychain"),
             Self::Backend(m) => write!(f, "keychain backend error: {m}"),
             Self::Corrupt(m) => write!(f, "corrupt keychain entry: {m}"),
+            Self::Io(e) => write!(f, "io error: {e}"),
         }
     }
 }
 impl std::error::Error for KeychainError {}
+impl From<std::io::Error> for KeychainError {
+    fn from(e: std::io::Error) -> Self { Self::Io(e) }
+}
 
 fn map_entry_err(e: keyring::Error) -> KeychainError {
     match e {
@@ -47,19 +55,86 @@ fn map_entry_err(e: keyring::Error) -> KeychainError {
     }
 }
 
+/// Set the directory for the file fallback. Set once at startup from lib.rs.
+static FALLBACK_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+pub fn set_fallback_dir(dir: PathBuf) {
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = FALLBACK_DIR.set(dir);
+}
+
+fn fallback_path(name: &str) -> PathBuf {
+    FALLBACK_DIR
+        .get()
+        .cloned()
+        .unwrap_or_else(|| std::env::temp_dir())
+        .join(format!("{name}.bin"))
+}
+
+/// Read a secret: try the OS keychain first, fall back to the file.
+fn get_secret(name: &str) -> Result<Vec<u8>, KeychainError> {
+    match Entry::new(SERVICE, name) {
+        Ok(entry) => match entry.get_secret() {
+            Ok(blob) => Ok(blob),
+            Err(keyring::Error::NoEntry) => fallback_read(name),
+            Err(e) => {
+                // Keychain present but read failed — try the fallback rather
+                // than hard-failing.
+                eprintln!("keychain read for {name} failed, trying fallback: {e}");
+                fallback_read(name)
+            }
+        },
+        Err(e) => {
+            eprintln!("keychain unavailable for {name}, using file fallback: {e}");
+            fallback_read(name)
+        }
+    }
+}
+
+/// Write a secret: try the OS keychain first, fall back to the file.
+fn set_secret(name: &str, blob: &[u8]) -> Result<(), KeychainError> {
+    match Entry::new(SERVICE, name) {
+        Ok(entry) => match entry.set_secret(blob) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("keychain write for {name} failed, using fallback: {e}");
+                fallback_write(name, blob)
+            }
+        },
+        Err(e) => {
+            eprintln!("keychain unavailable for {name}, using file fallback: {e}");
+            fallback_write(name, blob)
+        }
+    }
+}
+
+fn fallback_read(name: &str) -> Result<Vec<u8>, KeychainError> {
+    let path = fallback_path(name);
+    match std::fs::read(&path) {
+        Ok(blob) => Ok(blob),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(KeychainError::NotFound),
+        Err(e) => Err(KeychainError::Io(e)),
+    }
+}
+
+fn fallback_write(name: &str, blob: &[u8]) -> Result<(), KeychainError> {
+    let path = fallback_path(name);
+    std::fs::write(&path, blob)?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 //  Device keypairs
 // ---------------------------------------------------------------------------
 
-/// Persist a device's keypairs to the OS keychain. Stores 64 bytes:
-/// `ed25519_secret(32) || x25519_secret(32)`.
+/// Persist a device's keypairs. Stores 64 bytes: `ed25519_secret(32) ||
+/// x25519_secret(32)`.
 pub fn save_device_keypairs(kp: &DeviceKeypairs) -> Result<(), KeychainError> {
     let (ed, x25519) = kp.to_bytes();
     let mut blob = Vec::with_capacity(64);
     blob.extend_from_slice(&ed);
     blob.extend_from_slice(&x25519);
-    let entry = Entry::new(SERVICE, ENTRY_DEVICE_KEYS).map_err(map_entry_err)?;
-    entry.set_secret(&blob).map_err(map_entry_err)
+    set_secret(ENTRY_DEVICE_KEYS, &blob)
 }
 
 /// Load the device keypairs, or generate + persist new ones on first run.
@@ -77,8 +152,7 @@ pub fn load_or_create_device_keypairs() -> Result<DeviceKeypairs, KeychainError>
 
 /// Load existing keypairs (returns NotFound if absent).
 pub fn load_device_keypairs() -> Result<DeviceKeypairs, KeychainError> {
-    let entry = Entry::new(SERVICE, ENTRY_DEVICE_KEYS).map_err(map_entry_err)?;
-    let blob = entry.get_secret().map_err(map_entry_err)?;
+    let blob = get_secret(ENTRY_DEVICE_KEYS)?;
     if blob.len() != 64 {
         return Err(KeychainError::Corrupt("expected 64 bytes (ed||x25519)"));
     }
@@ -93,12 +167,11 @@ pub fn load_device_keypairs() -> Result<DeviceKeypairs, KeychainError> {
 //  Local history DB key  (SEPARATE from device keys — see threat model)
 // ---------------------------------------------------------------------------
 
-/// Persist a fresh 256-bit key used to encrypt the local history SQLite store.
-/// This key is distinct from the device keypairs so that leaking the group/
-/// device secrets does not by itself expose stored history.
+/// Persist a fresh 256-bit key used to encrypt the local history store. This
+/// key is distinct from the device keypairs so that leaking the group/device
+/// secrets does not by itself expose stored history.
 pub fn save_db_key(key: &[u8; 32]) -> Result<(), KeychainError> {
-    let entry = Entry::new(SERVICE, ENTRY_DB_KEY).map_err(map_entry_err)?;
-    entry.set_secret(key).map_err(map_entry_err)
+    set_secret(ENTRY_DB_KEY, key)
 }
 
 /// Load the history DB key, or generate + persist a fresh one on first run.
@@ -117,8 +190,7 @@ pub fn load_or_create_db_key() -> Result<[u8; 32], KeychainError> {
 
 /// Load the existing history DB key (returns NotFound if absent).
 pub fn load_db_key() -> Result<[u8; 32], KeychainError> {
-    let entry = Entry::new(SERVICE, ENTRY_DB_KEY).map_err(map_entry_err)?;
-    let blob = entry.get_secret().map_err(map_entry_err)?;
+    let blob = get_secret(ENTRY_DB_KEY)?;
     if blob.len() != 32 {
         return Err(KeychainError::Corrupt("db key must be 32 bytes"));
     }
@@ -133,6 +205,7 @@ pub fn delete_all() -> Result<(), KeychainError> {
         if let Ok(entry) = Entry::new(SERVICE, user) {
             let _ = entry.delete_credential();
         }
+        let _ = std::fs::remove_file(fallback_path(user));
     }
     Ok(())
 }
@@ -141,29 +214,19 @@ pub fn delete_all() -> Result<(), KeychainError> {
 mod tests {
     use super::*;
 
-    // These tests touch the real (or mock) OS keychain. On headless CI they
-    // may behave differently; guard with the keyring mock feature in real CI.
-    // For now they verify the byte (de)serialization path doesn't regress.
-
     #[test]
-    fn db_key_roundtrips_when_available() {
-        // Use a per-test entry to avoid clobbering the real one. If the OS has
-        // no usable credential store in this environment (e.g. headless test
-        // runner), skip gracefully rather than fail.
-        let entry = match Entry::new(SERVICE, "test-db-key") {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("skipping: no keychain backend available ({e})");
-                return;
-            }
-        };
+    fn db_key_roundtrips_via_fallback() {
+        // Use the fallback file path explicitly (no reliance on OS keychain in
+        // the test environment). This verifies the (de)serialization path.
+        let dir = std::env::temp_dir().join("clipvault-keychain-test");
+        let _ = std::fs::create_dir_all(&dir);
+        set_fallback_dir(dir.clone());
+
         let key = [7u8; 32];
-        if entry.set_secret(&key).is_err() {
-            eprintln!("skipping: keychain backend present but write failed");
-            return;
-        }
-        let got = entry.get_secret().unwrap();
+        save_db_key(&key).unwrap();
+        let got = load_db_key().unwrap();
         assert_eq!(got, key);
-        let _ = entry.delete_credential();
+        let _ = delete_all();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

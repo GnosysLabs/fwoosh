@@ -408,12 +408,13 @@ pub async fn copy_to_clipboard(text: String) -> Result<(), String> {
     Ok(())
 }
 
-/// History DB path helper (for main.rs to pass into AppState).
+/// History DB path helper (kept for external/test use; the main app inlines
+/// the same computation in lib.rs setup).
 pub fn history_db_path(app: &tauri::AppHandle) -> PathBuf {
     let dir = app
         .path()
         .app_data_dir()
         .unwrap_or_else(|_| std::env::temp_dir());
     let _ = std::fs::create_dir_all(&dir);
-    dir.join("history.redb")
+    dir.join("history.db")
 }

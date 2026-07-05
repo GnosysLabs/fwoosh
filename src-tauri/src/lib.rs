@@ -55,12 +55,20 @@ pub fn run() {
             None,
         ))
         .setup(|app| {
-            // --- Load device keypairs + history DB from the OS keychain ---
+            // --- Load device keypairs + history DB key ---
+            // Set the file-fallback dir for the keychain (used if the OS
+            // credential store isn't available in this launch context).
+            let app_data = app
+                .path()
+                .app_data_dir()
+                .unwrap_or_else(|_| std::env::temp_dir());
+            keychain::set_fallback_dir(app_data.clone());
+
             let device = keychain::load_or_create_device_keypairs()
-                .expect("failed to load device keypairs from keychain");
+                .expect("failed to load device keypairs (and no file fallback)");
             let db_key = keychain::load_or_create_db_key()
-                .expect("failed to load history DB key from keychain");
-            let db_path = commands::history_db_path(&app.handle());
+                .expect("failed to load history DB key (and no file fallback)");
+            let db_path = app_data.join("history.db");
             let store = store::HistoryStore::open(&db_path, &db_key)
                 .expect("failed to open history store");
 
