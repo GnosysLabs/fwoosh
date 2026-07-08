@@ -73,6 +73,20 @@ pub fn run() {
                 .expect("failed to open history store");
 
             let state = Arc::new(AppState::new(device, store));
+
+            // Set the roster persistence path + load any saved room.
+            let roster_path = app_data.join("roster.bin");
+            if let Ok(mut rp) = state.roster_path.try_lock() {
+                *rp = Some(roster_path.clone());
+            }
+            if let Some(entry) = commands::load_persisted_roster(&roster_path) {
+                if let Ok(v) = roster::VerifiedRoster::verify_first(entry) {
+                    if let Ok(mut r) = state.roster.try_lock() {
+                        *r = Some(v);
+                    }
+                }
+            }
+
             app.manage(state.clone());
 
             // --- Tray icon + menu ---
@@ -113,6 +127,7 @@ pub fn run() {
             commands::device_identity,
             commands::create_room,
             commands::join_room,
+            commands::room_state,
             commands::send_clip,
             commands::recent_clips,
             commands::search_clips,

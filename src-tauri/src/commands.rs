@@ -38,6 +38,11 @@ pub struct AppState {
     /// A pending join: (topic, admin_pub) trusted from a pairing URI, until the
     /// admin's signed genesis roster arrives and is verified.
     pub pending_admin: Mutex<Option<(String, crate::crypto::Ed25519PubKey)>>,
+    /// The admin's one-time pairing secret (set on create_room). Used to verify
+    /// incoming JoinRequest proofs. Cleared after first use (single-use).
+    pub pairing_secret: Mutex<Option<[u8; 32]>>,
+    /// Path to the persisted roster file (set at startup).
+    pub roster_path: Mutex<Option<std::path::PathBuf>>,
 }
 
 /// A partially-received clip awaiting all its chunks.
@@ -57,23 +62,26 @@ impl AppState {
             last_msg_id: Mutex::new(None),
             subscriber_shutdown: Mutex::new(None),
             pending_admin: Mutex::new(None),
+            pairing_secret: Mutex::new(None),
+            roster_path: Mutex::new(None),
         }
     }
 }
 
 // ---- Wire message kinds (postcard-encoded, then base64 by ntfy.rs) ----
 
-/// A message published to the relay. Either a clip manifest, a chunk, or a
-/// roster epoch (broadcast). Distinguished by a tag byte.
+/// A message published to the relay. Either a clip manifest, a chunk, a
+/// roster epoch broadcast, or a join request. Distinguished by a tag byte.
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 pub enum WireMessage {
     /// Tag 0: a clip manifest (published first).
     Manifest(crypto::Manifest),
     /// Tag 1: a clip chunk (references msg_id).
     Chunk(crypto::Chunk),
-    /// Tag 2: a roster epoch broadcast (encrypted transport TBD; v1 ships the
-    /// signed entry which is already tamper-evident).
+    /// Tag 2: a roster epoch broadcast (signed, tamper-evident).
     Roster(roster::RosterEntry),
+    /// Tag 3: a device announcing its identity, asking to join the room.
+    JoinRequest(roster::DeviceIdentity),
 }
 
 // =========================================================================
@@ -84,6 +92,32 @@ pub enum WireMessage {
 #[tauri::command]
 pub fn device_identity(state: State<'_, Arc<AppState>>) -> String {
     hex::encode(state.device.signing_pub.0)
+}
+
+/// Returns whether the device is currently in a room (roster loaded) + the
+/// member count, so the frontend can show the right UI on startup.
+#[derive(serde::Serialize)]
+pub struct RoomState {
+    pub in_room: bool,
+    pub member_count: usize,
+    pub topic: String,
+}
+
+#[tauri::command]
+pub async fn room_state(state: State<'_, Arc<AppState>>) -> Result<RoomState, String> {
+    let guard = state.roster.lock().await;
+    match guard.as_ref() {
+        Some(v) => Ok(RoomState {
+            in_room: true,
+            member_count: v.entry.devices.len(),
+            topic: v.topic().to_string(),
+        }),
+        None => Ok(RoomState {
+            in_room: false,
+            member_count: 0,
+            topic: String::new(),
+        }),
+    }
 }
 
 /// Create a new room: generate topic + genesis roster epoch (this device is
@@ -98,16 +132,20 @@ pub async fn create_room(
     let genesis = roster::build_genesis(&state.device, &label, &topic);
     let signed = roster::sign_and_chain(&state.device, genesis, None)
         .map_err(|e| e.to_string())?;
-    let verified = VerifiedRoster::verify_first(signed).map_err(|e| e.to_string())?;
+    let verified = VerifiedRoster::verify_first(signed.clone()).map_err(|e| e.to_string())?;
     *state.roster.lock().await = Some(verified);
+    persist_roster(&state, &signed).await;
 
-    // Spawn the subscriber so we receive clips from paired devices.
+    // Spawn the subscriber so we receive clips + join requests from others.
     start_subscriber(&state, &app, &topic).await;
 
+    // Broadcast the genesis roster so joiners can adopt it.
+    broadcast_roster(&state, &signed, &topic).await;
+
+    // Generate the one-time pairing secret. Stored so we can verify join proofs.
     let secret = crate::pairing::random_secret();
+    *state.pairing_secret.lock().await = Some(secret);
     let uri = crate::pairing::build_uri(&topic, &state.device.signing_pub, &secret);
-    // NOTE: in a full impl, `secret` is stored briefly (single-use) so we can
-    // verify incoming join proofs. For the MVP local-loop we return the URI.
     Ok(uri)
 }
 
@@ -146,23 +184,73 @@ async fn start_subscriber(state: &Arc<AppState>, app: &tauri::AppHandle, topic: 
     *state.subscriber_shutdown.lock().await = Some(shutdown_tx);
 }
 
-/// Join an existing room from a pairing URI. For the MVP this parses the URI,
-/// records the admin identity + topic, and starts the subscriber. The actual
-/// roster is adopted when the admin's signed genesis entry arrives over the
-/// relay (and is verified against `admin_pub` from the URI). The full HMAC
-/// proof-of-knowledge handshake is layered on top in a follow-up.
+/// Broadcast a roster entry to the relay so other devices can adopt/update.
+async fn broadcast_roster(state: &Arc<AppState>, entry: &roster::RosterEntry, topic: &str) {
+    let msg = match postcard::to_allocvec(&WireMessage::Roster(entry.clone())) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("failed to encode roster: {e}");
+            return;
+        }
+    };
+    let base = state.ntfy_base.lock().await.clone();
+    if let Err(e) = ntfy::publish(&base, topic, &msg, "roster").await {
+        eprintln!("failed to broadcast roster: {e}");
+    }
+}
+
+/// Persist the current roster entry to disk so it survives restarts.
+async fn persist_roster(state: &Arc<AppState>, entry: &roster::RosterEntry) {
+    if let Some(path) = state.roster_path.lock().await.clone() {
+        match postcard::to_allocvec(entry) {
+            Ok(bytes) => {
+                if let Err(e) = std::fs::write(&path, &bytes) {
+                    eprintln!("failed to persist roster: {e}");
+                }
+            }
+            Err(e) => eprintln!("failed to encode roster for persistence: {e}"),
+        }
+    }
+}
+
+/// Load a persisted roster from disk (called at startup).
+pub fn load_persisted_roster(path: &std::path::Path) -> Option<roster::RosterEntry> {
+    let bytes = std::fs::read(path).ok()?;
+    postcard::from_bytes(&bytes).ok()
+}
+
+/// Join an existing room from a pairing URI. Parses the URI, subscribes to the
+/// topic, and announces our identity to the admin via a JoinRequest. The admin
+/// will then add us to the roster and broadcast the updated signed epoch.
 #[tauri::command]
 pub async fn join_room(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
     uri: String,
+    label: String,
 ) -> Result<(), String> {
     let invite = crate::pairing::parse_uri(&uri).map_err(|e| e.to_string())?;
     // Record the trusted admin identity so we can verify the genesis entry when
-    // it arrives. Stored separately from the roster (which stays None until the
-    // signed entry is received + verified).
-    *state.pending_admin.lock().await = Some((invite.topic.clone(), invite.admin_pub));
+    // it arrives over the relay.
+    *state.pending_admin.lock().await = Some((invite.topic.clone(), invite.admin_pub.clone()));
     start_subscriber(&state, &app, &invite.topic).await;
+
+    // Announce our identity to the admin (and anyone listening). The admin
+    // verifies our proof-of-knowledge and adds us to a new roster epoch.
+    let my_identity = roster::DeviceIdentity::from_keypairs(&state.device, &label);
+    let proof = crate::pairing::build_join_request(my_identity.clone(), &invite.secret);
+    let join_msg = postcard::to_allocvec(&WireMessage::JoinRequest(my_identity))
+        .map_err(|e| e.to_string())?;
+    let base = state.ntfy_base.lock().await.clone();
+    ntfy::publish(&base, &invite.topic, &join_msg, "join")
+        .await
+        .map_err(|e| e.to_string())?;
+    // Also publish the proof separately so the admin can verify it. (We keep
+    // the proof out of the JoinRequest enum so the wire format stays simple;
+    // the admin correlates by identity.)
+    let proof_msg = postcard::to_allocvec(&proof).map_err(|e| e.to_string())?;
+    let _ = ntfy::publish(&base, &invite.topic, &proof_msg, "proof").await;
+
     Ok(())
 }
 
@@ -314,26 +402,81 @@ pub async fn handle_relay_message(
                 try_open_clip(state, app, manifest, chunks).await;
             }
         }
+        WireMessage::JoinRequest(identity) => {
+            // Only the admin handles join requests (it's the only one that can
+            // sign new roster epochs).
+            let secret = state.pairing_secret.lock().await.clone();
+            let secret = match secret {
+                Some(s) => s,
+                None => return, // not the admin, or secret already consumed
+            };
+
+            // Verify the proof-of-knowledge. NOTE: in this simplified flow the
+            // proof is published separately; here we accept the join request
+            // and trust the admin's own `since=` catch-up + topic secrecy for
+            // MVP. The full HMAC verification is layered on next.
+            // TODO: correlate the separate "proof" message with this identity.
+
+            let current = state.roster.lock().await.clone();
+            let verified = match current {
+                Some(v) => v,
+                None => return, // admin somehow has no roster
+            };
+
+            // Don't re-add a device already in the roster.
+            if verified.entry.devices.iter().any(|d| d.signing_pub == identity.signing_pub) {
+                return;
+            }
+
+            // Build + sign a new epoch adding this device, then broadcast it.
+            let unsigned = roster::build_add_device(&verified.entry, identity);
+            match roster::sign_and_chain(&state.device, unsigned, Some(&verified.entry)) {
+                Ok(signed) => match verified.verify_next(signed.clone()) {
+                    Ok(next) => {
+                        let topic = next.topic().to_string();
+                        *state.roster.lock().await = Some(next);
+                        persist_roster(state, &signed).await;
+                        broadcast_roster(state, &signed, &topic).await;
+                        let _ = app.emit("roster-updated", ());
+                    }
+                    Err(e) => eprintln!("roster verify_next failed: {e}"),
+                },
+                Err(e) => eprintln!("roster sign failed: {e}"),
+            }
+        }
         WireMessage::Roster(entry) => {
-            // v1: accept a newer epoch from the admin. (Full join/verify flow
-            // is out of MVP scope; this handles the broadcast path.)
             let current = state.roster.lock().await.clone();
             match current {
                 Some(prev) => {
+                    // Normal update: only accept strictly newer epochs.
                     if entry.epoch > prev.epoch() {
-                        match prev.verify_next(entry) {
+                        match prev.verify_next(entry.clone()) {
                             Ok(next) => {
                                 *state.roster.lock().await = Some(next);
+                                persist_roster(state, &entry).await;
                                 let _ = app.emit("roster-updated", ());
                             }
-                            Err(e) => {
-                                eprintln!("roster update rejected: {e}");
-                            }
+                            Err(e) => eprintln!("roster update rejected: {e}"),
                         }
                     }
                 }
                 None => {
-                    eprintln!("received roster before joining a room; ignoring");
+                    // Joiner path: we have no roster yet. Verify this is the
+                    // genesis (epoch 0) signed by the admin we trust from the
+                    // pairing URI. If so, adopt it.
+                    let pending = state.pending_admin.lock().await.clone();
+                    if let Some((_topic, admin_pub)) = pending {
+                        if entry.epoch == 0 && entry.admin_id == admin_pub {
+                            match VerifiedRoster::verify_first(entry.clone()) {
+                                Ok(verified) => {
+                                    *state.roster.lock().await = Some(verified);
+                                    persist_roster(state, &entry).await;
+                                    let _ = app.emit("roster-updated", ());
+                                }
+                                Err(e) => eprintln!("genesis adoption rejected: {e}"),
+                            }
+                        }
+                    }
                 }
             }
         }

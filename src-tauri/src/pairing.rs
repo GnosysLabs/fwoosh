@@ -22,6 +22,7 @@
 use crate::crypto::Ed25519PubKey;
 use crate::roster::DeviceIdentity;
 use base64::Engine;
+use serde::{Deserialize, Serialize};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
@@ -67,7 +68,7 @@ pub struct PairingInvite {
 }
 
 /// A device's join request: identity + proof MAC. Sent to the admin.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct JoinRequest {
     pub identity: DeviceIdentity,
     pub nonce: [u8; 16],

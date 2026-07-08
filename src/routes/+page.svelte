@@ -44,7 +44,17 @@
       try {
         clips = await invoke<ClipDto[]>("recent_clips", { limit: 50 });
       } catch {
-        /* not in a room yet, or store empty */
+        /* store empty */
+      }
+
+      // Check if we're already in a room (e.g. after restart).
+      try {
+        const rs = await invoke<{ in_room: boolean; member_count: number; topic: string }>(
+          "room_state"
+        );
+        inRoom = rs.in_room;
+      } catch {
+        /* ignore */
       }
 
       unlisteners.push(
@@ -58,6 +68,14 @@
       unlisteners.push(
         await listen("clip-stored", async () => {
           clips = await invoke<ClipDto[]>("recent_clips", { limit: 50 });
+        })
+      );
+      unlisteners.push(
+        await listen("roster-updated", async () => {
+          const rs = await invoke<{ in_room: boolean; member_count: number; topic: string }>(
+            "room_state"
+          );
+          inRoom = rs.in_room;
         })
       );
     })();
@@ -153,12 +171,11 @@
   async function joinRoom() {
     if (!joinUri.trim()) return;
     try {
-      await invoke("join_room", { uri: joinUri });
-      inRoom = true;
+      await invoke("join_room", { uri: joinUri, label: "My device" });
       joinUri = "";
       status = "ok";
-      statusMsg = "Joined room — listening for clips";
-      setTimeout(() => (status = "idle"), 2000);
+      statusMsg = "Joining room — waiting for admin to add you…";
+      setTimeout(() => (status = "idle"), 4000);
     } catch (e) {
       status = "err";
       statusMsg = String(e);
