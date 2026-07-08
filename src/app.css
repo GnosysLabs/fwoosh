@@ -1,7 +1,7 @@
 @import "tailwindcss";
 
 /* Fwoosh popup styling. The window is borderless + transparent, so the
-   root provides the visible rounded card + drop shadow. */
+   Svelte root provides the visible rounded card. */
 :root {
   color-scheme: dark;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
@@ -17,7 +17,6 @@ body {
   margin: 0;
   padding: 0;
   background: transparent;
-  border-radius: 14px;
   overflow: hidden;
   user-select: none;
 }

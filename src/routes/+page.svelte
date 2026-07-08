@@ -3,15 +3,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import { writeText } from "@tauri-apps/plugin-clipboard-manager";
-  import {
-    isPermissionGranted,
-    onAction,
-    registerActionTypes,
-    requestPermission,
-  } from "@tauri-apps/plugin-notification";
-
-  const NOTIFICATION_ACTION_TYPE = "fwoosh-clip-copy";
+  import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 
   type Theme = "dark" | "light";
 
@@ -36,9 +28,7 @@
   let deletingAll = $state(false);
   let logoSrc = $derived(theme === "dark" ? "/fwoosh_light.webp" : "/fwoosh_dark.webp");
   let historySearching = $derived(query.trim().length > 0);
-  let nextNotificationId = 1;
   let toastTimer: ReturnType<typeof setTimeout> | null = null;
-  const notificationClips = new Map<number, string>();
 
   interface ClipDto {
     id: number;
@@ -74,22 +64,6 @@
     setTheme(preferredTheme);
 
     (async () => {
-      try {
-        await registerActionTypes([
-          {
-            id: NOTIFICATION_ACTION_TYPE,
-            actions: [{ id: "copy", title: "Copy" }],
-          },
-        ]);
-        const actionListener = await onAction((payload) => {
-          const clipId = notificationClipId(payload);
-          if (clipId !== null) void copyNotificationClip(clipId);
-        });
-        unlisteners.push(() => actionListener.unregister());
-      } catch {
-        /* notification actions are optional; direct click still works */
-      }
-
       try {
         clips = await invoke<ClipDto[]>("recent_clips", { limit: 50 });
       } catch {
@@ -179,7 +153,7 @@
 
   async function copyText(value: string, preview = "Copied to clipboard") {
     try {
-      await writeText(value);
+      await invoke("copy_to_clipboard", { text: value });
       showToast({ sender: "you", preview, text: value }, 1500);
     } catch {
       /* ignore */
@@ -198,6 +172,14 @@
         toastTimer = null;
       }, ttlMs);
     }
+  }
+
+  function clearToast() {
+    if (toastTimer) {
+      clearTimeout(toastTimer);
+      toastTimer = null;
+    }
+    toast = null;
   }
 
   async function delClip(id: number) {
@@ -243,12 +225,16 @@
 
   async function handleIncomingClip(p: ToastInfo) {
     showToast(p);
-    if (await shouldNotifyInSystem()) {
+    const attention = await windowAttentionState();
+    if (attention.notify) {
       await notifyIncoming(p);
+    }
+    if (attention.revealForCopy) {
+      await showMainWindow();
     }
   }
 
-  async function shouldNotifyInSystem() {
+  async function windowAttentionState() {
     try {
       const win = getCurrentWindow();
       const [visible, minimized, focused] = await Promise.all([
@@ -256,35 +242,21 @@
         win.isMinimized(),
         win.isFocused(),
       ]);
-      return !visible || minimized || !focused;
+      return {
+        notify: !visible || minimized || !focused,
+        revealForCopy: !visible || minimized,
+      };
     } catch {
-      return true;
+      return { notify: true, revealForCopy: true };
     }
   }
 
-  function rememberNotificationClip(text: string) {
-    const id = nextNotificationId;
-    nextNotificationId = nextNotificationId >= 2_000_000_000 ? 1 : nextNotificationId + 1;
-    notificationClips.set(id, text);
-    setTimeout(() => notificationClips.delete(id), 5 * 60 * 1000);
-    return id;
-  }
-
-  function notificationClipId(payload: unknown): number | null {
-    const p = payload as {
-      id?: number;
-      data?: { fwooshClipId?: unknown };
-      extra?: { clipId?: unknown };
-    };
-    const raw = p.extra?.clipId ?? p.data?.fwooshClipId ?? p.id;
-    const id = typeof raw === "string" ? Number(raw) : raw;
-    return typeof id === "number" && Number.isFinite(id) ? id : null;
-  }
-
-  async function copyNotificationClip(id: number) {
-    const clip = notificationClips.get(id);
-    if (!clip) return;
-    await copyText(clip);
+  async function showMainWindow() {
+    try {
+      await invoke("show_main_window");
+    } catch {
+      /* optional fallback */
+    }
   }
 
   async function notifyIncoming(p: ToastInfo) {
@@ -293,28 +265,19 @@
       if (!granted) granted = (await requestPermission()) === "granted";
       if (!granted) return;
 
-      const id = rememberNotificationClip(p.text);
-      const notification = new Notification("Fwoosh", {
-        id,
-        body: `${p.sender}: ${p.preview}\nClick to copy`,
-        icon: "/fwoosh_icon3.png",
-        tag: `fwoosh-${id}`,
-        data: { fwooshClipId: id },
-        actionTypeId: NOTIFICATION_ACTION_TYPE,
-        extra: { clipId: id },
-        autoCancel: true,
-      } as NotificationOptions & {
-        id: number;
-        actionTypeId: string;
-        extra: { clipId: number };
-        autoCancel: boolean;
-      });
-      notification.onclick = () => {
-        void copyNotificationClip(id);
-        notification.close();
-      };
+      await invoke("notify_incoming_clip", { sender: p.sender, preview: p.preview });
     } catch {
       /* notifications optional */
+    }
+  }
+
+  async function copyToastText() {
+    if (!toast) return;
+    try {
+      await invoke("copy_to_clipboard", { text: toast.text });
+      clearToast();
+    } catch {
+      /* ignore */
     }
   }
 
@@ -623,7 +586,7 @@
           private.</p
         >
         <code class="pair-code">{pairingUri}</code>
-        <button class="ghost" onclick={() => writeText(pairingUri)}
+        <button class="ghost" onclick={() => copyText(pairingUri, "Pairing code copied")}
           >Copy pairing code</button
         >
         <button class="send-btn" onclick={() => (showPairing = false)}>Done</button>
@@ -667,27 +630,23 @@
   {/if}
 
   {#if toast}
-    <div
-      class="toast"
-      role="button"
-      tabindex="0"
-      onclick={() => {
-        if (toast) {
-          writeText(toast.text);
-          toast = null;
-        }
-      }}
-      onkeydown={(e) => {
-        if ((e.key === "Enter" || e.key === " ") && toast) {
-          e.preventDefault();
-          writeText(toast.text);
-          toast = null;
-        }
-      }}
-    >
-      <div class="toast-sender">{toast.sender}</div>
-      <div class="toast-preview">{toast.preview}</div>
-      <div class="toast-hint">click to copy</div>
+    <div class="toast" role="status">
+      <button class="toast-copy" onclick={() => void copyToastText()}>
+        <span class="toast-sender">{toast.sender}</span>
+        <span class="toast-preview">{toast.preview}</span>
+        <span class="toast-hint">click to copy</span>
+      </button>
+      <button
+        class="toast-dismiss"
+        aria-label="Dismiss notification"
+        title="Dismiss"
+        onclick={clearToast}
+      >
+        <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M6 6l12 12" />
+          <path d="M18 6 6 18" />
+        </svg>
+      </button>
     </div>
   {/if}
 
@@ -701,19 +660,30 @@
 
 <style>
   .card {
+    --window-radius: 14px;
+    --window-stroke: #2a2a32;
+    --window-stroke-inset: 1px;
     position: relative;
     width: 100vw;
     height: 100vh;
     background: #1a1a1f;
-    border-radius: 14px;
-    box-shadow:
-      0 12px 40px rgba(0, 0, 0, 0.5),
-      inset 0 0 0 1px #2a2a32;
+    border-radius: var(--window-radius);
     display: flex;
     flex-direction: column;
     overflow: hidden;
     border: none;
-    clip-path: inset(0 round 14px);
+    box-shadow: none;
+    box-sizing: border-box;
+  }
+  .card::before {
+    content: "";
+    position: absolute;
+    inset: var(--window-stroke-inset);
+    z-index: 50;
+    pointer-events: none;
+    border: 1px solid var(--window-stroke);
+    border-radius: calc(var(--window-radius) - var(--window-stroke-inset));
+    box-sizing: border-box;
   }
 
   .header {
@@ -1304,18 +1274,56 @@
     left: 12px;
     right: 36px;
     z-index: 11;
+    display: flex;
+    align-items: stretch;
     background: #6366f1;
     color: #fff;
     border-radius: 10px;
-    padding: 10px 14px;
-    cursor: pointer;
+    overflow: hidden;
     box-shadow: 0 6px 20px rgba(99, 102, 241, 0.4);
   }
+  .toast-copy {
+    flex: 1;
+    min-width: 0;
+    display: block;
+    padding: 10px 10px 10px 14px;
+    background: transparent;
+    border: none;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .toast-copy:hover {
+    background: rgba(255, 255, 255, 0.08);
+  }
+  .toast-copy:focus-visible,
+  .toast-dismiss:focus-visible {
+    outline: 2px solid rgba(255, 255, 255, 0.64);
+    outline-offset: -2px;
+  }
+  .toast-dismiss {
+    flex: 0 0 30px;
+    width: 30px;
+    margin: 6px 6px 6px 0;
+    display: grid;
+    place-items: center;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    border-radius: 7px;
+    color: rgba(255, 255, 255, 0.82);
+    cursor: pointer;
+  }
+  .toast-dismiss:hover {
+    background: rgba(255, 255, 255, 0.16);
+    color: #fff;
+  }
   .toast-sender {
+    display: block;
     font-size: 11px;
     opacity: 0.8;
   }
   .toast-preview {
+    display: block;
     font-size: 13px;
     margin-top: 2px;
     overflow: hidden;
@@ -1323,16 +1331,15 @@
     white-space: nowrap;
   }
   .toast-hint {
+    display: block;
     font-size: 10px;
     opacity: 0.7;
     margin-top: 3px;
   }
 
   :global(html[data-theme="light"]) .card {
+    --window-stroke: #c9d6e6;
     background: #f8fbff;
-    box-shadow:
-      0 12px 36px rgba(30, 41, 59, 0.22),
-      inset 0 0 0 1px #c9d6e6;
   }
   :global(html[data-theme="light"]) .header {
     border-bottom-color: #d8e2ef;

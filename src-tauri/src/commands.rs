@@ -21,6 +21,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
+use tauri_plugin_clipboard_manager::ClipboardExt;
+use tauri_plugin_notification::NotificationExt;
 use tokio::sync::Mutex;
 
 const PAIRING_SECRET_TTL_SECS: u64 = 10 * 60;
@@ -645,6 +647,35 @@ pub async fn delete_all_clips(
     Ok(())
 }
 
+pub fn reveal_main_window(app: &tauri::AppHandle) -> Result<(), String> {
+    let win = app
+        .get_webview_window("main")
+        .ok_or_else(|| "main window not found".to_string())?;
+
+    let _ = win.unminimize();
+    win.show().map_err(|e| e.to_string())?;
+    win.set_focus().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
+    reveal_main_window(&app)
+}
+
+#[tauri::command]
+pub fn notify_incoming_clip(
+    app: tauri::AppHandle,
+    sender: String,
+    preview: String,
+) -> Result<(), String> {
+    app.notification()
+        .builder()
+        .title("Fwoosh")
+        .body(format!("{sender}: {preview}\nOpen Fwoosh to copy"))
+        .show()
+        .map_err(|e| e.to_string())
+}
+
 /// A clip DTO for the frontend (no raw key bytes; sender shown as short hex).
 #[derive(serde::Serialize)]
 pub struct ClipDto {
@@ -1084,11 +1115,8 @@ async fn apply_roster_update(
 
 /// Copy text to the system clipboard (called from frontend on click-to-copy).
 #[tauri::command]
-pub async fn copy_to_clipboard(text: String) -> Result<(), String> {
-    // Delegate to the clipboard-manager plugin from the frontend instead; this
-    // is a fallback. Returns Ok for now.
-    let _ = text;
-    Ok(())
+pub async fn copy_to_clipboard(app: tauri::AppHandle, text: String) -> Result<(), String> {
+    app.clipboard().write_text(text).map_err(|e| e.to_string())
 }
 
 /// History DB path helper (kept for external/test use; the main app inlines

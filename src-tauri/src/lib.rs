@@ -18,15 +18,27 @@ use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
 /// Toggle the popup window: show + focus, or hide if already visible.
 fn toggle_popup(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
-        match win.is_visible() {
-            Ok(true) => {
-                let _ = win.hide();
-            }
-            _ => {
-                let _ = win.show();
-                let _ = win.set_focus();
-            }
+        let visible = win.is_visible().unwrap_or(false);
+        let minimized = win.is_minimized().unwrap_or(false);
+        let focused = win.is_focused().unwrap_or(false);
+
+        if visible && !minimized && focused {
+            let _ = win.hide();
+        } else {
+            let _ = commands::reveal_main_window(app);
         }
+    }
+}
+
+/// Show and focus the popup window.
+fn show_popup(app: &tauri::AppHandle) {
+    let _ = commands::reveal_main_window(app);
+}
+
+/// Hide the popup window.
+fn hide_popup(app: &tauri::AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.hide();
     }
 }
 
@@ -115,7 +127,7 @@ pub fn run() {
                 .menu(&menu)
                 .tooltip("Fwoosh")
                 .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => toggle_popup(app),
+                    "show" => show_popup(app),
                     "quit" => app.exit(0),
                     _ => {}
                 })
@@ -133,6 +145,8 @@ pub fn run() {
 
             // Hide the window on startup; it lives in the tray.
             if let Some(win) = app.get_webview_window("main") {
+                #[cfg(target_os = "windows")]
+                let _ = win.set_shadow(false);
                 let _ = win.hide();
             }
 
@@ -142,7 +156,7 @@ pub fn run() {
             // Hide instead of close so the app keeps running in the tray.
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
-                let _ = window.hide();
+                hide_popup(window.app_handle());
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -160,6 +174,8 @@ pub fn run() {
             commands::delete_clip,
             commands::delete_all_clips,
             commands::copy_to_clipboard,
+            commands::show_main_window,
+            commands::notify_incoming_clip,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Fwoosh");
