@@ -219,6 +219,27 @@ pub fn load_persisted_roster(path: &std::path::Path) -> Option<roster::RosterEnt
     postcard::from_bytes(&bytes).ok()
 }
 
+/// Leave the current room: clear the in-memory roster, stop the subscriber,
+/// delete the persisted roster file. The frontend then shows create/join again.
+#[tauri::command]
+pub async fn leave_room(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    // Stop the subscriber.
+    if let Some(tx) = state.subscriber_shutdown.lock().await.take() {
+        let _ = tx.send(());
+    }
+    // Clear in-memory state.
+    *state.roster.lock().await = None;
+    *state.pending_admin.lock().await = None;
+    *state.pairing_secret.lock().await = None;
+    *state.last_msg_id.lock().await = None;
+    state.pending.lock().await.clear();
+    // Delete the persisted roster so restart doesn't rejoin.
+    if let Some(path) = state.roster_path.lock().await.clone() {
+        let _ = std::fs::remove_file(&path);
+    }
+    Ok(())
+}
+
 /// Join an existing room from a pairing URI. Parses the URI, subscribes to the
 /// topic, and announces our identity to the admin via a JoinRequest. The admin
 /// will then add us to the roster and broadcast the updated signed epoch.

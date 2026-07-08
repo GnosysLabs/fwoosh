@@ -168,6 +168,17 @@
     return `${Math.floor(s / 86400)}d`;
   }
 
+  async function leaveRoom() {
+    try {
+      await invoke("leave_room");
+      inRoom = false;
+      status = "idle";
+    } catch (e) {
+      status = "err";
+      statusMsg = String(e);
+    }
+  }
+
   async function joinRoom() {
     if (!joinUri.trim()) return;
     try {
@@ -202,6 +213,9 @@
         class:active={activeView === "history"}
         onclick={() => (activeView = "history")}>History</button
       >
+      {#if inRoom}
+        <button class="tab leave" onclick={leaveRoom} title="Leave room">✕</button>
+      {/if}
     </div>
   </header>
 
@@ -362,6 +376,14 @@
   .tab.active {
     background: #2a2a32;
     color: #e4e4e7;
+  }
+  .tab.leave {
+    color: #5c5c66;
+    margin-left: 4px;
+    padding: 4px 7px;
+  }
+  .tab.leave:hover {
+    color: #f87171;
   }
 
   .compose {

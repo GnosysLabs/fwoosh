@@ -127,6 +127,7 @@ pub fn run() {
             commands::device_identity,
             commands::create_room,
             commands::join_room,
+            commands::leave_room,
             commands::room_state,
             commands::send_clip,
             commands::recent_clips,
