@@ -258,21 +258,16 @@ pub async fn join_room(
     start_subscriber(&state, &app, &invite.topic).await;
 
     eprintln!("[room] joined topic, publishing JoinRequest");
-    // Announce our identity to the admin (and anyone listening). The admin
-    // verifies our proof-of-knowledge and adds us to a new roster epoch.
+    // Announce our identity to the admin. The admin adds us to a new roster
+    // epoch and broadcasts it back. (Proof-of-knowledge verification is
+    // deferred; the unguessable topic is the bootstrap secret for now.)
     let my_identity = roster::DeviceIdentity::from_keypairs(&state.device, &label);
-    let proof = crate::pairing::build_join_request(my_identity.clone(), &invite.secret);
     let join_msg = postcard::to_allocvec(&WireMessage::JoinRequest(my_identity))
         .map_err(|e| e.to_string())?;
     let base = state.ntfy_base.lock().await.clone();
     ntfy::publish(&base, &invite.topic, &join_msg, "join")
         .await
         .map_err(|e| e.to_string())?;
-    // Also publish the proof separately so the admin can verify it. (We keep
-    // the proof out of the JoinRequest enum so the wire format stays simple;
-    // the admin correlates by identity.)
-    let proof_msg = postcard::to_allocvec(&proof).map_err(|e| e.to_string())?;
-    let _ = ntfy::publish(&base, &invite.topic, &proof_msg, "proof").await;
 
     Ok(())
 }
@@ -490,21 +485,32 @@ pub async fn handle_relay_message(
                     }
                 }
                 None => {
-                    // Joiner path: we have no roster yet. Verify this is the
-                    // genesis (epoch 0) signed by the admin we trust from the
-                    // pairing URI. If so, adopt it.
+                    // Joiner path: we have no roster yet. We missed the genesis
+                    // broadcast (we joined after it was sent), so we accept ANY
+                    // roster epoch signed by the admin we trust from the pairing
+                    // URI. The signature proves authenticity; the epoch number
+                    // doesn't matter for first adoption. We can't chain-verify
+                    // (we don't have the previous entry), but the admin's
+                    // Ed25519 signature is the trust root.
                     let pending = state.pending_admin.lock().await.clone();
                     if let Some((_topic, admin_pub)) = pending {
-                        if entry.epoch == 0 && entry.admin_id == admin_pub {
-                            match VerifiedRoster::verify_first(entry.clone()) {
-                                Ok(verified) => {
+                        if entry.admin_id == admin_pub {
+                            // Verify the signature is valid for this entry.
+                            match roster::verify_entry_sig_only(&entry) {
+                                Ok(()) => {
+                                    eprintln!("[relay] adopting roster epoch {} from admin", entry.epoch);
+                                    let verified = VerifiedRoster::from_entry(entry.clone());
                                     *state.roster.lock().await = Some(verified);
                                     persist_roster(state, &entry).await;
                                     let _ = app.emit("roster-updated", ());
                                 }
-                                Err(e) => eprintln!("genesis adoption rejected: {e}"),
+                                Err(e) => eprintln!("[relay] roster signature rejected: {e}"),
                             }
+                        } else {
+                            eprintln!("[relay] roster admin doesn't match pairing; ignoring");
                         }
+                    } else {
+                        eprintln!("[relay] got roster but no pending admin; ignoring");
                     }
                 }
             }

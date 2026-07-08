@@ -166,6 +166,14 @@ fn verify_entry_sig(e: &RosterEntry) -> Result<(), RosterError> {
         .map_err(|_| RosterError::InvalidSignature)
 }
 
+/// Verify only the signature + internal consistency of an entry, without
+/// checking the chain (no previous entry needed). Used by the joiner path
+/// when it adopts a roster it didn't chain-verify.
+pub fn verify_entry_sig_only(e: &RosterEntry) -> Result<(), RosterError> {
+    VerifiedRoster::check_consistency(e)?;
+    verify_entry_sig(e)
+}
+
 // ===========================================================================
 //  A verified view of a roster entry + helpers to advance the chain.
 //  Mutations are admin-only and always produce a NEW epoch.
@@ -193,6 +201,15 @@ impl VerifiedRoster {
         Self::check_consistency(&entry)?;
         verify_entry_sig(&entry)?;
         Ok(Self { entry })
+    }
+
+    /// Construct a VerifiedRoster from an entry whose signature has already
+    /// been checked (via `verify_entry_sig_only`). Used by the joiner path
+    /// when it receives a non-genesis roster as its first entry (it missed the
+    /// genesis broadcast). The chain can't be verified without the previous
+    /// entry, but the admin's signature is the trust root.
+    pub fn from_entry(entry: RosterEntry) -> Self {
+        Self { entry }
     }
 
     /// Verify that `next` is a valid successor to `self`: sequential epoch,
