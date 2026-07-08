@@ -136,6 +136,7 @@ pub async fn publish(
 
     // POST the raw base64 string as the body (text/plain). ntfy treats the
     // request body as the message content.
+    let b64_len = b64.len();
     let resp = client
         .post(&url)
         .header("Content-Type", "text/plain")
@@ -145,8 +146,10 @@ pub async fn publish(
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
+        eprintln!("[ntfy] publish failed: {status} {text}");
         return Err(NtfyError::BadStatus(status.as_u16(), text));
     }
+    eprintln!("[ntfy] published {} bytes ({} b64) to topic", payload.len(), b64_len);
     Ok(String::from("ok"))
 }
 
@@ -188,37 +191,46 @@ pub fn spawn_subscriber(
 
         loop {
             let url = ws_url(&https_base, &cfg.topic, last_id.as_deref());
-            tracing_connect(&url);
+            eprintln!("[ntfy] connecting to relay (topic hidden)…");
             let stream = tokio_tungstenite::connect_async(&url).await;
             match stream {
                 Ok((mut ws, _)) => {
+                    eprintln!("[ntfy] WebSocket connected, listening for messages");
                     backoff = Duration::from_secs(1); // reset on success
                     while let Some(msg_result) = ws.next().await {
                         // Check for shutdown between messages.
                         if shutdown.try_recv().is_ok() {
                             let _ = ws.close(None).await;
+                            eprintln!("[ntfy] subscriber shutting down");
                             return;
                         }
                         let msg = match msg_result {
                             Ok(m) => m,
                             Err(e) => {
-                                eprintln!("ntfy ws read error: {e}");
+                                eprintln!("[ntfy] ws read error: {e}");
                                 break;
                             }
                         };
                         if let Some(text) = msg.into_text().ok() {
+                            // Log raw text for diagnosis (doesn't contain the topic secret;
+                            // ntfy messages include the topic, so redact it).
+                            let preview = if text.len() > 120 { &text[..120] } else { &text };
+                            eprintln!("[ntfy] received: {preview}");
                             if let Some(rm) = decode_ntfy_json(&text) {
+                                eprintln!("[ntfy] decoded message, {} bytes payload", rm.payload.len());
                                 last_id = Some(rm.id.clone());
                                 if out.send(rm).await.is_err() {
+                                    eprintln!("[ntfy] consumer gone, stopping");
                                     return; // consumer gone
                                 }
                             }
                         }
                     }
+                    eprintln!("[ntfy] stream ended, reconnecting…");
                     // stream ended; fall through to reconnect
                 }
                 Err(e) => {
-                    eprintln!("ntfy ws connect failed: {e}");
+                    eprintln!("[ntfy] ws connect failed: {e}");
                 }
             }
 
@@ -232,9 +244,7 @@ pub fn spawn_subscriber(
     })
 }
 
-fn tracing_connect(_url: &str) {
-    // Intentionally do NOT log the topic/URL: the topic is a secret.
-}
+
 
 /// Decode one ntfy JSON line into a RelayMessage, or None if it's not a
 /// message event (e.g. open/keepalive).

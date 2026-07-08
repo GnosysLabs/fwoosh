@@ -213,9 +213,6 @@
         class:active={activeView === "history"}
         onclick={() => (activeView = "history")}>History</button
       >
-      {#if inRoom}
-        <button class="tab leave" onclick={leaveRoom} title="Leave room">✕</button>
-      {/if}
     </div>
   </header>
 
@@ -257,6 +254,8 @@
             onkeydown={(e) => e.key === "Enter" && joinRoom()} />
           <button class="ghost" onclick={joinRoom} disabled={!joinUri.trim()}>Join room</button>
         </div>
+      {:else}
+        <button class="leave-link" onclick={leaveRoom}>Leave room</button>
       {/if}
     </div>
   {:else}
@@ -377,12 +376,20 @@
     background: #2a2a32;
     color: #e4e4e7;
   }
-  .tab.leave {
-    color: #5c5c66;
-    margin-left: 4px;
-    padding: 4px 7px;
+  .leave-link {
+    align-self: center;
+    margin: 0 auto;
+    margin-top: auto;
+    background: transparent;
+    border: none;
+    color: #4a4a52;
+    font-size: 11px;
+    cursor: pointer;
+    padding: 4px;
+    text-decoration: underline;
+    text-underline-offset: 2px;
   }
-  .tab.leave:hover {
+  .leave-link:hover {
     color: #f87171;
   }
 

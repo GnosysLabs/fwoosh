@@ -140,6 +140,7 @@ pub async fn create_room(
     start_subscriber(&state, &app, &topic).await;
 
     // Broadcast the genesis roster so joiners can adopt it.
+    eprintln!("[room] created room, broadcasting genesis roster");
     broadcast_roster(&state, &signed, &topic).await;
 
     // Generate the one-time pairing secret. Stored so we can verify join proofs.
@@ -256,6 +257,7 @@ pub async fn join_room(
     *state.pending_admin.lock().await = Some((invite.topic.clone(), invite.admin_pub.clone()));
     start_subscriber(&state, &app, &invite.topic).await;
 
+    eprintln!("[room] joined topic, publishing JoinRequest");
     // Announce our identity to the admin (and anyone listening). The admin
     // verifies our proof-of-knowledge and adds us to a new roster epoch.
     let my_identity = roster::DeviceIdentity::from_keypairs(&state.device, &label);
@@ -382,8 +384,14 @@ pub async fn handle_relay_message(
     msg: RelayMessage,
 ) {
     let wire: WireMessage = match postcard::from_bytes(&msg.payload) {
-        Ok(w) => w,
-        Err(_) => return,
+        Ok(w) => {
+            eprintln!("[relay] decoded wire message ({} bytes)", msg.payload.len());
+            w
+        }
+        Err(e) => {
+            eprintln!("[relay] failed to decode wire message: {e} ({} bytes)", msg.payload.len());
+            return;
+        }
     };
     match wire {
         WireMessage::Manifest(manifest) => {
@@ -424,10 +432,12 @@ pub async fn handle_relay_message(
             }
         }
         WireMessage::JoinRequest(identity) => {
+            eprintln!("[relay] JoinRequest from {} ({})", identity.label, hex::encode(&identity.signing_pub.0[..4]));
             // Only the admin handles join requests (it's the only one that can
             // sign new roster epochs). Gate on having a pairing secret set.
             let has_secret = state.pairing_secret.lock().await.is_some();
             if !has_secret {
+                eprintln!("[relay] not the admin (no pairing secret), ignoring join");
                 return; // not the admin
             }
 
@@ -463,6 +473,7 @@ pub async fn handle_relay_message(
             }
         }
         WireMessage::Roster(entry) => {
+            eprintln!("[relay] Roster epoch {} ({} devices)", entry.epoch, entry.devices.len());
             let current = state.roster.lock().await.clone();
             match current {
                 Some(prev) => {
