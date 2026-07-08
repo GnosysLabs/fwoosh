@@ -193,7 +193,10 @@ impl VerifiedRoster {
     /// `verify_next`.)
     pub fn verify_first(entry: RosterEntry) -> Result<Self, RosterError> {
         if entry.epoch != 0 {
-            return Err(RosterError::BadEpoch { got: entry.epoch, expected: 0 });
+            return Err(RosterError::BadEpoch {
+                got: entry.epoch,
+                expected: 0,
+            });
         }
         if entry.prev_hash != [0u8; 32] {
             return Err(RosterError::ChainBroken { epoch: 0 });
@@ -236,7 +239,10 @@ impl VerifiedRoster {
 
     /// True if `device_id` is an active (non-revoked) member.
     pub fn is_active(&self, device_id: &Ed25519PubKey) -> bool {
-        self.entry.devices.iter().any(|d| &d.signing_pub == device_id)
+        self.entry
+            .devices
+            .iter()
+            .any(|d| &d.signing_pub == device_id)
     }
 
     /// Active members as `Recipient`s (for `crypto::seal_clip`).
@@ -332,7 +338,9 @@ pub fn build_revoke_device(
         .clone();
 
     if revoked_id == &prev.admin_id {
-        return Err(RosterError::BadInput("cannot revoke the admin (transfer is out of v1)"));
+        return Err(RosterError::BadInput(
+            "cannot revoke the admin (transfer is out of v1)",
+        ));
     }
 
     let devices: Vec<DeviceIdentity> = prev
@@ -370,7 +378,10 @@ pub fn sign_and_chain(
         Some(p) => entry_hash(p),
         None => {
             if entry.epoch != 0 {
-                return Err(RosterError::BadEpoch { got: entry.epoch, expected: 0 });
+                return Err(RosterError::BadEpoch {
+                    got: entry.epoch,
+                    expected: 0,
+                });
             }
             [0u8; 32]
         }
@@ -399,7 +410,9 @@ pub fn new_topic() -> String {
 mod tests {
     use super::*;
 
-    fn gen_admin() -> DeviceKeypairs { DeviceKeypairs::generate() }
+    fn gen_admin() -> DeviceKeypairs {
+        DeviceKeypairs::generate()
+    }
 
     fn genesis(admin: &DeviceKeypairs, topic: &str) -> RosterEntry {
         let unsigned = build_genesis(admin, "admin-laptop", topic);
@@ -468,7 +481,11 @@ mod tests {
         let g_unsigned = build_genesis(&admin, "real-admin", &new_topic());
         // Mallory signs with her own key but keeps admin_id = real admin.
         let mut forged = g_unsigned;
-        forged.signature = mallory.signing.sign(&canonical_bytes(&forged)).to_bytes().to_vec();
+        forged.signature = mallory
+            .signing
+            .sign(&canonical_bytes(&forged))
+            .to_bytes()
+            .to_vec();
         let err = VerifiedRoster::verify_first(forged).unwrap_err();
         assert!(matches!(err, RosterError::InvalidSignature), "got {err:?}");
     }
@@ -493,7 +510,10 @@ mod tests {
         let g2 = genesis(&admin, &new_topic());
         let v0b = VerifiedRoster::verify_first(g2).unwrap();
         let err = v0b.verify_next(e1).unwrap_err();
-        assert!(matches!(err, RosterError::ChainBroken { .. }), "got {err:?}");
+        assert!(
+            matches!(err, RosterError::ChainBroken { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]

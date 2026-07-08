@@ -20,6 +20,8 @@ use std::sync::Mutex;
 
 /// Max clips retained in history (oldest evicted).
 const MAX_HISTORY: i64 = 500;
+/// Max successfully-opened relay message IDs retained for replay rejection.
+const MAX_SEEN_MESSAGES: i64 = 4096;
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -41,13 +43,16 @@ impl std::fmt::Display for StoreError {
 }
 impl std::error::Error for StoreError {}
 impl From<rusqlite::Error> for StoreError {
-    fn from(e: rusqlite::Error) -> Self { Self::Sqlite(e) }
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Sqlite(e)
+    }
 }
 
 /// A decrypted history row.
 #[derive(Clone, Debug)]
 pub struct HistoryClip {
     pub id: i64,
+    pub msg_id: Option<[u8; 16]>,
     pub sender_id: Ed25519PubKey,
     pub ts: u64,
     pub text: String,
@@ -68,17 +73,46 @@ impl HistoryStore {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS clips (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                msg_id      BLOB UNIQUE,
                 sender_id   BLOB NOT NULL,
                 ts          INTEGER NOT NULL,
                 nonce       BLOB NOT NULL,
                 ciphertext  BLOB NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_clips_ts ON clips(ts DESC);",
+            CREATE INDEX IF NOT EXISTS idx_clips_ts ON clips(ts DESC);
+
+            CREATE TABLE IF NOT EXISTS seen_messages (
+                msg_id      BLOB PRIMARY KEY,
+                ts          INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_seen_messages_ts
+                ON seen_messages(ts DESC);",
         )?;
+        Self::ensure_clip_msg_id_column(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             cipher: XChaCha20Poly1305::new(db_key.into()),
         })
+    }
+
+    fn ensure_clip_msg_id_column(conn: &Connection) -> Result<(), StoreError> {
+        let mut stmt = conn.prepare("PRAGMA table_info(clips)")?;
+        let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut has_msg_id = false;
+        for col in cols {
+            if col? == "msg_id" {
+                has_msg_id = true;
+                break;
+            }
+        }
+        if !has_msg_id {
+            conn.execute("ALTER TABLE clips ADD COLUMN msg_id BLOB", [])?;
+        }
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_clips_msg_id ON clips(msg_id)",
+            [],
+        )?;
+        Ok(())
     }
 
     /// Encrypt + insert a clip. Returns its row id.
@@ -88,6 +122,17 @@ impl HistoryStore {
         ts: u64,
         text: &str,
     ) -> Result<i64, StoreError> {
+        self.insert_with_msg_id(sender_id, ts, text, None)
+    }
+
+    /// Encrypt + insert a clip, optionally binding it to the relay message id.
+    pub fn insert_with_msg_id(
+        &self,
+        sender_id: &Ed25519PubKey,
+        ts: u64,
+        text: &str,
+        msg_id: Option<&[u8; 16]>,
+    ) -> Result<i64, StoreError> {
         let mut nonce = [0u8; 24];
         rand::RngCore::fill_bytes(&mut rand::rng(), &mut nonce);
         let ct = self
@@ -96,9 +141,17 @@ impl HistoryStore {
             .map_err(|_| StoreError::Encrypt)?;
 
         let conn = self.conn.lock().unwrap();
+        let msg_id_blob = msg_id.map(|m| m.to_vec());
         conn.execute(
-            "INSERT INTO clips (sender_id, ts, nonce, ciphertext) VALUES (?1, ?2, ?3, ?4)",
-            params![&sender_id.0[..], ts as i64, &nonce[..], &ct[..]],
+            "INSERT INTO clips (msg_id, sender_id, ts, nonce, ciphertext)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                msg_id_blob,
+                &sender_id.0[..],
+                ts as i64,
+                &nonce[..],
+                &ct[..]
+            ],
         )?;
         let id = conn.last_insert_rowid();
 
@@ -116,24 +169,35 @@ impl HistoryStore {
     pub fn recent(&self, limit: i64) -> Result<Vec<HistoryClip>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, sender_id, ts, nonce, ciphertext FROM clips
+            "SELECT id, msg_id, sender_id, ts, nonce, ciphertext FROM clips
              ORDER BY ts DESC, id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit], |row| {
             let id: i64 = row.get(0)?;
-            let sender: Vec<u8> = row.get(1)?;
-            let ts: i64 = row.get(2)?;
-            let nonce: Vec<u8> = row.get(3)?;
-            let ct: Vec<u8> = row.get(4)?;
-            Ok((id, sender, ts, nonce, ct))
+            let msg_id: Option<Vec<u8>> = row.get(1)?;
+            let sender: Vec<u8> = row.get(2)?;
+            let ts: i64 = row.get(3)?;
+            let nonce: Vec<u8> = row.get(4)?;
+            let ct: Vec<u8> = row.get(5)?;
+            Ok((id, msg_id, sender, ts, nonce, ct))
         })?;
 
         let mut out = Vec::new();
         for r in rows {
-            let (id, sender, ts, nonce, ct) = r?;
+            let (id, msg_id, sender, ts, nonce, ct) = r?;
             if sender.len() != 32 || nonce.len() != 24 {
                 return Err(StoreError::BadRow("sender/nonce length"));
             }
+            let msg_id = msg_id
+                .map(|blob| {
+                    if blob.len() != 16 {
+                        return Err(StoreError::BadRow("msg_id length"));
+                    }
+                    let mut out = [0u8; 16];
+                    out.copy_from_slice(&blob);
+                    Ok(out)
+                })
+                .transpose()?;
             let mut sn = [0u8; 32];
             sn.copy_from_slice(&sender);
             let mut nc = [0u8; 24];
@@ -143,7 +207,13 @@ impl HistoryStore {
                 .decrypt(&XNonce::from(nc), &ct[..])
                 .map_err(|_| StoreError::Decrypt)?;
             let text = String::from_utf8(pt).map_err(|_| StoreError::BadRow("non-utf8 text"))?;
-            out.push(HistoryClip { id, sender_id: Ed25519PubKey(sn), ts: ts as u64, text });
+            out.push(HistoryClip {
+                id,
+                msg_id,
+                sender_id: Ed25519PubKey(sn),
+                ts: ts as u64,
+                text,
+            });
         }
         Ok(out)
     }
@@ -153,6 +223,59 @@ impl HistoryStore {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM clips WHERE id = ?1", params![id])?;
         Ok(())
+    }
+
+    /// Return all relay message ids currently bound to local history rows.
+    pub fn all_msg_ids(&self) -> Result<Vec<[u8; 16]>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT msg_id FROM clips WHERE msg_id IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let blob = row?;
+            if blob.len() != 16 {
+                return Err(StoreError::BadRow("msg_id length"));
+            }
+            let mut msg_id = [0u8; 16];
+            msg_id.copy_from_slice(&blob);
+            out.push(msg_id);
+        }
+        Ok(out)
+    }
+
+    /// Delete every local history clip. Returns how many rows changed.
+    pub fn delete_all(&self) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute("DELETE FROM clips", [])?;
+        Ok(changed)
+    }
+
+    /// Return the relay message id for a local history row, if it has one.
+    pub fn msg_id_for_clip(&self, id: i64) -> Result<Option<[u8; 16]>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let raw: Option<Option<Vec<u8>>> = conn
+            .query_row(
+                "SELECT msg_id FROM clips WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(Some(blob)) = raw else {
+            return Ok(None);
+        };
+        if blob.len() != 16 {
+            return Err(StoreError::BadRow("msg_id length"));
+        }
+        let mut msg_id = [0u8; 16];
+        msg_id.copy_from_slice(&blob);
+        Ok(Some(msg_id))
+    }
+
+    /// Delete a clip by relay message id. Returns how many local rows changed.
+    pub fn delete_by_msg_id(&self, msg_id: &[u8; 16]) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute("DELETE FROM clips WHERE msg_id = ?1", params![&msg_id[..]])?;
+        Ok(changed)
     }
 
     /// Full-text search over decrypted clips (decrypts then filters; fine for
@@ -175,6 +298,33 @@ impl HistoryStore {
             .query_row("SELECT COUNT(*) FROM clips", [], |row| row.get(0))
             .optional()?
             .unwrap_or(0))
+    }
+
+    /// Return true if this relay message ID was already opened successfully.
+    pub fn has_seen_message(&self, msg_id: &[u8; 16]) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let exists: i64 = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM seen_messages WHERE msg_id = ?1)",
+            params![&msg_id[..]],
+            |row| row.get(0),
+        )?;
+        Ok(exists != 0)
+    }
+
+    /// Remember a successfully-opened relay message ID for replay rejection.
+    pub fn mark_seen_message(&self, msg_id: &[u8; 16], ts: u64) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO seen_messages (msg_id, ts) VALUES (?1, ?2)",
+            params![&msg_id[..], ts as i64],
+        )?;
+        conn.execute(
+            "DELETE FROM seen_messages WHERE msg_id NOT IN (
+                SELECT msg_id FROM seen_messages ORDER BY ts DESC LIMIT ?1
+             )",
+            params![MAX_SEEN_MESSAGES],
+        )?;
+        Ok(())
     }
 }
 
@@ -213,6 +363,77 @@ mod tests {
         assert_eq!(store.count().unwrap(), 1);
         store.delete(id).unwrap();
         assert_eq!(store.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn msg_id_roundtrip_and_delete() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::open(&dir.path().join("h.db"), &test_key()).unwrap();
+        let sender = Ed25519PubKey([0xEF; 32]);
+        let msg_id = [0x42; 16];
+        let id = store
+            .insert_with_msg_id(&sender, 70, "shared delete", Some(&msg_id))
+            .unwrap();
+
+        assert_eq!(store.msg_id_for_clip(id).unwrap(), Some(msg_id));
+        let clips = store.recent(10).unwrap();
+        assert_eq!(clips[0].msg_id, Some(msg_id));
+        assert_eq!(store.delete_by_msg_id(&msg_id).unwrap(), 1);
+        assert_eq!(store.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn all_msg_ids_and_delete_all() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::open(&dir.path().join("h.db"), &test_key()).unwrap();
+        let sender = Ed25519PubKey([0xBC; 32]);
+        let msg_a = [0x01; 16];
+        let msg_b = [0x02; 16];
+        store
+            .insert_with_msg_id(&sender, 1, "one", Some(&msg_a))
+            .unwrap();
+        store.insert(&sender, 2, "legacy").unwrap();
+        store
+            .insert_with_msg_id(&sender, 3, "two", Some(&msg_b))
+            .unwrap();
+
+        let ids = store.all_msg_ids().unwrap();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&msg_a));
+        assert!(ids.contains(&msg_b));
+        assert_eq!(store.delete_all().unwrap(), 3);
+        assert_eq!(store.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn opening_legacy_schema_adds_msg_id_column() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("h.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE clips (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sender_id   BLOB NOT NULL,
+                    ts          INTEGER NOT NULL,
+                    nonce       BLOB NOT NULL,
+                    ciphertext  BLOB NOT NULL
+                );
+                CREATE TABLE seen_messages (
+                    msg_id      BLOB PRIMARY KEY,
+                    ts          INTEGER NOT NULL
+                );",
+            )
+            .unwrap();
+        }
+
+        let store = HistoryStore::open(&path, &test_key()).unwrap();
+        let sender = Ed25519PubKey([0xAA; 32]);
+        let msg_id = [0x99; 16];
+        let id = store
+            .insert_with_msg_id(&sender, 1, "after migration", Some(&msg_id))
+            .unwrap();
+        assert_eq!(store.msg_id_for_clip(id).unwrap(), Some(msg_id));
     }
 
     #[test]
@@ -261,10 +482,27 @@ mod tests {
         let store = HistoryStore::open(&dir.path().join("h.db"), &test_key()).unwrap();
         let sender = Ed25519PubKey([0x33; 32]);
         for i in 0..(MAX_HISTORY + 50) {
-            store.insert(&sender, i as u64, &format!("clip {i}")).unwrap();
+            store
+                .insert(&sender, i as u64, &format!("clip {i}"))
+                .unwrap();
         }
         assert_eq!(store.count().unwrap(), MAX_HISTORY);
         let top = store.recent(1).unwrap();
         assert_eq!(top[0].text, format!("clip {}", MAX_HISTORY + 49));
+    }
+
+    #[test]
+    fn seen_messages_persist_across_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("h.db");
+        let msg_id = [0xAA; 16];
+        {
+            let store = HistoryStore::open(&path, &test_key()).unwrap();
+            assert!(!store.has_seen_message(&msg_id).unwrap());
+            store.mark_seen_message(&msg_id, 123).unwrap();
+            assert!(store.has_seen_message(&msg_id).unwrap());
+        }
+        let store = HistoryStore::open(&path, &test_key()).unwrap();
+        assert!(store.has_seen_message(&msg_id).unwrap());
     }
 }

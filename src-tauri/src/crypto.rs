@@ -19,7 +19,10 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
 };
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use hpke::{Deserializable, HpkeError, Kem, OpModeR, OpModeS, Serializable, single_shot_open, single_shot_seal};
+use hpke::{
+    single_shot_open, single_shot_seal, Deserializable, HpkeError, Kem, OpModeR, OpModeS,
+    Serializable,
+};
 // Ciphersuite: HPKE base mode, X25519+HKDF-SHA256+ChaCha20-Poly1305.
 use hpke::{aead::ChaCha20Poly1305 as HpkeAead, kdf::HkdfSha256, kem::X25519HkdfSha256 as KemImpl};
 // rand 0.9: use rand::rng() (ThreadRng) which implements rand_core 0.9's
@@ -42,7 +45,7 @@ type HpkePub = <KemImpl as Kem>::PublicKey;
 /// Max plaintext bytes per encrypted chunk. Stays under ntfy's 4096-byte body
 /// threshold after base64 + envelope overhead. Public ntfy treats larger bodies
 /// as attachments, which we avoid in v1.
-pub const CHUNK_SIZE: usize = 3072;
+pub const CHUNK_SIZE: usize = 2048;
 /// Nonce = 128-bit random clip prefix + 64-bit big-endian chunk index.
 const CLIP_NONCE_PREFIX_LEN: usize = 16;
 const CLIP_NONCE_LEN: usize = 24; // XChaCha20-Poly1305 nonce length (XNonce)
@@ -58,7 +61,9 @@ pub struct X25519PubKey(pub [u8; 32]);
 
 impl std::fmt::Debug for X25519PubKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("X25519PubKey").field(&hex::encode(self.0)).finish()
+        f.debug_tuple("X25519PubKey")
+            .field(&hex::encode(self.0))
+            .finish()
     }
 }
 
@@ -69,7 +74,9 @@ pub struct Ed25519PubKey(pub [u8; 32]);
 
 impl std::fmt::Debug for Ed25519PubKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple("Ed25519PubKey").field(&hex::encode(self.0)).finish()
+        f.debug_tuple("Ed25519PubKey")
+            .field(&hex::encode(self.0))
+            .finish()
     }
 }
 
@@ -80,10 +87,10 @@ impl std::fmt::Debug for Ed25519PubKey {
 /// A device's long-term keypairs. The private halves are held in memory only
 /// after being loaded from the OS keychain (see keychain.rs).
 pub struct DeviceKeypairs {
-    pub signing: SigningKey,           // Ed25519
-    pub signing_pub: Ed25519PubKey,    // = signing.verifying_key()
-    pub x25519_secret: HpkePriv,       // HPKE encryption private (wraps dalek)
-    pub x25519_pub: X25519PubKey,      // encryption public (raw bytes for serde)
+    pub signing: SigningKey,        // Ed25519
+    pub signing_pub: Ed25519PubKey, // = signing.verifying_key()
+    pub x25519_secret: HpkePriv,    // HPKE encryption private (wraps dalek)
+    pub x25519_pub: X25519PubKey,   // encryption public (raw bytes for serde)
 }
 
 impl DeviceKeypairs {
@@ -105,11 +112,15 @@ impl DeviceKeypairs {
     /// given ed25519 signing key and raw x25519 secret bytes.
     fn assemble(signing: SigningKey, x_sk_bytes: [u8; 32]) -> Self {
         let signing_pub = Ed25519PubKey(signing.verifying_key().to_bytes());
-        let x25519_secret =
-            HpkePriv::from_bytes(&x_sk_bytes).expect("32-byte x25519 secret");
+        let x25519_secret = HpkePriv::from_bytes(&x_sk_bytes).expect("32-byte x25519 secret");
         let x25519_pub_obj = KemImpl::sk_to_pk(&x25519_secret);
         let x25519_pub = X25519PubKey(x25519_pub_obj.to_bytes().into());
-        Self { signing, signing_pub, x25519_secret, x25519_pub }
+        Self {
+            signing,
+            signing_pub,
+            x25519_secret,
+            x25519_pub,
+        }
     }
 
     /// Reconstruct from raw keychain bytes: (ed25519_sk, x25519_sk).
@@ -159,16 +170,16 @@ pub struct RecipientWrap {
 /// `SIG_DOMAIN`.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Manifest {
-    pub msg_id: [u8; 16],            // UUIDv4 bytes
-    pub room_id: String,             // ntfy topic
+    pub msg_id: [u8; 16], // UUIDv4 bytes
+    pub room_id: String,  // ntfy topic
     pub roster_epoch: u64,
     pub sender_id: Ed25519PubKey,
     pub sender_x25519: X25519PubKey, // for reference; auth is via signature
     pub ts: u64,                     // unix seconds
     pub payload_type: PayloadType,
-    pub declared_size: u64,          // plaintext byte length
+    pub declared_size: u64, // plaintext byte length
     pub chunk_count: u32,
-    pub merkle_root: [u8; 32],       // SHA-256 Merkle root over chunk ciphertexts
+    pub merkle_root: [u8; 32], // SHA-256 Merkle root over chunk ciphertexts
     pub recipients: Vec<RecipientWrap>,
     pub store_policy: StorePolicy,
     /// Ed25519 signature over `SIG_DOMAIN || postcard(Self without this field)`.
@@ -198,6 +209,8 @@ pub struct Chunk {
 pub enum CryptoError {
     /// Sender's epoch is older than the receiver's current roster epoch.
     StaleEpoch { got: u64, have: u64 },
+    /// Sender's epoch is newer than the receiver's current roster epoch.
+    UnknownEpoch { got: u64, have: u64 },
     /// Sender is not in the receiver's current (non-revoked) roster.
     UnknownSender,
     /// We are not a recipient of this clip (no wrap for our device).
@@ -220,6 +233,9 @@ impl std::fmt::Display for CryptoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::StaleEpoch { got, have } => write!(f, "stale roster epoch {got} (have {have})"),
+            Self::UnknownEpoch { got, have } => {
+                write!(f, "unknown roster epoch {got} (have {have})")
+            }
             Self::UnknownSender => write!(f, "sender not in current roster"),
             Self::NotARecipient => write!(f, "device is not a recipient of this clip"),
             Self::InvalidSignature => write!(f, "envelope signature verification failed"),
@@ -234,7 +250,9 @@ impl std::fmt::Display for CryptoError {
 impl std::error::Error for CryptoError {}
 
 impl From<HpkeError> for CryptoError {
-    fn from(e: HpkeError) -> Self { Self::Hpke(e) }
+    fn from(e: HpkeError) -> Self {
+        Self::Hpke(e)
+    }
 }
 
 // ============================================================================
@@ -285,7 +303,8 @@ fn verify_manifest_sig(m: &Manifest) -> Result<(), CryptoError> {
     let sig = Signature::from_slice(&m.signature)
         .map_err(|_| CryptoError::BadInput("bad signature bytes"))?;
     let signing_bytes = to_signing_bytes(m);
-    vk.verify(&signing_bytes, &sig).map_err(|_| CryptoError::InvalidSignature)
+    vk.verify(&signing_bytes, &sig)
+        .map_err(|_| CryptoError::InvalidSignature)
 }
 
 // ============================================================================
@@ -318,7 +337,11 @@ fn merkle_root_of(chunks: &[impl AsRef<[u8]>]) -> [u8; 32] {
         let mut i = 0;
         while i < level.len() {
             let left = level[i];
-            let right = if i + 1 < level.len() { level[i + 1] } else { left };
+            let right = if i + 1 < level.len() {
+                level[i + 1]
+            } else {
+                left
+            };
             let mut pair = [0u8; 64];
             pair[..32].copy_from_slice(&left);
             pair[32..].copy_from_slice(&right);
@@ -385,7 +408,12 @@ fn wrap_content_key(
         .map_err(|_| CryptoError::BadInput("bad recipient x25519 pubkey"))?;
     let info = hpke_info(sender_id, &recipient_id, room, epoch, msg_id);
     let (encapped, wrapped_ct) = single_shot_seal::<AeadImpl, KdfImpl, KemImpl, _>(
-        &mode, &pk_r, &info, content_key, b"", rng,
+        &mode,
+        &pk_r,
+        &info,
+        content_key,
+        b"",
+        rng,
     )?;
     let enc_bytes = Serializable::to_bytes(&encapped);
     if enc_bytes.len() != 32 {
@@ -393,7 +421,12 @@ fn wrap_content_key(
     }
     let mut enc = [0u8; 32];
     enc.copy_from_slice(&enc_bytes);
-    Ok(RecipientWrap { recipient_id, recipient_x25519, encapped: enc, wrapped_ct })
+    Ok(RecipientWrap {
+        recipient_id,
+        recipient_x25519,
+        encapped: enc,
+        wrapped_ct,
+    })
 }
 
 /// Unwrap the content key for our device.
@@ -410,10 +443,17 @@ fn unwrap_content_key(
         .map_err(|_| CryptoError::BadInput("bad encapped key"))?;
     let info = hpke_info(sender_id, &wrap.recipient_id, room, epoch, msg_id);
     let pt = single_shot_open::<AeadImpl, KdfImpl, KemImpl>(
-        &mode, my_x25519_secret, &encapped, &info, &wrap.wrapped_ct, b"",
+        &mode,
+        my_x25519_secret,
+        &encapped,
+        &info,
+        &wrap.wrapped_ct,
+        b"",
     )?;
     if pt.len() != 32 {
-        return Err(CryptoError::BadInput("decrypted content key has wrong length"));
+        return Err(CryptoError::BadInput(
+            "decrypted content key has wrong length",
+        ));
     }
     let mut k = [0u8; 32];
     k.copy_from_slice(&pt);
@@ -481,7 +521,13 @@ pub fn seal_clip(
         let nonce_bytes = build_nonce(&nonce_prefix, i as u32);
         let aad = chunk_aad(room, epoch, &sender.signing_pub.0, i as u32, chunk_count);
         let ct = cipher
-            .encrypt(&XNonce::from(nonce_bytes), Payload { msg: pt_chunk, aad: &aad })
+            .encrypt(
+                &XNonce::from(nonce_bytes),
+                Payload {
+                    msg: pt_chunk,
+                    aad: &aad,
+                },
+            )
             .map_err(|_| CryptoError::Decrypt)?;
         encrypted_chunks.push(ct.clone());
         chunk_objs.push(Chunk {
@@ -539,7 +585,10 @@ pub fn seal_clip(
     let signing_bytes = to_signing_bytes(&manifest);
     manifest.signature = sender.signing.sign(&signing_bytes).to_bytes().to_vec();
 
-    Ok(SealedClip { manifest, chunks: chunk_objs })
+    Ok(SealedClip {
+        manifest,
+        chunks: chunk_objs,
+    })
 }
 
 /// AAD bound to each chunk's AEAD: binds room, epoch, sender, index, count.
@@ -566,7 +615,8 @@ pub struct OpenedClip {
 /// Verifies and decrypts a sealed clip for our device.
 ///
 /// `current_epoch`: the receiver's latest known roster epoch. Messages with a
-/// strictly smaller epoch are rejected as stale (replay/old-state protection).
+/// different epoch are rejected: older epochs are stale, newer epochs are
+/// unknown until the roster update has been verified.
 /// `is_active_member`: closure returning whether (sender_id, epoch) is in the
 /// receiver's current, non-revoked roster.
 pub fn open_clip(
@@ -576,9 +626,15 @@ pub fn open_clip(
     current_epoch: u64,
     is_active_member: impl Fn(&Ed25519PubKey, u64) -> bool,
 ) -> Result<OpenedClip, CryptoError> {
-    // 1. Epoch check: reject strictly stale epochs.
+    // 1. Epoch check: reject stale or unknown epochs.
     if manifest.roster_epoch < current_epoch {
         return Err(CryptoError::StaleEpoch {
+            got: manifest.roster_epoch,
+            have: current_epoch,
+        });
+    }
+    if manifest.roster_epoch > current_epoch {
+        return Err(CryptoError::UnknownEpoch {
             got: manifest.roster_epoch,
             have: current_epoch,
         });
@@ -635,7 +691,13 @@ pub fn open_clip(
             manifest.chunk_count,
         );
         let pt = cipher
-            .decrypt(&XNonce::from(c.nonce), Payload { msg: &c.ct, aad: &aad })
+            .decrypt(
+                &XNonce::from(c.nonce),
+                Payload {
+                    msg: &c.ct,
+                    aad: &aad,
+                },
+            )
             .map_err(|_| CryptoError::Decrypt)?;
         plaintext.extend_from_slice(&pt);
     }
@@ -663,12 +725,17 @@ pub fn open_clip(
 mod tests {
     use super::*;
 
-    fn now() -> u64 { 1_750_000_000 }
+    fn now() -> u64 {
+        1_750_000_000
+    }
 
     fn recipients_of(devices: &[&DeviceKeypairs]) -> Vec<Recipient> {
         devices
             .iter()
-            .map(|d| Recipient { id: d.signing_pub.clone(), x25519: d.x25519_pub.clone() })
+            .map(|d| Recipient {
+                id: d.signing_pub.clone(),
+                x25519: d.x25519_pub.clone(),
+            })
             .collect()
     }
 
@@ -807,7 +874,7 @@ mod tests {
             &sealed.manifest,
             &sealed.chunks,
             &bob,
-            2, // current epoch matches (not stale)
+            2,            // current epoch matches (not stale)
             |_, _| false, // alice revoked from roster
         )
         .unwrap_err();
@@ -837,6 +904,34 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, CryptoError::StaleEpoch { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn unknown_future_epoch_rejected() {
+        let alice = DeviceKeypairs::generate();
+        let bob = DeviceKeypairs::generate();
+        let sealed = seal_clip(
+            &alice,
+            &recipients_of(&[&bob]),
+            "future",
+            "room-future",
+            7,
+            StorePolicy::History,
+            now(),
+        )
+        .expect("seal");
+        let err = open_clip(
+            &sealed.manifest,
+            &sealed.chunks,
+            &bob,
+            3,
+            always_alice(&alice),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, CryptoError::UnknownEpoch { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]

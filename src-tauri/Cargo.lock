@@ -1671,6 +1671,7 @@ dependencies = [
 name = "fwoosh"
 version = "0.1.0"
 dependencies = [
+ "apple-native-keyring-store",
  "base64 0.22.1",
  "bytes",
  "chacha20poly1305 0.11.0",
@@ -1680,6 +1681,7 @@ dependencies = [
  "hmac 0.13.0",
  "hpke",
  "keyring",
+ "keyring-core",
  "postcard",
  "rand",
  "reqwest",
@@ -1698,7 +1700,9 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "uuid",
+ "windows-native-keyring-store",
  "x25519-dalek",
+ "zbus-secret-service-keyring-store",
 ]
 
 [[package]]

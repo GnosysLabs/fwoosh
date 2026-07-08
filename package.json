@@ -1,7 +1,7 @@
 {
   "name": "fwoosh",
   "version": "0.1.0",
-  "description": "",
+  "description": "Fwoosh encrypted clipboard sync",
   "type": "module",
   "scripts": {
     "dev": "vite dev",
@@ -9,6 +9,8 @@
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
+    "version:check": "node scripts/version.mjs check",
+    "version:bump": "node scripts/version.mjs bump",
     "tauri": "tauri"
   },
   "license": "MIT",

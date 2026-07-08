@@ -56,10 +56,14 @@ impl std::fmt::Display for NtfyError {
 }
 impl std::error::Error for NtfyError {}
 impl From<reqwest::Error> for NtfyError {
-    fn from(e: reqwest::Error) -> Self { Self::Http(e) }
+    fn from(e: reqwest::Error) -> Self {
+        Self::Http(e)
+    }
 }
 impl From<tokio_tungstenite::tungstenite::Error> for NtfyError {
-    fn from(e: tokio_tungstenite::tungstenite::Error) -> Self { Self::WebSocket(e) }
+    fn from(e: tokio_tungstenite::tungstenite::Error) -> Self {
+        Self::WebSocket(e)
+    }
 }
 
 /// Ensure the base URL uses TLS. Returns the https base (no trailing slash).
@@ -123,11 +127,11 @@ pub async fn publish(
     payload: &[u8],
     _title: &str,
 ) -> Result<String, NtfyError> {
-    if payload.len() > MAX_BODY_BYTES {
-        return Err(NtfyError::TooLarge);
-    }
     let https_base = require_tls_base(base)?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(payload);
+    if b64.len() > MAX_BODY_BYTES {
+        return Err(NtfyError::TooLarge);
+    }
     let url = format!("{https_base}/{topic}");
 
     let client = reqwest::Client::builder()
@@ -149,7 +153,11 @@ pub async fn publish(
         eprintln!("[ntfy] publish failed: {status} {text}");
         return Err(NtfyError::BadStatus(status.as_u16(), text));
     }
-    eprintln!("[ntfy] published {} bytes ({} b64) to topic", payload.len(), b64_len);
+    eprintln!(
+        "[ntfy] published {} bytes ({} b64) to topic",
+        payload.len(),
+        b64_len
+    );
     Ok(String::from("ok"))
 }
 
@@ -177,11 +185,13 @@ pub fn spawn_subscriber(
             Ok(b) => b,
             Err(e) => {
                 eprintln!("ntfy subscribe aborting: {e}");
-                let _ = out.send(RelayMessage {
-                    id: String::new(),
-                    payload: Vec::new(),
-                    time_ms: 0,
-                }).await; // sentinel: empty payload signals fatal error
+                let _ = out
+                    .send(RelayMessage {
+                        id: String::new(),
+                        payload: Vec::new(),
+                        time_ms: 0,
+                    })
+                    .await; // sentinel: empty payload signals fatal error
                 return;
             }
         };
@@ -214,10 +224,17 @@ pub fn spawn_subscriber(
                         if let Some(text) = msg.into_text().ok() {
                             // Log raw text for diagnosis (doesn't contain the topic secret;
                             // ntfy messages include the topic, so redact it).
-                            let preview = if text.len() > 120 { &text[..120] } else { &text };
+                            let preview = if text.len() > 120 {
+                                &text[..120]
+                            } else {
+                                &text
+                            };
                             eprintln!("[ntfy] received: {preview}");
                             if let Some(rm) = decode_ntfy_json(&text) {
-                                eprintln!("[ntfy] decoded message, {} bytes payload", rm.payload.len());
+                                eprintln!(
+                                    "[ntfy] decoded message, {} bytes payload",
+                                    rm.payload.len()
+                                );
                                 last_id = Some(rm.id.clone());
                                 if out.send(rm).await.is_err() {
                                     eprintln!("[ntfy] consumer gone, stopping");
@@ -244,17 +261,22 @@ pub fn spawn_subscriber(
     })
 }
 
-
-
 /// Decode one ntfy JSON line into a RelayMessage, or None if it's not a
 /// message event (e.g. open/keepalive).
 fn decode_ntfy_json(line: &str) -> Option<RelayMessage> {
     let parsed: NtfyJson = serde_json::from_str(line).ok()?;
     // ntfy sends `event: "open"` / `"keepalive"` on the WS stream; ignore those.
-    if matches!(parsed.event.as_deref(), Some("open") | Some("keepalive") | Some("poll_request")) {
+    if matches!(
+        parsed.event.as_deref(),
+        Some("open") | Some("keepalive") | Some("poll_request")
+    ) {
         return None;
     }
     let msg = parsed.message?;
+    if msg.len() > MAX_BODY_BYTES {
+        eprintln!("ntfy: skipping oversized message body");
+        return None;
+    }
     let id = parsed.id.unwrap_or_default();
     let payload = base64::engine::general_purpose::STANDARD
         .decode(&msg)
@@ -288,11 +310,20 @@ mod tests {
 
     #[test]
     fn accepts_https_and_wss() {
-        assert_eq!(require_tls_base("https://ntfy.sh").unwrap(), "https://ntfy.sh");
-        assert_eq!(require_tls_base("wss://ntfy.sh").unwrap(), "https://ntfy.sh");
+        assert_eq!(
+            require_tls_base("https://ntfy.sh").unwrap(),
+            "https://ntfy.sh"
+        );
+        assert_eq!(
+            require_tls_base("wss://ntfy.sh").unwrap(),
+            "https://ntfy.sh"
+        );
         assert_eq!(require_tls_base("ntfy.sh").unwrap(), "https://ntfy.sh");
         // trailing slash stripped
-        assert_eq!(require_tls_base("https://ntfy.sh/").unwrap(), "https://ntfy.sh");
+        assert_eq!(
+            require_tls_base("https://ntfy.sh/").unwrap(),
+            "https://ntfy.sh"
+        );
     }
 
     #[test]

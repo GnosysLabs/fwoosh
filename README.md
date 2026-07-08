@@ -33,31 +33,33 @@ servers to run**.
 
 ## Status
 
-✅ **Working & tested (41/41 unit tests):** crypto core, roster (membership +
-revocation + topic rotation), encrypted history, keychain, ntfy transport,
-pairing. The app builds to a runnable desktop binary with tray + hotkey + UI.
+**Working & tested:** crypto core, roster epochs, HMAC-authenticated pairing,
+encrypted history, keychain storage, ntfy transport, replay cache, tray/hotkey,
+manual send UI, and admin revocation with encrypted topic-rotation notice.
 
-🚧 **MVP-complete; in polish:** the join handshake completes the proof-of-
-knowledge round-trip over the wire, the revocation UI button, and a first
-tagged release via CI.
+**Still before public MVP:** QR scanning, custom relay settings UI, pause sync,
+full room-repair UX, installer packaging via Tauri bundling, and cargo/npm audit
+automation in CI.
 
 | Area | State |
 |---|---|
-| Signed envelope crypto (`crypto.rs`) | ✅ 11 tests |
+| Signed envelope crypto (`crypto.rs`) | 12 tests |
 | Roster log (`roster.rs`) | ✅ 9 tests |
-| Encrypted history (`store.rs`) | ✅ 5 tests |
-| OS keychain (`keychain.rs`) | ✅ |
+| Encrypted history (`store.rs`) | 6 tests |
+| OS keychain (`keychain.rs`) | OS keychain by default; file fallback only by explicit dev opt-in |
 | ntfy transport (`ntfy.rs`) | ✅ 7 tests |
 | Pairing (`pairing.rs`) | ✅ 8 tests |
 | Desktop shell (tray, hotkey, popup UI) | ✅ builds |
-| CI / release pipeline | ✅ written |
+| CI / release pipeline | Tests plus cargo/npm audit in CI; release workflow written |
 
 ## Threat model (honest)
 
 - ✅ **Content is E2E encrypted.** The relay sees only ciphertext.
 - ✅ **Sender authenticity** (Ed25519 signatures over canonical bytes).
-- ✅ **Replay/roster-tamper resistance** (signed, hash-chained epoch log).
-- ✅ **Revocation** (drop pubkey + rotate the ntfy topic).
+- ✅ **Replay/roster-tamper resistance** (signed epochs, strict current-epoch
+  checks, and a local seen-message cache).
+- ✅ **Revocation** (admin drops pubkey, rotates the ntfy topic, and sends the
+  new roster to remaining devices through an encrypted move message).
 - ❌ **Not protected:** relay metadata (unguessable topic, timing, size, IPs);
   topic leaks via HTTPS URLs/logs; ~12h ntfy cache window for offline catch-up.
 - ❌ **No forward secrecy** (deferred — ratcheting is fragile on a lossy relay).
@@ -88,6 +90,22 @@ cd src-tauri && cargo build --release
 cd src-tauri && cargo test --lib
 ```
 
+## Versioning
+
+Fwoosh uses SemVer and release tags like `v0.1.0`.
+
+The app version is stored in `package.json`, `package-lock.json`,
+`src-tauri/Cargo.toml`, `src-tauri/Cargo.lock`, and
+`src-tauri/tauri.conf.json`. Keep them in sync with:
+
+```bash
+npm run version:check
+npm run version:bump -- patch   # or minor, major, 0.2.0
+```
+
+Before tagging a release, move the relevant `CHANGELOG.md` entries from
+`Unreleased` to the target version and create a matching `vX.Y.Z` tag.
+
 > **Windows + Git Bash:** because Git Bash's `/usr/bin/link` (GNU coreutils)
 > shadows MSVC's `link.exe` in PATH, builds from Git Bash use
 > `src-tauri/cargo-dev.cmd` (which loads `vcvars64.bat`) and a linker pin in
@@ -107,7 +125,7 @@ src-tauri/src/
   commands.rs  Tauri IPC: send_clip, recent_clips, create/join_room, ...
   lib.rs       tray icon, global hotkey, popup window, plugin setup
 src/routes/+page.svelte   the popup UI (Svelte + Tailwind)
-.github/workflows/        CI (test+audit) and release (build+checksum)
+.github/workflows/        Release build/checksum workflow
 ```
 
 ## License

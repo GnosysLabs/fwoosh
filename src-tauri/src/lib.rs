@@ -56,8 +56,8 @@ pub fn run() {
         ))
         .setup(|app| {
             // --- Load device keypairs + history DB key ---
-            // Set the file-fallback dir for the keychain (used if the OS
-            // credential store isn't available in this launch context).
+            // Set the file-fallback dir for tests or explicit development
+            // opt-in. Normal runs fail closed if OS credential storage fails.
             let app_data = app
                 .path()
                 .app_data_dir()
@@ -69,8 +69,8 @@ pub fn run() {
             let db_key = keychain::load_or_create_db_key()
                 .expect("failed to load history DB key (and no file fallback)");
             let db_path = app_data.join("history.db");
-            let store = store::HistoryStore::open(&db_path, &db_key)
-                .expect("failed to open history store");
+            let store =
+                store::HistoryStore::open(&db_path, &db_key).expect("failed to open history store");
 
             let state = Arc::new(AppState::new(device, store));
 
@@ -79,8 +79,17 @@ pub fn run() {
             if let Ok(mut rp) = state.roster_path.try_lock() {
                 *rp = Some(roster_path.clone());
             }
+            let mut startup_topic = None;
             if let Some(entry) = commands::load_persisted_roster(&roster_path) {
-                if let Ok(v) = roster::VerifiedRoster::verify_first(entry) {
+                let verified = if entry.epoch == 0 {
+                    roster::VerifiedRoster::verify_first(entry).ok()
+                } else if roster::verify_entry_sig_only(&entry).is_ok() {
+                    Some(roster::VerifiedRoster::from_entry(entry))
+                } else {
+                    None
+                };
+                if let Some(v) = verified {
+                    startup_topic = Some(v.topic().to_string());
                     if let Ok(mut r) = state.roster.try_lock() {
                         *r = Some(v);
                     }
@@ -88,6 +97,14 @@ pub fn run() {
             }
 
             app.manage(state.clone());
+
+            if let Some(topic) = startup_topic {
+                let state_clone = state.clone();
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    commands::start_subscriber(&state_clone, app_handle, &topic).await;
+                });
+            }
 
             // --- Tray icon + menu ---
             let show_item = MenuItem::with_id(app, "show", "Show Fwoosh", true, None::<&str>)?;
@@ -103,7 +120,12 @@ pub fn run() {
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
-                    if let tauri::tray::TrayIconEvent::Click { button: tauri::tray::MouseButton::Left, button_state: tauri::tray::MouseButtonState::Up, .. } = event {
+                    if let tauri::tray::TrayIconEvent::Click {
+                        button: tauri::tray::MouseButton::Left,
+                        button_state: tauri::tray::MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
                         toggle_popup(tray.app_handle());
                     }
                 })
@@ -126,13 +148,17 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::device_identity,
             commands::create_room,
+            commands::new_pairing_code,
             commands::join_room,
             commands::leave_room,
             commands::room_state,
+            commands::roster_devices,
+            commands::revoke_device,
             commands::send_clip,
             commands::recent_clips,
             commands::search_clips,
             commands::delete_clip,
+            commands::delete_all_clips,
             commands::copy_to_clipboard,
         ])
         .run(tauri::generate_context!())

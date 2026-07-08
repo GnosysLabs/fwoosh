@@ -13,7 +13,6 @@
     "global-shortcut:allow-register",
     "global-shortcut:allow-unregister",
     "clipboard-manager:allow-write-text",
-    "clipboard-manager:allow-read-text",
     "notification:default",
     "notification:allow-notify",
     "autostart:allow-enable",

@@ -22,8 +22,8 @@
 use crate::crypto::Ed25519PubKey;
 use crate::roster::DeviceIdentity;
 use base64::Engine;
-use serde::{Deserialize, Serialize};
 use hmac::{Hmac, KeyInit, Mac};
+use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -98,13 +98,17 @@ pub fn build_uri(topic: &str, admin_pub: &Ed25519PubKey, secret: &[u8; 32]) -> S
 /// Parse a pairing URI into an invite. Does NOT log the secret.
 pub fn parse_uri(uri: &str) -> Result<PairingInvite, PairingError> {
     let rest = uri.strip_prefix(SCHEME).ok_or(PairingError::BadScheme)?;
-    let rest = rest.strip_prefix('?').ok_or(PairingError::BadParams("missing query"))?;
+    let rest = rest
+        .strip_prefix('?')
+        .ok_or(PairingError::BadParams("missing query"))?;
 
     let mut topic = None;
     let mut pub_b64 = None;
     let mut sec_b64 = None;
     for pair in rest.split('&') {
-        let (k, v) = pair.split_once('=').ok_or(PairingError::BadParams("malformed pair"))?;
+        let (k, v) = pair
+            .split_once('=')
+            .ok_or(PairingError::BadParams("malformed pair"))?;
         match k {
             "t" => topic = Some(urldec(v)),
             "pub" => pub_b64 = Some(v),
@@ -195,7 +199,11 @@ pub fn build_join_request(identity: DeviceIdentity, secret: &[u8; 32]) -> JoinRe
     let tag = mac.finalize().into_bytes();
     let mut proof = [0u8; 32];
     proof.copy_from_slice(&tag);
-    JoinRequest { identity, nonce, proof }
+    JoinRequest {
+        identity,
+        nonce,
+        proof,
+    }
 }
 
 /// The admin verifies a join request against the one-time secret it generated.
@@ -204,7 +212,8 @@ pub fn verify_join_request(req: &JoinRequest, secret: &[u8; 32]) -> Result<(), P
     let key = mac_key(secret);
     let mut mac = <HmacSha256 as KeyInit>::new_from_slice(&key).expect("hmac key");
     mac.update(&proof_input(&req.identity, &req.nonce));
-    mac.verify_slice(&req.proof).map_err(|_| PairingError::InvalidProof)
+    mac.verify_slice(&req.proof)
+        .map_err(|_| PairingError::InvalidProof)
 }
 
 // ---------------------------------------------------------------------------
@@ -231,10 +240,9 @@ fn urldec(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(
-                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""),
-                16,
-            ) {
+            if let Ok(byte) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+            {
                 out.push(byte);
                 i += 3;
                 continue;

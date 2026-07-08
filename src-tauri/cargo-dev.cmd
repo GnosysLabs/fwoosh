@@ -1,5 +1,5 @@
 @echo off
-REM ClipVault cargo wrapper: load the full MSVC C++ build environment.
+REM Fwoosh cargo wrapper: load the full MSVC C++ build environment.
 REM
 REM vcvars64.bat sets LIB/INCLUDE/PATH correctly (MSVC CRT headers + libs +
 REM Windows SDK). Git Bash's /usr/bin/link.exe would shadow the MSVC linker,

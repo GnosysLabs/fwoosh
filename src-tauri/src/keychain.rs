@@ -1,19 +1,18 @@
 //! OS credential storage: device keypairs + a separate local DB key.
 //!
 //! Primary store: the OS keychain (Windows Credential Manager via DPAPI, macOS
-//! Keychain). Fallback: an encrypted file in the app data dir, used when the OS
-//! keychain is unavailable in the current environment (e.g. some headless /
-//! non-interactive launch contexts).
+//! Keychain). A raw file fallback exists only for tests or explicit development
+//! opt-in via `FWOOSH_ALLOW_FILE_KEY_FALLBACK=1`.
 //!
 //! Security note: OS keychain storage protects against other *users* reading
 //! secrets, but not against malware running as the same logged-in user. The
-//! file fallback is weaker (bound to the OS user account via DPAPI on Windows,
-//! or file perms on Unix). This is the standard limitation of credential
-//! storage; see the threat model.
+//! file fallback is weaker and must not be used for normal app runs. This is
+//! the standard limitation of credential storage; see the threat model.
 
 use crate::crypto::DeviceKeypairs;
 use keyring::Entry;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 /// Service name under which Fwoosh stores its secrets.
 const SERVICE: &str = "fwoosh";
@@ -45,15 +44,43 @@ impl std::fmt::Display for KeychainError {
 }
 impl std::error::Error for KeychainError {}
 impl From<std::io::Error> for KeychainError {
-    fn from(e: std::io::Error) -> Self { Self::Io(e) }
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
 }
 
 /// Set the directory for the file fallback. Set once at startup from lib.rs.
-static FALLBACK_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+static FALLBACK_DIR: OnceLock<PathBuf> = OnceLock::new();
+static KEYRING_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
 pub fn set_fallback_dir(dir: PathBuf) {
     let _ = std::fs::create_dir_all(&dir);
     let _ = FALLBACK_DIR.set(dir);
+}
+
+fn init_platform_store() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let store = apple_native_keyring_store::keychain::Store::new().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "windows")]
+    let store = windows_native_keyring_store::Store::new().map_err(|e| e.to_string())?;
+    #[cfg(all(
+        unix,
+        not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+    ))]
+    let store = zbus_secret_service_keyring_store::Store::new().map_err(|e| e.to_string())?;
+
+    #[cfg(all(any(unix, windows), not(any(target_os = "ios", target_os = "android"))))]
+    keyring_core::set_default_store(store);
+
+    Ok(())
+}
+
+fn ensure_platform_store() -> Result<(), KeychainError> {
+    KEYRING_INIT
+        .get_or_init(init_platform_store)
+        .as_ref()
+        .map(|_| ())
+        .map_err(|e| KeychainError::Backend(e.clone()))
 }
 
 fn fallback_path(name: &str) -> PathBuf {
@@ -64,44 +91,93 @@ fn fallback_path(name: &str) -> PathBuf {
         .join(format!("{name}.bin"))
 }
 
+fn fallback_enabled() -> bool {
+    cfg!(test) || std::env::var_os("FWOOSH_ALLOW_FILE_KEY_FALLBACK").is_some()
+}
+
+fn prefer_file_fallback() -> bool {
+    cfg!(test) && FALLBACK_DIR.get().is_some()
+}
+
 /// Read a secret: try the OS keychain first, fall back to the file.
 fn get_secret(name: &str) -> Result<Vec<u8>, KeychainError> {
+    if prefer_file_fallback() {
+        return fallback_read(name);
+    }
+    if let Err(e) = ensure_platform_store() {
+        if fallback_enabled() {
+            eprintln!("keychain unavailable for {name}, using file fallback: {e}");
+            return fallback_read(name);
+        }
+        return Err(e);
+    }
+
     match Entry::new(SERVICE, name) {
         Ok(entry) => match entry.get_secret() {
             Ok(blob) => Ok(blob),
             Err(keyring::Error::NoEntry) => fallback_read(name),
             Err(e) => {
-                // Keychain present but read failed — try the fallback rather
-                // than hard-failing.
-                eprintln!("keychain read for {name} failed, trying fallback: {e}");
-                fallback_read(name)
+                // Keychain read failures fail closed unless the development
+                // file fallback is explicitly enabled.
+                if fallback_enabled() {
+                    eprintln!("keychain read for {name} failed, trying fallback: {e}");
+                    fallback_read(name)
+                } else {
+                    Err(KeychainError::Backend(e.to_string()))
+                }
             }
         },
         Err(e) => {
-            eprintln!("keychain unavailable for {name}, using file fallback: {e}");
-            fallback_read(name)
+            if fallback_enabled() {
+                eprintln!("keychain unavailable for {name}, using file fallback: {e}");
+                fallback_read(name)
+            } else {
+                Err(KeychainError::Backend(e.to_string()))
+            }
         }
     }
 }
 
 /// Write a secret: try the OS keychain first, fall back to the file.
 fn set_secret(name: &str, blob: &[u8]) -> Result<(), KeychainError> {
+    if prefer_file_fallback() {
+        return fallback_write(name, blob);
+    }
+    if let Err(e) = ensure_platform_store() {
+        if fallback_enabled() {
+            eprintln!("keychain unavailable for {name}, using file fallback: {e}");
+            return fallback_write(name, blob);
+        }
+        return Err(e);
+    }
+
     match Entry::new(SERVICE, name) {
         Ok(entry) => match entry.set_secret(blob) {
             Ok(()) => Ok(()),
             Err(e) => {
-                eprintln!("keychain write for {name} failed, using fallback: {e}");
-                fallback_write(name, blob)
+                if fallback_enabled() {
+                    eprintln!("keychain write for {name} failed, using fallback: {e}");
+                    fallback_write(name, blob)
+                } else {
+                    Err(KeychainError::Backend(e.to_string()))
+                }
             }
         },
         Err(e) => {
-            eprintln!("keychain unavailable for {name}, using file fallback: {e}");
-            fallback_write(name, blob)
+            if fallback_enabled() {
+                eprintln!("keychain unavailable for {name}, using file fallback: {e}");
+                fallback_write(name, blob)
+            } else {
+                Err(KeychainError::Backend(e.to_string()))
+            }
         }
     }
 }
 
 fn fallback_read(name: &str) -> Result<Vec<u8>, KeychainError> {
+    if !fallback_enabled() {
+        return Err(KeychainError::NotFound);
+    }
     let path = fallback_path(name);
     match std::fs::read(&path) {
         Ok(blob) => Ok(blob),
@@ -111,6 +187,11 @@ fn fallback_read(name: &str) -> Result<Vec<u8>, KeychainError> {
 }
 
 fn fallback_write(name: &str, blob: &[u8]) -> Result<(), KeychainError> {
+    if !fallback_enabled() {
+        return Err(KeychainError::Backend(
+            "file key fallback is disabled; use the OS keychain".to_string(),
+        ));
+    }
     let path = fallback_path(name);
     std::fs::write(&path, blob)?;
     Ok(())

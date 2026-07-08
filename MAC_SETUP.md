@@ -69,9 +69,9 @@ Subsequent builds are incremental (~10s).
 Accessibility permissions (System Settings → Privacy & Security → Accessibility,
 enable Terminal/iTerm). Global shortcuts need it.
 
-**App crashes / no tray icon** — check the Terminal output. The keychain falls
-back to a file in `~/Library/Application Support/com.aramo.fwoosh/` if macOS
-Keychain is locked.
+**App crashes / no tray icon** — check the Terminal output. Fwoosh expects
+macOS Keychain to be available. A raw file fallback is only for development or
+tests with `FWOOSH_ALLOW_FILE_KEY_FALLBACK=1`.
 
 ## To make a distributable `.dmg`
 
