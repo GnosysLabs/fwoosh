@@ -1,4 +1,4 @@
-//! ClipVault crypto core: signed envelope encryption with roster epochs.
+//! Fwoosh crypto core: signed envelope encryption with roster epochs.
 //!
 //! Design (frozen spec):
 //! - Per device: X25519 encryption keypair + Ed25519 signing keypair.
@@ -49,7 +49,7 @@ const CLIP_NONCE_LEN: usize = 24; // XChaCha20-Poly1305 nonce length (XNonce)
 
 /// Domain separator bound into every signature to prevent cross-protocol /
 /// cross-version signature reuse.
-const SIG_DOMAIN: &[u8] = b"ClipVault envelope v1";
+const SIG_DOMAIN: &[u8] = b"Fwoosh envelope v1";
 
 /// X25519 public key bytes (32). Wrapped for serde + newtype semantics.
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -135,9 +135,9 @@ impl DeviceKeypairs {
 /// How the receiver treats the plaintext after decrypt.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
 pub enum StorePolicy {
-    /// Sync once; do NOT persist to ClipVault history.
+    /// Sync once; do NOT persist to Fwoosh history.
     Private,
-    /// Persist to ClipVault history.
+    /// Persist to Fwoosh history.
     History,
 }
 
@@ -358,7 +358,7 @@ fn hpke_info(
     epoch: u64,
     msg_id: &[u8; 16],
 ) -> Vec<u8> {
-    let mut info = b"ClipVault wrap v1\0".to_vec();
+    let mut info = b"Fwoosh wrap v1\0".to_vec();
     info.extend_from_slice(&sender.0);
     info.extend_from_slice(&recipient.0);
     info.extend_from_slice(room.as_bytes());

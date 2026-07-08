@@ -90,13 +90,13 @@ pub fn run() {
             app.manage(state.clone());
 
             // --- Tray icon + menu ---
-            let show_item = MenuItem::with_id(app, "show", "Show ClipVault", true, None::<&str>)?;
+            let show_item = MenuItem::with_id(app, "show", "Show Fwoosh", true, None::<&str>)?;
             let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
             let _tray = TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
-                .tooltip("ClipVault")
+                .tooltip("Fwoosh")
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => toggle_popup(app),
                     "quit" => app.exit(0),
@@ -136,5 +136,5 @@ pub fn run() {
             commands::copy_to_clipboard,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running ClipVault");
+        .expect("error while running Fwoosh");
 }

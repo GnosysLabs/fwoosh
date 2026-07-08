@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Domain separator for roster signatures (distinct from envelope signatures).
-const ROSTER_SIG_DOMAIN: &[u8] = b"ClipVault roster v1";
+const ROSTER_SIG_DOMAIN: &[u8] = b"Fwoosh roster v1";
 
 /// A device's public identity in the roster.
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

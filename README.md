@@ -1,4 +1,4 @@
-# ClipVault
+# Fwoosh
 
 A free, open-source, **end-to-end-encrypted clipboard sync** app for Windows &
 macOS. Pop a small text box out of the tray/dock with `Ctrl/Cmd+Shift+V`, paste,
@@ -72,7 +72,7 @@ tagged release via CI.
 
 ### Run in dev
 ```bash
-cd clipvault
+cd fwoosh
 npm install
 npm run tauri dev
 ```

@@ -1,4 +1,4 @@
-# ClipVault — Mac setup (one page)
+# Fwoosh — Mac setup (one page)
 
 This builds the same app that runs on Windows, so the two can sync clips. No
 Mac-specific code — just the toolchain. **~15 minutes one-time setup.**
@@ -20,12 +20,12 @@ brew install node
 
 ## 2. Get the source onto the Mac
 
-Copy `clipvault-source.zip` over (AirDrop, USB, etc.), then:
+Copy `fwoosh-source.zip` over (AirDrop, USB, etc.), then:
 
 ```bash
 cd ~/Downloads        # or wherever you saved it
-unzip clipvault-source.zip -d clipvault
-cd clipvault
+unzip fwoosh-source.zip -d fwoosh
+cd fwoosh
 ```
 
 ## 3. Build + run
@@ -36,7 +36,7 @@ npm run tauri dev     # builds + launches the native Mac app
 ```
 
 The first build compiles the Rust core (~3-5 min). A native window appears and
-a **ClipVault icon shows in the menu bar** (top-right). Hit
+a **Fwoosh icon shows in the menu bar** (top-right). Hit
 **`Cmd+Shift+V`** anywhere to pop the text box.
 
 > **No `dev.cmd` on Mac** — that file is Windows-only (it loads the MSVC build
@@ -50,7 +50,7 @@ pairing code shown.
 On **Mac**: the popup should show "Not connected to any device yet". Click
 **Join a room**, paste the code from Windows.
 
-Wait a few seconds — the green dot next to "ClipVault" lights up when paired.
+Wait a few seconds — the green dot next to "Fwoosh" lights up when paired.
 Now paste something into either popup and hit `Cmd/Ctrl+Enter`; it appears on
 the other machine within ~1 second as a toast (click to copy).
 
@@ -70,14 +70,14 @@ Accessibility permissions (System Settings → Privacy & Security → Accessibil
 enable Terminal/iTerm). Global shortcuts need it.
 
 **App crashes / no tray icon** — check the Terminal output. The keychain falls
-back to a file in `~/Library/Application Support/com.aramo.clipvault/` if macOS
+back to a file in `~/Library/Application Support/com.aramo.fwoosh/` if macOS
 Keychain is locked.
 
 ## To make a distributable `.dmg`
 
 ```bash
 npm run tauri build
-# Output: src-tauri/target/release/bundle/dmg/clipvault_0.1.0_*.dmg
+# Output: src-tauri/target/release/bundle/dmg/fwoosh_0.1.0_*.dmg
 ```
 
 That `.dmg` is the installer you can share with other Mac users (unsigned —

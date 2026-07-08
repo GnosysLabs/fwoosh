@@ -144,7 +144,7 @@
     try {
       let granted = await isPermissionGranted();
       if (!granted) granted = (await requestPermission()) === "granted";
-      if (granted) sendNotification({ title: "ClipVault", body: preview });
+      if (granted) sendNotification({ title: "Fwoosh", body: preview });
     } catch {
       /* notifications optional */
     }
@@ -200,7 +200,7 @@
   <header class="header" data-tauri-drag-region>
     <div class="title">
       <span class="dot" class:live={inRoom}></span>
-      ClipVault
+      Fwoosh
     </div>
     <div class="tabs">
       <button

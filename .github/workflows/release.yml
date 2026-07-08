@@ -14,13 +14,13 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifact: clipvault-windows
+            artifact: fwoosh-windows
           - os: macos-latest
             target: aarch64-apple-darwin
-            artifact: clipvault-macos-arm64
+            artifact: fwoosh-macos-arm64
           - os: macos-latest
             target: x86_64-apple-darwin
-            artifact: clipvault-macos-x86_64
+            artifact: fwoosh-macos-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -52,14 +52,14 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           mkdir -p out
-          cp src-tauri/target/x86_64-pc-windows-msvc/release/clipvault.exe out/
-          cd out && 7z a ../${{ matrix.artifact }}.zip clipvault.exe
+          cp src-tauri/target/x86_64-pc-windows-msvc/release/fwoosh.exe out/
+          cd out && 7z a ../${{ matrix.artifact }}.zip fwoosh.exe
       - name: Package macOS
         if: runner.os == 'macOS'
         run: |
           mkdir -p out
-          cp src-tauri/target/${{ matrix.target }}/release/clipvault out/
-          cd out && tar czf ../${{ matrix.artifact }}.tar.gz clipvault
+          cp src-tauri/target/${{ matrix.target }}/release/fwoosh out/
+          cd out && tar czf ../${{ matrix.artifact }}.tar.gz fwoosh
 
       - name: Generate SHA-256 checksum
         shell: bash

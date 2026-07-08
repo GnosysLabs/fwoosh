@@ -15,8 +15,8 @@ use crate::crypto::DeviceKeypairs;
 use keyring::Entry;
 use std::path::PathBuf;
 
-/// Service name under which ClipVault stores its secrets.
-const SERVICE: &str = "clipvault";
+/// Service name under which Fwoosh stores its secrets.
+const SERVICE: &str = "fwoosh";
 
 /// Sub-entries stored under the service.
 const ENTRY_DEVICE_KEYS: &str = "device-keypairs";
@@ -192,7 +192,7 @@ pub fn load_db_key() -> Result<[u8; 32], KeychainError> {
     Ok(k)
 }
 
-/// Delete all ClipVault secrets (used by "leave room" / factory reset).
+/// Delete all Fwoosh secrets (used by "leave room" / factory reset).
 pub fn delete_all() -> Result<(), KeychainError> {
     for user in [ENTRY_DEVICE_KEYS, ENTRY_DB_KEY] {
         if let Ok(entry) = Entry::new(SERVICE, user) {
@@ -211,7 +211,7 @@ mod tests {
     fn db_key_roundtrips_via_fallback() {
         // Use the fallback file path explicitly (no reliance on OS keychain in
         // the test environment). This verifies the (de)serialization path.
-        let dir = std::env::temp_dir().join("clipvault-keychain-test");
+        let dir = std::env::temp_dir().join("fwoosh-keychain-test");
         let _ = std::fs::create_dir_all(&dir);
         set_fallback_dir(dir.clone());
 

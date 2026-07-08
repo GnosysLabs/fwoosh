@@ -1,6 +1,6 @@
 @import "tailwindcss";
 
-/* ClipVault popup styling. The window is borderless + transparent, so the
+/* Fwoosh popup styling. The window is borderless + transparent, so the
    root provides the visible rounded card + drop shadow. */
 :root {
   color-scheme: dark;

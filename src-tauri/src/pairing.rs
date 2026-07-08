@@ -3,7 +3,7 @@
 //! Flow (frozen spec):
 //! 1. Admin (room creator) generates a one-time secret `s` (32 random bytes)
 //!    and encodes a pairing URI:
-//!      `clipvault://pair?t=<topic>&pub=<base64url admin-ed25519>&s=<base64url s>`
+//!      `fwoosh://pair?t=<topic>&pub=<base64url admin-ed25519>&s=<base64url s>`
 //!    rendered as a QR code (in-app only; never logged). Short-lived + single-use.
 //! 2. Joining device scans/pastes the URI, learns (topic, admin_pub, s).
 //! 3. Joining device derives an HMAC key from `s` and produces a proof MAC over
@@ -29,7 +29,7 @@ use sha2::Sha256;
 type HmacSha256 = Hmac<Sha256>;
 
 /// The pairing scheme prefix.
-const SCHEME: &str = "clipvault://pair";
+const SCHEME: &str = "fwoosh://pair";
 
 #[derive(Debug)]
 pub enum PairingError {
@@ -48,7 +48,7 @@ pub enum PairingError {
 impl std::fmt::Display for PairingError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::BadScheme => write!(f, "not a clipvault pairing URI"),
+            Self::BadScheme => write!(f, "not a fwoosh pairing URI"),
             Self::BadParams(m) => write!(f, "bad pairing params: {m}"),
             Self::BadEncoding => write!(f, "base64 decoding failed"),
             Self::InvalidProof => write!(f, "proof-of-knowledge verification failed"),
@@ -151,14 +151,14 @@ pub fn random_secret() -> [u8; 32] {
 // ---------------------------------------------------------------------------
 
 /// Derive the HMAC key from the one-time secret (HKDF-SHA256, fixed info/salt).
-/// This binds the MAC to ClipVault pairing so the secret can't be reused
+/// This binds the MAC to Fwoosh pairing so the secret can't be reused
 /// against some other protocol's expectation.
 fn mac_key(secret: &[u8; 32]) -> [u8; 32] {
     // Simple, deterministic HKDF-like extract+expand using SHA-256. We use a
     // fixed salt + info to derive a 32-byte MAC key from the pairing secret.
     // (hkdf crate isn't a direct dep; this is equivalent and avoids adding it.)
-    let salt = b"ClipVault pairing v1\0salt";
-    let info = b"ClipVault pairing v1\0mac-key";
+    let salt = b"Fwoosh pairing v1\0salt";
+    let info = b"Fwoosh pairing v1\0mac-key";
 
     // Extract: prk = HMAC(salt, secret)
     let mut prk_mac = <HmacSha256 as KeyInit>::new_from_slice(salt).expect("hmac key");
@@ -271,12 +271,12 @@ mod tests {
     #[test]
     fn rejects_wrong_scheme() {
         assert!(parse_uri("https://example.com/pair?t=x&pub=y&s=z").is_err());
-        assert!(parse_uri("clipvault://join?t=x").is_err());
+        assert!(parse_uri("fwoosh://join?t=x").is_err());
     }
 
     #[test]
     fn rejects_missing_param() {
-        let uri = "clipvault://pair?t=foo&pub=AAAA";
+        let uri = "fwoosh://pair?t=foo&pub=AAAA";
         assert!(parse_uri(uri).is_err());
     }
 
