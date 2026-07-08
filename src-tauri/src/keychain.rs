@@ -48,13 +48,6 @@ impl From<std::io::Error> for KeychainError {
     fn from(e: std::io::Error) -> Self { Self::Io(e) }
 }
 
-fn map_entry_err(e: keyring::Error) -> KeychainError {
-    match e {
-        keyring::Error::NoEntry => KeychainError::NotFound,
-        other => KeychainError::Backend(other.to_string()),
-    }
-}
-
 /// Set the directory for the file fallback. Set once at startup from lib.rs.
 static FALLBACK_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 

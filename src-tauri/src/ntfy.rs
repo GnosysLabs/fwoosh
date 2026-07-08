@@ -14,7 +14,7 @@
 
 use base64::Engine;
 use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -109,23 +109,19 @@ struct NtfyJson {
     event: Option<String>,
 }
 
-/// A publish request body.
-#[derive(Serialize)]
-struct PublishBody<'a> {
-    topic: &'a str,
-    message: &'a str,
-    title: &'a str,
-}
-
 /// Publish a single encrypted payload (manifest or one chunk) to the relay.
 ///
-/// `payload` is already-serialized bytes; we base64-encode them into the JSON
-/// `message` field. Returns the relay-assigned message id on success.
+/// `payload` is already-serialized bytes; we base64-encode them and POST the
+/// raw base64 string as the request body (NOT as JSON). ntfy stores the raw
+/// body as the `message` field, so subscribers receive exactly the base64.
+///
+/// (Posting JSON like `{"topic":...,"message":"..."}` causes ntfy to store the
+/// *entire JSON document* as the message, which breaks decoding.)
 pub async fn publish(
     base: &str,
     topic: &str,
     payload: &[u8],
-    title: &str,
+    _title: &str,
 ) -> Result<String, NtfyError> {
     if payload.len() > MAX_BODY_BYTES {
         return Err(NtfyError::TooLarge);
@@ -138,18 +134,19 @@ pub async fn publish(
         .timeout(Duration::from_secs(15))
         .build()?;
 
-    let body = PublishBody {
-        topic,
-        message: &b64,
-        title,
-    };
-    let resp = client.post(&url).json(&body).send().await?;
+    // POST the raw base64 string as the body (text/plain). ntfy treats the
+    // request body as the message content.
+    let resp = client
+        .post(&url)
+        .header("Content-Type", "text/plain")
+        .body(b64)
+        .send()
+        .await?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
         return Err(NtfyError::BadStatus(status.as_u16(), text));
     }
-    // ntfy returns a JSON ack; we don't strictly need its id for fire-and-forget.
     Ok(String::from("ok"))
 }
 

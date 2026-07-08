@@ -404,18 +404,15 @@ pub async fn handle_relay_message(
         }
         WireMessage::JoinRequest(identity) => {
             // Only the admin handles join requests (it's the only one that can
-            // sign new roster epochs).
-            let secret = state.pairing_secret.lock().await.clone();
-            let secret = match secret {
-                Some(s) => s,
-                None => return, // not the admin, or secret already consumed
-            };
+            // sign new roster epochs). Gate on having a pairing secret set.
+            let has_secret = state.pairing_secret.lock().await.is_some();
+            if !has_secret {
+                return; // not the admin
+            }
 
-            // Verify the proof-of-knowledge. NOTE: in this simplified flow the
-            // proof is published separately; here we accept the join request
-            // and trust the admin's own `since=` catch-up + topic secrecy for
-            // MVP. The full HMAC verification is layered on next.
-            // TODO: correlate the separate "proof" message with this identity.
+            // NOTE: full HMAC proof-of-knowledge verification is layered on
+            // next. For now we accept the join request and rely on topic
+            // secrecy (the unguessable ntfy topic is the bootstrap secret).
 
             let current = state.roster.lock().await.clone();
             let verified = match current {
@@ -502,6 +499,10 @@ async fn try_open_clip(
     drop(roster_guard);
 
     let my_id = state.device.signing_pub.clone();
+    // Skip our own echoed messages (the subscriber receives what we publish).
+    if manifest.sender_id == my_id {
+        return;
+    }
     let opened = crypto::open_clip(&manifest, &chunks, &state.device, current_epoch, |id, _| {
         active.contains(id) || *id == my_id
     });
