@@ -15,6 +15,9 @@
   let clips = $state<ClipDto[]>([]);
   let query = $state("");
   let pairingUri = $state("");
+  let pairingExpiresAt = $state(0);
+  let pairingRefreshing = $state(false);
+  let nowSeconds = $state(Math.floor(Date.now() / 1000));
   let joinUri = $state("");
   let showPairing = $state(false);
   let inRoom = $state(false);
@@ -48,8 +51,15 @@
   let historySearching = $derived(query.trim().length > 0);
   let peerDevices = $derived(devices.filter((d) => !d.is_self));
   let transferList = $derived(Object.values(transfers));
+  let pairingSecondsLeft = $derived(Math.max(0, pairingExpiresAt - nowSeconds));
+  let pairingExpiryLabel = $derived(formatPairingExpiry(pairingSecondsLeft));
   let toastTimer: ReturnType<typeof setTimeout> | null = null;
+  let pairingTickTimer: ReturnType<typeof setInterval> | null = null;
 
+  interface PairingCodeDto {
+    uri: string;
+    expires_at: number;
+  }
   interface ClipDto {
     id: number;
     sender: string;
@@ -116,6 +126,13 @@
   let unlisteners: Array<() => void | Promise<void>> = [];
 
   onMount(() => {
+    pairingTickTimer = setInterval(() => {
+      nowSeconds = Math.floor(Date.now() / 1000);
+      if (showPairing && pairingUri && pairingExpiresAt > 0 && nowSeconds >= pairingExpiresAt) {
+        void refreshPairingCode();
+      }
+    }, 1000);
+
     const savedTheme = localStorage.getItem("fwoosh-theme");
     const preferredTheme =
       savedTheme === "dark"
@@ -218,7 +235,13 @@
       );
     })();
 
-    return () => unlisteners.forEach((u) => void u());
+    return () => {
+      if (pairingTickTimer) {
+        clearInterval(pairingTickTimer);
+        pairingTickTimer = null;
+      }
+      unlisteners.forEach((u) => void u());
+    };
   });
 
   // ---- Actions ----
@@ -476,6 +499,51 @@
     return deviceLabelDraft.trim() || deviceLabel.trim() || "This device";
   }
 
+  function applyPairingCode(code: PairingCodeDto) {
+    pairingUri = code.uri;
+    pairingExpiresAt = code.expires_at;
+    nowSeconds = Math.floor(Date.now() / 1000);
+    showPairing = true;
+  }
+
+  function clearPairingCode() {
+    pairingUri = "";
+    pairingExpiresAt = 0;
+    showPairing = false;
+  }
+
+  function formatPairingExpiry(seconds: number) {
+    if (seconds <= 0) return "refreshing";
+    if (seconds < 60) return `${seconds}s`;
+    return `${Math.ceil(seconds / 60)}m`;
+  }
+
+  async function refreshPairingCode() {
+    if (pairingRefreshing) return false;
+    pairingRefreshing = true;
+    try {
+      const code = await invoke<PairingCodeDto>("new_pairing_code");
+      applyPairingCode(code);
+      return true;
+    } catch (e) {
+      clearPairingCode();
+      status = "err";
+      statusMsg = String(e);
+      return false;
+    } finally {
+      pairingRefreshing = false;
+    }
+  }
+
+  async function copyPairingCode() {
+    if (!pairingUri) return;
+    if (pairingExpiresAt <= nowSeconds + 5) {
+      const refreshed = await refreshPairingCode();
+      if (!refreshed) return;
+    }
+    await copyText(pairingUri, "Pairing code copied");
+  }
+
   async function hidePopup() {
     settingsOpen = false;
     await getCurrentWindow().hide();
@@ -594,10 +662,10 @@
 
   async function createRoom() {
     try {
-      pairingUri = await invoke<string>("create_room", { label: preferredDeviceLabel() });
+      const code = await invoke<PairingCodeDto>("create_room", { label: preferredDeviceLabel() });
       inRoom = true;
       await refreshRoom(true);
-      showPairing = true;
+      applyPairingCode(code);
     } catch (e) {
       status = "err";
       statusMsg = String(e);
@@ -706,6 +774,7 @@
       inRoom = false;
       devices = [];
       devicesExpanded = false;
+      clearPairingCode();
       status = "idle";
     } catch (e) {
       status = "err";
@@ -728,13 +797,7 @@
   }
 
   async function createPairingCode() {
-    try {
-      pairingUri = await invoke<string>("new_pairing_code");
-      showPairing = true;
-    } catch (e) {
-      status = "err";
-      statusMsg = String(e);
-    }
+    await refreshPairingCode();
   }
 
   async function revokeDevice(id: string) {
@@ -1089,12 +1152,15 @@
         <h3>Pair a device</h3>
         <p class="muted small"
           >Scan this on another device, or share the code. Single-use - keep it
-          private.</p
+          private. Expires in {pairingExpiryLabel}.</p
         >
         <code class="pair-code">{pairingUri}</code>
-        <button class="ghost" onclick={() => copyText(pairingUri, "Pairing code copied")}
-          >Copy pairing code</button
-        >
+        <div class="pairing-actions">
+          <button class="ghost" onclick={copyPairingCode} disabled={pairingRefreshing}
+            >{pairingRefreshing ? "Refreshing..." : "Copy pairing code"}</button
+          >
+          <button class="ghost" onclick={refreshPairingCode} disabled={pairingRefreshing}>New code</button>
+        </div>
         <button class="send-btn" onclick={() => (showPairing = false)}>Done</button>
       </div>
     </div>
@@ -1984,6 +2050,15 @@
     color: #818cf8;
     word-break: break-all;
     user-select: text;
+  }
+  .pairing-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .pairing-actions .ghost {
+    flex: 1 1 130px;
+    min-height: 36px;
   }
   .confirm-dialog {
     width: 84%;
