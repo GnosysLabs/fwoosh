@@ -322,6 +322,28 @@ pub fn build_add_device(prev: &RosterEntry, new_device: DeviceIdentity) -> Roste
     }
 }
 
+/// Build a new epoch that updates an active device's label.
+pub fn build_update_device_label(
+    prev: &RosterEntry,
+    device_id: &Ed25519PubKey,
+    label: &str,
+) -> Result<RosterEntry, RosterError> {
+    let mut devices = prev.devices.clone();
+    let Some(device) = devices.iter_mut().find(|d| &d.signing_pub == device_id) else {
+        return Err(RosterError::BadInput("device to rename is not active"));
+    };
+    device.label = label.to_string();
+    Ok(RosterEntry {
+        epoch: prev.epoch + 1,
+        prev_hash: [0u8; 32], // filled by sign_and_chain
+        topic: prev.topic.clone(),
+        devices,
+        revoked: prev.revoked.clone(),
+        admin_id: prev.admin_id.clone(),
+        signature: Vec::new(),
+    })
+}
+
 /// Build a new epoch that REVOKES a device AND rotates the topic. Returns the
 /// unsigned entry; the caller should also publish the new topic to remaining
 /// members so they can resubscribe.

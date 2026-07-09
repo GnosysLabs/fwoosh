@@ -25,6 +25,12 @@ pub const DEFAULT_BASE: &str = "https://ntfy.sh";
 /// (after base64 expansion). See crypto::CHUNK_SIZE for the plaintext cap.
 pub const MAX_BODY_BYTES: usize = 3500;
 
+fn ensure_rustls_crypto_provider() {
+    // WebRTC and the HTTPS/WebSocket stack can enable different Rustls crypto
+    // backends transitively. Pick one explicitly before any TLS client starts.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 #[derive(Debug)]
 pub enum NtfyError {
     /// A non-TLS base URL was configured. We never allow plaintext transport.
@@ -127,6 +133,7 @@ pub async fn publish(
     payload: &[u8],
     _title: &str,
 ) -> Result<String, NtfyError> {
+    ensure_rustls_crypto_provider();
     let https_base = require_tls_base(base)?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(payload);
     if b64.len() > MAX_BODY_BYTES {
@@ -180,6 +187,7 @@ pub fn spawn_subscriber(
     out: mpsc::Sender<RelayMessage>,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> tokio::task::JoinHandle<()> {
+    ensure_rustls_crypto_provider();
     tokio::spawn(async move {
         let https_base = match require_tls_base(&cfg.base) {
             Ok(b) => b,
@@ -222,14 +230,18 @@ pub fn spawn_subscriber(
                             }
                         };
                         if let Some(text) = msg.into_text().ok() {
-                            // Log raw text for diagnosis (doesn't contain the topic secret;
-                            // ntfy messages include the topic, so redact it).
-                            let preview = if text.len() > 120 {
-                                &text[..120]
-                            } else {
-                                &text
-                            };
-                            eprintln!("[ntfy] received: {preview}");
+                            let is_idle_event = text.contains(r#""event":"open""#)
+                                || text.contains(r#""event":"keepalive""#);
+                            if !is_idle_event {
+                                // Log raw text for diagnosis (doesn't contain the topic secret;
+                                // ntfy messages include the topic, so redact it).
+                                let preview = if text.len() > 120 {
+                                    &text[..120]
+                                } else {
+                                    &text
+                                };
+                                eprintln!("[ntfy] received: {preview}");
+                            }
                             if let Some(rm) = decode_ntfy_json(&text) {
                                 eprintln!(
                                     "[ntfy] decoded message, {} bytes payload",

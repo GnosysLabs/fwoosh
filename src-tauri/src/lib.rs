@@ -48,6 +48,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_shortcut(Shortcut::new(
@@ -86,8 +87,15 @@ pub fn run() {
 
             // Set the roster persistence path + load any saved room.
             let roster_path = app_data.join("roster.bin");
+            let settings_path = app_data.join("settings.json");
             if let Ok(mut rp) = state.roster_path.try_lock() {
                 *rp = Some(roster_path.clone());
+            }
+            if let Ok(mut sp) = state.settings_path.try_lock() {
+                *sp = Some(settings_path.clone());
+            }
+            if let Ok(mut settings) = state.settings.try_lock() {
+                *settings = commands::load_settings(&settings_path);
             }
             let mut startup_topic = None;
             if let Some(entry) = commands::load_persisted_roster(&roster_path) {
@@ -163,10 +171,18 @@ pub fn run() {
             commands::new_pairing_code,
             commands::join_room,
             commands::leave_room,
+            commands::suggest_device_label,
+            commands::rename_device,
+            commands::network_settings,
+            commands::set_stun_servers,
             commands::room_state,
             commands::roster_devices,
             commands::revoke_device,
             commands::send_clip,
+            commands::start_file_send,
+            commands::accept_file_transfer,
+            commands::reject_file_transfer,
+            commands::cancel_file_transfer,
             commands::recent_clips,
             commands::search_clips,
             commands::delete_clip,
