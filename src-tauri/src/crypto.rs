@@ -170,7 +170,7 @@ pub struct RecipientWrap {
 /// `SIG_DOMAIN`.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Manifest {
-    pub msg_id: [u8; 16], // UUIDv4 bytes
+    pub msg_id: [u8; 16], // random 128-bit message id
     pub room_id: String,  // ntfy topic
     pub roster_epoch: u64,
     pub sender_id: Ed25519PubKey,

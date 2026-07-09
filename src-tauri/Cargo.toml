@@ -19,19 +19,16 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
-tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # --- crypto ---
 # rand 0.9 + rand_core 0.9 to match hpke 0.13's expected rand_core.
 rand = "0.9"
-x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
 chacha20poly1305 = "0.11.0"
 hpke = { version = "0.13.0", features = ["std", "x25519"] }
 postcard = { version = "1.1.3", features = ["alloc"] }
 sha2 = "0.11.0"
-uuid = { version = "1.23.4", features = ["v4"] }
 base64 = { version = "0.22.1", features = ["std"] }
 bytes = { version = "1.12.0", features = ["serde"] }
 hex = "0.4.3"
@@ -47,7 +44,6 @@ hmac = "0.13.0"
 tauri-plugin-global-shortcut = "2.3.2"
 tauri-plugin-clipboard-manager = "2.3.2"
 tauri-plugin-notification = "2.3.3"
-tauri-plugin-autostart = "2.5.1"
 tauri-plugin-dialog = "2"
 webrtc = "0.17.1"
 whoami = "2.1.2"

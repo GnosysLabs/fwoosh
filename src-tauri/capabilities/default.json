@@ -9,15 +9,9 @@
     "core:window:allow-hide",
     "core:window:allow-set-focus",
     "core:window:allow-start-dragging",
-    "opener:default",
-    "global-shortcut:allow-register",
-    "global-shortcut:allow-unregister",
     "clipboard-manager:allow-write-text",
     "notification:default",
     "notification:allow-notify",
-    "dialog:default",
-    "autostart:allow-enable",
-    "autostart:allow-disable",
-    "autostart:allow-is-enabled"
+    "dialog:default"
   ]
 }

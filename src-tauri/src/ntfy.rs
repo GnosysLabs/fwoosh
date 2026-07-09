@@ -233,14 +233,18 @@ pub fn spawn_subscriber(
                             let is_idle_event = text.contains(r#""event":"open""#)
                                 || text.contains(r#""event":"keepalive""#);
                             if !is_idle_event {
-                                // Log raw text for diagnosis (doesn't contain the topic secret;
-                                // ntfy messages include the topic, so redact it).
-                                let preview = if text.len() > 120 {
-                                    &text[..120]
-                                } else {
-                                    &text
-                                };
-                                eprintln!("[ntfy] received: {preview}");
+                                match serde_json::from_str::<NtfyJson>(&text) {
+                                    Ok(parsed) => eprintln!(
+                                        "[ntfy] received event={} id={} message_bytes={}",
+                                        parsed.event.as_deref().unwrap_or("message"),
+                                        parsed.id.as_deref().unwrap_or("<none>"),
+                                        parsed.message.as_ref().map(|m| m.len()).unwrap_or(0)
+                                    ),
+                                    Err(_) => eprintln!(
+                                        "[ntfy] received non-json websocket message ({} bytes)",
+                                        text.len()
+                                    ),
+                                }
                             }
                             if let Some(rm) = decode_ntfy_json(&text) {
                                 eprintln!(

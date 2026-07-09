@@ -396,12 +396,6 @@ fn now_unix() -> u64 {
 //  Commands callable from the frontend
 // =========================================================================
 
-/// Returns the device's identity (Ed25519 pubkey hex + label) for display.
-#[tauri::command]
-pub fn device_identity(state: State<'_, Arc<AppState>>) -> String {
-    hex::encode(state.device.signing_pub.0)
-}
-
 pub fn load_settings(path: &Path) -> AppSettings {
     let Ok(bytes) = std::fs::read(path) else {
         return AppSettings::default();
