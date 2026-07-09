@@ -187,7 +187,6 @@ pub struct PendingIncomingTransfer {
     sender_id: crypto::Ed25519PubKey,
     file_name: String,
     size: u64,
-    sha256: [u8; 32],
     content_key: [u8; 32],
     nonce_prefix: [u8; FILE_NONCE_PREFIX_LEN],
     offer_sdp_json: String,
@@ -248,7 +247,6 @@ pub enum FileSignal {
         session_id: String,
         file_name: String,
         size: u64,
-        sha256: [u8; 32],
         content_key: [u8; 32],
         nonce_prefix: [u8; FILE_NONCE_PREFIX_LEN],
         sdp_json: String,
@@ -269,9 +267,19 @@ pub enum FileSignal {
 
 #[derive(Serialize, Deserialize)]
 enum FileFrame {
-    Chunk { index: u64, ct: Vec<u8> },
-    Finish,
-    Cancel { reason: String },
+    Chunk {
+        index: u64,
+        ct: Vec<u8>,
+    },
+    /// Carries the checksum of the plaintext stream. Keeping it in the final
+    /// authenticated frame lets the sender calculate it while streaming rather
+    /// than making a full pre-transfer pass over the file.
+    Finish {
+        sha256: [u8; 32],
+    },
+    Cancel {
+        reason: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -286,7 +294,6 @@ struct ReceiverWriteState {
     total: u64,
     received: u64,
     next_index: u64,
-    sha256: [u8; 32],
     content_key: [u8; 32],
     nonce_prefix: [u8; FILE_NONCE_PREFIX_LEN],
     file: Option<tokio::fs::File>,
@@ -301,7 +308,6 @@ struct OutgoingFilePayload {
     path: PathBuf,
     file_name: String,
     total: u64,
-    sha256: [u8; 32],
     content_key: [u8; 32],
     nonce_prefix: [u8; FILE_NONCE_PREFIX_LEN],
 }
@@ -1229,7 +1235,6 @@ pub async fn start_file_send(
     let (recipient_label, recipient_identity, topic, epoch) =
         recipient_for_transfer(state.inner(), &recipient).await?;
 
-    let sha256 = hash_file_blocking(path.clone()).await?;
     let mut content_key = [0u8; 32];
     rand::rng().fill_bytes(&mut content_key);
     let mut nonce_prefix = [0u8; FILE_NONCE_PREFIX_LEN];
@@ -1259,7 +1264,6 @@ pub async fn start_file_send(
         path: path.clone(),
         file_name: file_name.clone(),
         total: size,
-        sha256,
         content_key,
         nonce_prefix,
     };
@@ -1315,7 +1319,6 @@ pub async fn start_file_send(
         session_id: session_id.clone(),
         file_name: file_name.clone(),
         size,
-        sha256,
         content_key,
         nonce_prefix,
         sdp_json,
@@ -1514,7 +1517,6 @@ pub async fn accept_file_transfer(
             total: pending.size,
             received: 0,
             next_index: 0,
-            sha256: pending.sha256,
             content_key: pending.content_key,
             nonce_prefix: pending.nonce_prefix,
             file: Some(file),
@@ -2465,7 +2467,6 @@ async fn handle_file_signal(
             session_id,
             file_name,
             size,
-            sha256,
             content_key,
             nonce_prefix,
             sdp_json,
@@ -2501,7 +2502,6 @@ async fn handle_file_signal(
                         sender_id: sender_id.clone(),
                         file_name: file_name.clone(),
                         size,
-                        sha256,
                         content_key,
                         nonce_prefix,
                         offer_sdp_json: sdp_json,
@@ -2618,24 +2618,6 @@ async fn handle_file_signal(
             );
         }
     }
-}
-
-async fn hash_file_blocking(path: PathBuf) -> Result<[u8; 32], String> {
-    tokio::task::spawn_blocking(move || {
-        let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-        let mut hasher = Sha256::new();
-        let mut buf = [0u8; 64 * 1024];
-        loop {
-            let n = std::io::Read::read(&mut file, &mut buf).map_err(|e| e.to_string())?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-        }
-        Ok(hasher.finalize().into())
-    })
-    .await
-    .map_err(|e| e.to_string())?
 }
 
 async fn new_peer_connection(stun_servers: Vec<String>) -> Result<Arc<RTCPeerConnection>, String> {
@@ -2765,10 +2747,14 @@ async fn send_file_over_channel(
     let mut buf = vec![0u8; FILE_CHUNK_SIZE];
     let mut index = 0u64;
     let mut sent = 0u64;
+    let mut hasher = Sha256::new();
     loop {
         let n = file.read(&mut buf).await.map_err(|e| e.to_string())?;
         if n == 0 {
             break;
+        }
+        if sent.saturating_add(n as u64) > payload.total {
+            return Err("source file size changed during transfer".to_string());
         }
         let nonce = file_chunk_nonce(&payload.nonce_prefix, index);
         let aad = file_chunk_aad(&session_id, index);
@@ -2795,6 +2781,7 @@ async fn send_file_over_channel(
         dc.send(&Bytes::from(frame))
             .await
             .map_err(|e| e.to_string())?;
+        hasher.update(&buf[..n]);
         sent += n as u64;
         index += 1;
         let _ = app.emit(
@@ -2808,7 +2795,11 @@ async fn send_file_over_channel(
             },
         );
     }
-    let frame = postcard::to_allocvec(&FileFrame::Finish).map_err(|e| e.to_string())?;
+    if sent != payload.total {
+        return Err("source file size changed during transfer".to_string());
+    }
+    let sha256: [u8; 32] = hasher.finalize().into();
+    let frame = postcard::to_allocvec(&FileFrame::Finish { sha256 }).map_err(|e| e.to_string())?;
     dc.send(&Bytes::from(frame))
         .await
         .map_err(|e| e.to_string())?;
@@ -2824,7 +2815,7 @@ async fn send_file_over_channel(
             "session_id": session_id,
             "file_name": payload.file_name,
             "size": payload.total,
-            "sha256": hex::encode(payload.sha256),
+            "sha256": hex::encode(sha256),
             "direction": "outgoing"
         }),
     );
@@ -2885,8 +2876,8 @@ async fn handle_file_frame(
             );
             Ok(())
         }
-        FileFrame::Finish => {
-            let (session_id, final_path, part_path, file_name, total, expected, computed) = {
+        FileFrame::Finish { sha256: expected } => {
+            let (session_id, final_path, part_path, file_name, total, computed) = {
                 let mut guard = write_state.lock().await;
                 if guard.done {
                     return Ok(());
@@ -2909,7 +2900,6 @@ async fn handle_file_frame(
                     guard.part_path.clone(),
                     guard.file_name.clone(),
                     guard.total,
-                    guard.sha256,
                     computed,
                 )
             };
@@ -3303,6 +3293,15 @@ mod tests {
     }
 
     #[test]
+    fn file_finish_frame_carries_stream_checksum() {
+        let sha256 = [0xA5; 32];
+        let bytes = postcard::to_allocvec(&FileFrame::Finish { sha256 }).unwrap();
+        let frame: FileFrame = postcard::from_bytes(&bytes).unwrap();
+
+        assert!(matches!(frame, FileFrame::Finish { sha256: actual } if actual == sha256));
+    }
+
+    #[test]
     fn legacy_settings_default_transfer_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
@@ -3340,7 +3339,6 @@ mod tests {
                 sender_id: crypto::Ed25519PubKey([1u8; 32]),
                 file_name: "large.bin".to_string(),
                 size: u64::from(u32::MAX) + 1,
-                sha256: [2u8; 32],
                 content_key: [3u8; 32],
                 nonce_prefix: [4u8; FILE_NONCE_PREFIX_LEN],
                 offer_sdp_json: "{}".to_string(),
@@ -3365,7 +3363,6 @@ mod tests {
                 sender_id: crypto::Ed25519PubKey([1u8; 32]),
                 file_name: "complete.bin".to_string(),
                 size: 1,
-                sha256: [2u8; 32],
                 content_key: [3u8; 32],
                 nonce_prefix: [4u8; FILE_NONCE_PREFIX_LEN],
                 offer_sdp_json: "{}".to_string(),

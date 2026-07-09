@@ -139,6 +139,9 @@ pub fn run() {
             let _tray = TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
+                // Let the click handler below open the popup; keep the menu
+                // accessible with a secondary click.
+                .show_menu_on_left_click(false)
                 .tooltip("Fwoosh")
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => show_popup(app),
@@ -208,6 +211,17 @@ pub fn run() {
             commands::show_main_window,
             commands::notify_incoming_clip,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Fwoosh");
+        .build(tauri::generate_context!())
+        .expect("error while building Fwoosh")
+        .run(|app, event| {
+            // macOS emits this when the user clicks the Dock icon while every
+            // app window is hidden. Restore our tray-style popup in response.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = event {
+                show_popup(app);
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
+        });
 }
