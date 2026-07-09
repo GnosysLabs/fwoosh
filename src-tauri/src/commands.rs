@@ -159,6 +159,12 @@ pub struct NetworkSettingsDto {
     pub stun_servers: Vec<String>,
 }
 
+#[derive(Serialize)]
+pub struct PairingCodeDto {
+    pub uri: String,
+    pub expires_at: u64,
+}
+
 pub enum TransferRecord {
     PendingIncoming(PendingIncomingTransfer),
     Outgoing(OutgoingTransfer),
@@ -433,6 +439,20 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn pairing_expires_at(now: u64) -> u64 {
+    now + PAIRING_SECRET_TTL_SECS
+}
+
+async fn issue_pairing_code(state: &Arc<AppState>, topic: &str) -> PairingCodeDto {
+    let secret = crate::pairing::random_secret();
+    let expires_at = pairing_expires_at(now_unix());
+    *state.pairing_secret.lock().await = Some(PendingPairingSecret { secret, expires_at });
+    PairingCodeDto {
+        uri: crate::pairing::build_uri(topic, &state.device.signing_pub, &secret),
+        expires_at,
+    }
 }
 
 // =========================================================================
@@ -754,7 +774,7 @@ pub async fn create_room(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
     label: String,
-) -> Result<String, String> {
+) -> Result<PairingCodeDto, String> {
     let label = sanitize_device_label(&label).unwrap_or_else(|_| detected_device_label());
     let topic = roster::new_topic();
     let genesis = roster::build_genesis(&state.device, &label, &topic);
@@ -771,17 +791,11 @@ pub async fn create_room(
     broadcast_roster(&state, &signed, &topic).await;
 
     // Generate the one-time pairing secret. Stored so we can verify join proofs.
-    let secret = crate::pairing::random_secret();
-    *state.pairing_secret.lock().await = Some(PendingPairingSecret {
-        secret,
-        expires_at: now_unix() + PAIRING_SECRET_TTL_SECS,
-    });
-    let uri = crate::pairing::build_uri(&topic, &state.device.signing_pub, &secret);
-    Ok(uri)
+    Ok(issue_pairing_code(&state, &topic).await)
 }
 
 #[tauri::command]
-pub async fn new_pairing_code(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+pub async fn new_pairing_code(state: State<'_, Arc<AppState>>) -> Result<PairingCodeDto, String> {
     let guard = state.roster.lock().await;
     let verified = guard.as_ref().ok_or("not in a room")?;
     if state.device.signing_pub != verified.entry.admin_id {
@@ -790,16 +804,7 @@ pub async fn new_pairing_code(state: State<'_, Arc<AppState>>) -> Result<String,
     let topic = verified.topic().to_string();
     drop(guard);
 
-    let secret = crate::pairing::random_secret();
-    *state.pairing_secret.lock().await = Some(PendingPairingSecret {
-        secret,
-        expires_at: now_unix() + PAIRING_SECRET_TTL_SECS,
-    });
-    Ok(crate::pairing::build_uri(
-        &topic,
-        &state.device.signing_pub,
-        &secret,
-    ))
+    Ok(issue_pairing_code(&state, &topic).await)
 }
 
 #[tauri::command]
@@ -3127,6 +3132,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(loaded.epoch(), 0);
+    }
+
+    #[test]
+    fn pairing_expiry_uses_configured_ttl() {
+        assert_eq!(pairing_expires_at(1_000), 1_000 + PAIRING_SECRET_TTL_SECS);
     }
 }
 
