@@ -80,8 +80,36 @@ npm run tauri build
 # Output: src-tauri/target/release/bundle/dmg/fwoosh_0.1.0_*.dmg
 ```
 
-That `.dmg` is the installer you can share with other Mac users (unsigned —
-they'll need to right-click → Open the first time, since it's not notarized).
+For throwaway local testing, an unsigned DMG can be opened with right-click ->
+Open. Do not use unsigned or ad-hoc-signed builds as the normal update path:
+macOS Keychain authorization is tracked against the app's code-signing
+requirement, so every rebuilt unsigned app can look like a different app and
+trigger repeated "Fwoosh wants to use your confidential information" prompts.
+
+For builds you keep updating, sign with the same Apple code-signing identity
+every time. On the Mac that builds the app:
+
+```bash
+security find-identity -v -p codesigning
+export APPLE_SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)"
+npm run tauri build
+```
+
+For sharing outside your own Mac, use a paid Apple Developer account and
+notarize the build too:
+
+```bash
+export APPLE_ID="you@example.com"
+export APPLE_PASSWORD="app-specific-password"
+export APPLE_TEAM_ID="TEAMID"
+export APPLE_SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)"
+npm run tauri build
+```
+
+After moving from an unsigned build to a consistently signed build, macOS may
+ask for Keychain access once more. Choose **Always Allow** for the signed app.
+Future updates signed with the same identity should not re-prompt for the same
+Keychain item.
 
 ---
 

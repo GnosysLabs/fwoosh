@@ -18,8 +18,10 @@ use std::sync::OnceLock;
 const SERVICE: &str = "fwoosh";
 
 /// Sub-entries stored under the service.
+const ENTRY_CORE_SECRETS: &str = "core-secrets-v1";
 const ENTRY_DEVICE_KEYS: &str = "device-keypairs";
 const ENTRY_DB_KEY: &str = "history-db-key";
+const CORE_SECRETS_MAGIC: &[u8] = b"fwoosh-core-v1\0";
 
 #[derive(Debug)]
 pub enum KeychainError {
@@ -198,17 +200,105 @@ fn fallback_write(name: &str, blob: &[u8]) -> Result<(), KeychainError> {
 }
 
 // ---------------------------------------------------------------------------
+//  Combined app secrets
+// ---------------------------------------------------------------------------
+
+fn encode_device_keypairs(kp: &DeviceKeypairs) -> Vec<u8> {
+    let (ed, x25519) = kp.to_bytes();
+    let mut blob = Vec::with_capacity(64);
+    blob.extend_from_slice(&ed);
+    blob.extend_from_slice(&x25519);
+    blob
+}
+
+fn decode_device_keypairs(blob: &[u8]) -> Result<DeviceKeypairs, KeychainError> {
+    if blob.len() != 64 {
+        return Err(KeychainError::Corrupt("expected 64 bytes (ed||x25519)"));
+    }
+    let mut ed = [0u8; 32];
+    let mut x25519 = [0u8; 32];
+    ed.copy_from_slice(&blob[..32]);
+    x25519.copy_from_slice(&blob[32..]);
+    Ok(DeviceKeypairs::from_bytes(ed, x25519))
+}
+
+fn decode_db_key(blob: &[u8]) -> Result<[u8; 32], KeychainError> {
+    if blob.len() != 32 {
+        return Err(KeychainError::Corrupt("db key must be 32 bytes"));
+    }
+    let mut k = [0u8; 32];
+    k.copy_from_slice(blob);
+    Ok(k)
+}
+
+fn generate_db_key() -> [u8; 32] {
+    let mut k = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::rng(), &mut k);
+    k
+}
+
+fn encode_core_secrets(kp: &DeviceKeypairs, db_key: &[u8; 32]) -> Vec<u8> {
+    let mut blob = Vec::with_capacity(CORE_SECRETS_MAGIC.len() + 96);
+    blob.extend_from_slice(CORE_SECRETS_MAGIC);
+    blob.extend_from_slice(&encode_device_keypairs(kp));
+    blob.extend_from_slice(db_key);
+    blob
+}
+
+fn decode_core_secrets(blob: &[u8]) -> Result<(DeviceKeypairs, [u8; 32]), KeychainError> {
+    if !blob.starts_with(CORE_SECRETS_MAGIC) {
+        return Err(KeychainError::Corrupt("unknown core secrets format"));
+    }
+    let payload = &blob[CORE_SECRETS_MAGIC.len()..];
+    if payload.len() != 96 {
+        return Err(KeychainError::Corrupt("expected 96 bytes of core secrets"));
+    }
+    let device = decode_device_keypairs(&payload[..64])?;
+    let db_key = decode_db_key(&payload[64..])?;
+    Ok((device, db_key))
+}
+
+fn load_core_secrets() -> Result<(DeviceKeypairs, [u8; 32]), KeychainError> {
+    let blob = get_secret(ENTRY_CORE_SECRETS)?;
+    decode_core_secrets(&blob)
+}
+
+fn save_core_secrets(kp: &DeviceKeypairs, db_key: &[u8; 32]) -> Result<(), KeychainError> {
+    set_secret(ENTRY_CORE_SECRETS, &encode_core_secrets(kp, db_key))
+}
+
+/// Load both app secrets through one keychain item. Older builds stored the
+/// device keys and history DB key separately; migrate them into the combined
+/// item the first time this newer code runs.
+pub fn load_or_create_core_secrets() -> Result<(DeviceKeypairs, [u8; 32]), KeychainError> {
+    match load_core_secrets() {
+        Ok(secrets) => Ok(secrets),
+        Err(KeychainError::NotFound) => {
+            let device = match load_device_keypairs() {
+                Ok(kp) => kp,
+                Err(KeychainError::NotFound) => DeviceKeypairs::generate(),
+                Err(e) => return Err(e),
+            };
+            let db_key = match load_db_key() {
+                Ok(k) => k,
+                Err(KeychainError::NotFound) => generate_db_key(),
+                Err(e) => return Err(e),
+            };
+            save_core_secrets(&device, &db_key)?;
+            Ok((device, db_key))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+// ---------------------------------------------------------------------------
 //  Device keypairs
 // ---------------------------------------------------------------------------
 
 /// Persist a device's keypairs. Stores 64 bytes: `ed25519_secret(32) ||
 /// x25519_secret(32)`.
 pub fn save_device_keypairs(kp: &DeviceKeypairs) -> Result<(), KeychainError> {
-    let (ed, x25519) = kp.to_bytes();
-    let mut blob = Vec::with_capacity(64);
-    blob.extend_from_slice(&ed);
-    blob.extend_from_slice(&x25519);
-    set_secret(ENTRY_DEVICE_KEYS, &blob)
+    set_secret(ENTRY_DEVICE_KEYS, &encode_device_keypairs(kp))
 }
 
 /// Load the device keypairs, or generate + persist new ones on first run.
@@ -227,14 +317,7 @@ pub fn load_or_create_device_keypairs() -> Result<DeviceKeypairs, KeychainError>
 /// Load existing keypairs (returns NotFound if absent).
 pub fn load_device_keypairs() -> Result<DeviceKeypairs, KeychainError> {
     let blob = get_secret(ENTRY_DEVICE_KEYS)?;
-    if blob.len() != 64 {
-        return Err(KeychainError::Corrupt("expected 64 bytes (ed||x25519)"));
-    }
-    let mut ed = [0u8; 32];
-    let mut x25519 = [0u8; 32];
-    ed.copy_from_slice(&blob[..32]);
-    x25519.copy_from_slice(&blob[32..]);
-    Ok(DeviceKeypairs::from_bytes(ed, x25519))
+    decode_device_keypairs(&blob)
 }
 
 // ---------------------------------------------------------------------------
@@ -253,8 +336,7 @@ pub fn load_or_create_db_key() -> Result<[u8; 32], KeychainError> {
     match load_db_key() {
         Ok(k) => Ok(k),
         Err(KeychainError::NotFound) => {
-            let mut k = [0u8; 32];
-            rand::RngCore::fill_bytes(&mut rand::rng(), &mut k);
+            let k = generate_db_key();
             save_db_key(&k)?;
             Ok(k)
         }
@@ -265,17 +347,12 @@ pub fn load_or_create_db_key() -> Result<[u8; 32], KeychainError> {
 /// Load the existing history DB key (returns NotFound if absent).
 pub fn load_db_key() -> Result<[u8; 32], KeychainError> {
     let blob = get_secret(ENTRY_DB_KEY)?;
-    if blob.len() != 32 {
-        return Err(KeychainError::Corrupt("db key must be 32 bytes"));
-    }
-    let mut k = [0u8; 32];
-    k.copy_from_slice(&blob);
-    Ok(k)
+    decode_db_key(&blob)
 }
 
 /// Delete all Fwoosh secrets (used by "leave room" / factory reset).
 pub fn delete_all() -> Result<(), KeychainError> {
-    for user in [ENTRY_DEVICE_KEYS, ENTRY_DB_KEY] {
+    for user in [ENTRY_CORE_SECRETS, ENTRY_DEVICE_KEYS, ENTRY_DB_KEY] {
         if let Ok(entry) = Entry::new(SERVICE, user) {
             let _ = entry.delete_credential();
         }
@@ -296,10 +373,15 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         set_fallback_dir(dir.clone());
 
+        let kp = DeviceKeypairs::generate();
+        save_device_keypairs(&kp).unwrap();
         let key = [7u8; 32];
         save_db_key(&key).unwrap();
         let got = load_db_key().unwrap();
         assert_eq!(got, key);
+        let (migrated_kp, migrated_key) = load_or_create_core_secrets().unwrap();
+        assert_eq!(migrated_kp.signing_pub, kp.signing_pub);
+        assert_eq!(migrated_key, key);
         let _ = delete_all();
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -106,6 +106,12 @@
     await getCurrentWindow().hide();
   }
 
+  function startLogoDrag(e: MouseEvent) {
+    if (e.button !== 0 || !/^Mac/.test(navigator.platform)) return;
+    e.preventDefault();
+    void getCurrentWindow().startDragging();
+  }
+
   async function refreshRoom(collapseDevices = false) {
     try {
       const wasInRoom = inRoom;
@@ -364,8 +370,14 @@
 
 <div class="card" data-tauri-drag-region>
   <header class="header" data-tauri-drag-region>
-    <div class="title">
-      <img class="brand-logo" src={logoSrc} alt="Fwoosh" draggable="false" />
+    <div class="title" role="presentation" data-tauri-drag-region onmousedown={startLogoDrag}>
+      <img
+        class="brand-logo"
+        src={logoSrc}
+        alt="Fwoosh"
+        draggable="false"
+        data-tauri-drag-region
+      />
     </div>
     <div class="tabs">
       <button
@@ -710,7 +722,7 @@
     height: 32px;
     object-fit: contain;
     object-position: left center;
-    pointer-events: none;
+    -webkit-app-region: drag;
     user-select: none;
   }
   .window-actions {

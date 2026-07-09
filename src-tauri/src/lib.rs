@@ -76,10 +76,8 @@ pub fn run() {
                 .unwrap_or_else(|_| std::env::temp_dir());
             keychain::set_fallback_dir(app_data.clone());
 
-            let device = keychain::load_or_create_device_keypairs()
-                .expect("failed to load device keypairs (and no file fallback)");
-            let db_key = keychain::load_or_create_db_key()
-                .expect("failed to load history DB key (and no file fallback)");
+            let (device, db_key) = keychain::load_or_create_core_secrets()
+                .expect("failed to load app secrets (and no file fallback)");
             let db_path = app_data.join("history.db");
             let store =
                 store::HistoryStore::open(&db_path, &db_key).expect("failed to open history store");
