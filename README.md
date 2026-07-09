@@ -60,10 +60,14 @@ automation in CI.
   checks, and a local seen-message cache).
 - ✅ **Revocation** (admin drops pubkey, rotates the ntfy topic, and sends the
   new roster to remaining devices through an encrypted move message).
-- ❌ **Not protected:** relay metadata (unguessable topic, timing, size, IPs);
-  topic leaks via HTTPS URLs/logs; ~12h ntfy cache window for offline catch-up.
-- ❌ **No forward secrecy** (deferred — ratcheting is fragile on a lossy relay).
-- ❌ Same-user malware defeats the OS keychain (standard limitation).
+- **Known limit: relay metadata.** The relay can observe topic URLs, timing,
+  message sizes, and IPs. The default public relay also keeps encrypted messages
+  briefly for offline catch-up.
+- **Known limit: no forward secrecy in v1.** Message ratcheting is deferred
+  because it is easy to get wrong over a lossy relay with offline catch-up.
+- **Known limit: endpoint compromise.** Malware running as the same logged-in
+  user can access OS-keychain-backed secrets; this is a standard OS credential
+  storage boundary.
 
 ## Building
 
