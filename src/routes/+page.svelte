@@ -5,7 +5,7 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 
-  type Theme = "hacker" | "light" | "onyx";
+  type Theme = "hacker" | "light" | "onyx" | "melanzana";
 
   // ---- State ----
   let text = $state("");
@@ -45,7 +45,7 @@
   let logoSrc = $derived(
     theme === "light"
       ? "/fwoosh_dark.webp"
-      : theme === "onyx"
+      : theme === "onyx" || theme === "melanzana"
         ? "/fwoosh_onyx.webp"
         : "/fwoosh_light.webp"
   );
@@ -139,7 +139,10 @@
     const preferredTheme =
       savedTheme === "dark"
         ? "hacker"
-        : savedTheme === "light" || savedTheme === "hacker" || savedTheme === "onyx"
+        : savedTheme === "light" ||
+            savedTheme === "hacker" ||
+            savedTheme === "onyx" ||
+            savedTheme === "melanzana"
           ? savedTheme
         : window.matchMedia?.("(prefers-color-scheme: light)").matches
           ? "light"
@@ -917,6 +920,12 @@
                 role="radio"
                 aria-checked={theme === "onyx"}
                 onclick={() => setTheme("onyx")}>Onyx</button
+              >
+              <button
+                class:active={theme === "melanzana"}
+                role="radio"
+                aria-checked={theme === "melanzana"}
+                onclick={() => setTheme("melanzana")}>Melanzana</button
               >
             </div>
           </div>
@@ -2693,6 +2702,41 @@
       inset 0 -42px 80px rgba(255, 255, 255, 0.02);
   }
 
+  :global(html[data-theme="melanzana"]) .card {
+    --window-stroke: rgba(255, 146, 216, 0.34);
+    --shell-bg: #090009;
+    --shell-top: #160016;
+    --panel: #110011;
+    --panel-raised: #1b031a;
+    --field: #050005;
+    --field-strong: #150014;
+    --line: rgba(255, 141, 213, 0.24);
+    --line-soft: rgba(255, 141, 213, 0.14);
+    --line-strong: rgba(255, 178, 230, 0.58);
+    --text: #eaddea;
+    --text-strong: #fff4ff;
+    --muted: #b49ab1;
+    --muted-soft: #80607d;
+    --accent: #ff9bd8;
+    --accent-hover: #ffc0e9;
+    --accent-text: #180014;
+    --mint: #9ef2d6;
+    --mint-panel: rgba(57, 156, 133, 0.18);
+    --danger: #ff8f9b;
+    --danger-panel: rgba(105, 19, 42, 0.48);
+    --danger-line: rgba(255, 143, 155, 0.42);
+    --focus: rgba(255, 155, 216, 0.2);
+    background:
+      radial-gradient(circle at 20% -12%, rgba(255, 155, 216, 0.16), transparent 36%),
+      radial-gradient(circle at 88% 12%, rgba(158, 242, 214, 0.1), transparent 32%),
+      radial-gradient(circle at 50% 110%, rgba(128, 31, 120, 0.2), transparent 46%),
+      linear-gradient(180deg, var(--shell-top) 0%, #0c000c 48%, var(--shell-bg) 100%),
+      var(--shell-bg);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 204, 238, 0.08),
+      inset 0 -42px 84px rgba(114, 18, 100, 0.15);
+  }
+
   .header {
     display: grid;
     grid-template-columns: minmax(132px, 1fr) auto auto;
@@ -2708,6 +2752,12 @@
       linear-gradient(180deg, rgba(0, 0, 0, 0.94), rgba(0, 0, 0, 0.64)),
       var(--shell-top);
     border-bottom-color: rgba(255, 255, 255, 0.09);
+  }
+  :global(html[data-theme="melanzana"]) .header {
+    background:
+      linear-gradient(180deg, rgba(22, 0, 22, 0.94), rgba(9, 0, 9, 0.68)),
+      var(--shell-top);
+    border-bottom-color: rgba(255, 155, 216, 0.14);
   }
   .title {
     color: var(--text-strong);
@@ -2982,6 +3032,49 @@
     border-bottom-color: rgba(255, 255, 255, 0.28);
     background: #050505;
   }
+  :global(html[data-theme="melanzana"]) .scheme-toggle button.active {
+    background: linear-gradient(135deg, #ff9bd8 0%, #9ef2d6 100%);
+    border-color: rgba(255, 178, 230, 0.66);
+    color: #160014;
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.34),
+      0 0 18px rgba(255, 155, 216, 0.18);
+  }
+  :global(html[data-theme="melanzana"]) .mini-action:hover:not(:disabled),
+  :global(html[data-theme="melanzana"]) .ghost:hover,
+  :global(html[data-theme="melanzana"]) .device-toggle:hover,
+  :global(html[data-theme="melanzana"]) .device-toggle:focus-visible,
+  :global(html[data-theme="melanzana"]) .pair-btn:hover,
+  :global(html[data-theme="melanzana"]) .icon-btn:hover,
+  :global(html[data-theme="melanzana"]) .icon-btn:focus-visible,
+  :global(html[data-theme="melanzana"]) .tab.active,
+  :global(html[data-theme="melanzana"]) .tab:hover,
+  :global(html[data-theme="melanzana"]) .recipient-button:hover:not(:disabled),
+  :global(html[data-theme="melanzana"]) .recipient-button:focus-visible {
+    background:
+      linear-gradient(180deg, rgba(255, 155, 216, 0.16), rgba(158, 242, 214, 0.05)),
+      #170017;
+    border-color: rgba(255, 178, 230, 0.52);
+    color: var(--text-strong);
+  }
+  :global(html[data-theme="melanzana"]) .private-toggle input {
+    accent-color: var(--accent);
+  }
+  :global(html[data-theme="melanzana"]) .private-tooltip {
+    border-color: rgba(255, 178, 230, 0.38);
+    background:
+      linear-gradient(180deg, rgba(255, 155, 216, 0.075), rgba(158, 242, 214, 0.02)),
+      #100010;
+    color: var(--text-strong);
+    box-shadow:
+      0 12px 28px rgba(9, 0, 9, 0.62),
+      inset 0 1px 0 rgba(255, 204, 238, 0.08);
+  }
+  :global(html[data-theme="melanzana"]) .private-tooltip::after {
+    border-right-color: rgba(255, 178, 230, 0.38);
+    border-bottom-color: rgba(255, 178, 230, 0.38);
+    background: #100010;
+  }
 
   .compose {
     padding: 18px 20px;
@@ -3078,6 +3171,16 @@
   :global(html[data-theme="onyx"]) .device-toggle:focus-visible {
     border-color: rgba(255, 255, 255, 0.56);
     color: #ffffff;
+  }
+  :global(html[data-theme="melanzana"]) .device-toggle {
+    border-color: rgba(255, 155, 216, 0.38);
+    background: rgba(255, 155, 216, 0.08);
+    color: var(--accent);
+  }
+  :global(html[data-theme="melanzana"]) .device-toggle:hover,
+  :global(html[data-theme="melanzana"]) .device-toggle:focus-visible {
+    border-color: rgba(255, 178, 230, 0.62);
+    color: var(--text-strong);
   }
   .roster {
     display: flex;
@@ -3317,6 +3420,11 @@
     background: rgba(255, 255, 255, 0.84);
     color: var(--accent);
   }
+  :global(html[data-theme="melanzana"]) .drop-target {
+    background: rgba(9, 0, 9, 0.86);
+    border-color: rgba(255, 155, 216, 0.72);
+    color: var(--accent);
+  }
 
   .toast {
     left: 22px;
@@ -3352,6 +3460,11 @@
     box-shadow:
       0 0 0 3px var(--shell-bg),
       0 0 15px rgba(255, 255, 255, 0.74);
+  }
+  :global(html[data-theme="melanzana"]) .connection-indicator.live {
+    box-shadow:
+      0 0 0 3px var(--shell-bg),
+      0 0 15px rgba(158, 242, 214, 0.76);
   }
 
   .card {
@@ -3815,6 +3928,11 @@
     box-shadow:
       0 0 0 2px var(--shell-bg),
       0 0 12px rgba(255, 255, 255, 0.72);
+  }
+  :global(html[data-theme="melanzana"]) .footer-security .connection-indicator.live {
+    box-shadow:
+      0 0 0 2px var(--shell-bg),
+      0 0 12px rgba(158, 242, 214, 0.74);
   }
 
   @media (max-width: 410px) {
