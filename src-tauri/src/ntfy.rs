@@ -25,6 +25,38 @@ pub const DEFAULT_BASE: &str = "https://ntfy.sh";
 /// (after base64 expansion). See crypto::CHUNK_SIZE for the plaintext cap.
 pub const MAX_BODY_BYTES: usize = 3500;
 
+/// Relay-side caching behavior for a published message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayCache {
+    /// Use the relay default. On public ntfy.sh this enables short catch-up
+    /// caching for offline or reconnecting subscribers.
+    Default,
+    /// Ask the relay not to cache this message server-side. Subscribers must be
+    /// connected at publish time to receive it.
+    NoStore,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublishOptions {
+    pub cache: RelayCache,
+}
+
+impl PublishOptions {
+    pub const fn no_cache() -> Self {
+        Self {
+            cache: RelayCache::NoStore,
+        }
+    }
+}
+
+impl Default for PublishOptions {
+    fn default() -> Self {
+        Self {
+            cache: RelayCache::Default,
+        }
+    }
+}
+
 fn ensure_rustls_crypto_provider() {
     // WebRTC and the HTTPS/WebSocket stack can enable different Rustls crypto
     // backends transitively. Pick one explicitly before any TLS client starts.
@@ -133,6 +165,17 @@ pub async fn publish(
     payload: &[u8],
     _title: &str,
 ) -> Result<String, NtfyError> {
+    publish_with_options(base, topic, payload, _title, PublishOptions::default()).await
+}
+
+/// Publish a single encrypted payload with explicit relay options.
+pub async fn publish_with_options(
+    base: &str,
+    topic: &str,
+    payload: &[u8],
+    _title: &str,
+    options: PublishOptions,
+) -> Result<String, NtfyError> {
     ensure_rustls_crypto_provider();
     let https_base = require_tls_base(base)?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(payload);
@@ -149,10 +192,7 @@ pub async fn publish(
     // request body as the message content.
     let b64_len = b64.len();
     let resp = client
-        .post(&url)
-        .header("Content-Type", "text/plain")
-        .body(b64)
-        .send()
+        .execute(build_publish_request(&client, &url, b64, options)?)
         .await?;
     let status = resp.status();
     if !status.is_success() {
@@ -166,6 +206,19 @@ pub async fn publish(
         b64_len
     );
     Ok(String::from("ok"))
+}
+
+fn build_publish_request(
+    client: &reqwest::Client,
+    url: &str,
+    b64: String,
+    options: PublishOptions,
+) -> Result<reqwest::Request, reqwest::Error> {
+    let mut request = client.post(url).header("Content-Type", "text/plain");
+    if options.cache == RelayCache::NoStore {
+        request = request.header("Cache", "no");
+    }
+    request.body(b64).build()
 }
 
 /// Configuration for a subscription.
@@ -374,5 +427,33 @@ mod tests {
     fn decode_skips_non_base64() {
         let line = r#"{"id":"msg1","message":"!!!not-base64!!!","time":1}"#;
         assert!(decode_ntfy_json(line).is_none());
+    }
+
+    #[test]
+    fn publish_request_defaults_to_relay_cache() {
+        let client = reqwest::Client::new();
+        let request = build_publish_request(
+            &client,
+            "https://ntfy.sh/topic",
+            "payload".to_string(),
+            PublishOptions::default(),
+        )
+        .unwrap();
+
+        assert!(request.headers().get("Cache").is_none());
+    }
+
+    #[test]
+    fn publish_request_can_disable_relay_cache() {
+        let client = reqwest::Client::new();
+        let request = build_publish_request(
+            &client,
+            "https://ntfy.sh/topic",
+            "payload".to_string(),
+            PublishOptions::no_cache(),
+        )
+        .unwrap();
+
+        assert_eq!(request.headers().get("Cache").unwrap(), "no");
     }
 }

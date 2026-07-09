@@ -1072,8 +1072,18 @@ async fn publish_wire(
     wire: WireMessage,
     title: &str,
 ) -> Result<(), String> {
+    publish_wire_with_options(base, topic, wire, title, ntfy::PublishOptions::default()).await
+}
+
+async fn publish_wire_with_options(
+    base: &str,
+    topic: &str,
+    wire: WireMessage,
+    title: &str,
+    options: ntfy::PublishOptions,
+) -> Result<(), String> {
     let msg = postcard::to_allocvec(&wire).map_err(|e| e.to_string())?;
-    ntfy::publish(base, topic, &msg, title)
+    ntfy::publish_with_options(base, topic, &msg, title, options)
         .await
         .map(|_| ())
         .map_err(|e| e.to_string())
@@ -1083,10 +1093,18 @@ async fn publish_sealed_clip(
     base: &str,
     topic: &str,
     sealed: crypto::SealedClip,
+    options: ntfy::PublishOptions,
 ) -> Result<(), String> {
-    publish_wire(base, topic, WireMessage::Manifest(sealed.manifest), "clip").await?;
+    publish_wire_with_options(
+        base,
+        topic,
+        WireMessage::Manifest(sealed.manifest),
+        "clip",
+        options,
+    )
+    .await?;
     for chunk in sealed.chunks {
-        publish_wire(base, topic, WireMessage::Chunk(chunk), "clip").await?;
+        publish_wire_with_options(base, topic, WireMessage::Chunk(chunk), "clip", options).await?;
     }
     Ok(())
 }
@@ -1136,7 +1154,12 @@ pub async fn send_clip(
 
     let msg_id = sealed.manifest.msg_id;
     let base = state.ntfy_base.lock().await.clone();
-    publish_sealed_clip(&base, &topic, sealed).await?;
+    let publish_options = if private {
+        ntfy::PublishOptions::no_cache()
+    } else {
+        ntfy::PublishOptions::default()
+    };
+    publish_sealed_clip(&base, &topic, sealed, publish_options).await?;
 
     // Also store locally (history) unless private.
     if !private {
@@ -1608,7 +1631,7 @@ pub async fn revoke_device(
     .map_err(|e| e.to_string())?;
 
     let base = state.ntfy_base.lock().await.clone();
-    publish_sealed_clip(&base, &old_topic, sealed).await?;
+    publish_sealed_clip(&base, &old_topic, sealed, ntfy::PublishOptions::default()).await?;
 
     *state.roster.lock().await = Some(next.clone());
     cancel_transfers_not_in_roster(&state, &app, &next).await;
@@ -2328,7 +2351,7 @@ async fn publish_file_signal(
     )
     .map_err(|e| e.to_string())?;
     let base = state.ntfy_base.lock().await.clone();
-    publish_sealed_clip(&base, topic, sealed)
+    publish_sealed_clip(&base, topic, sealed, ntfy::PublishOptions::default())
         .await
         .map_err(|e| format!("{title}: {e}"))
 }

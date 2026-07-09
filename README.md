@@ -69,8 +69,8 @@ automation in CI.
 - ✅ **Revocation** (admin drops pubkey, rotates the ntfy topic, and sends the
   new roster to remaining devices through an encrypted move message).
 - **Known limit: relay metadata.** The relay can observe topic URLs, timing,
-  message sizes, and IPs. The default public relay also keeps encrypted messages
-  briefly for offline catch-up.
+  message sizes, and IPs. The default public relay keeps ordinary encrypted
+  messages briefly for offline catch-up; Private sends request no relay cache.
 - **Known limit: no forward secrecy.** Fwoosh uses stable device keys for v1
   because lossy networks, offline catch-up, and portable devices make ratcheting
   hard to do reliably.
