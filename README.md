@@ -1,16 +1,18 @@
 # Fwoosh
 
-A free, open-source, **end-to-end-encrypted clipboard sync** app for Windows &
-macOS. Pop a small text box out of the tray/dock with `Ctrl/Cmd+Shift+V`, paste,
-and it becomes available on all your paired devices — instantly, with **zero
-servers to run**.
+A free, open-source, **end-to-end-encrypted clipboard sync and P2P file
+sharing** app for Windows & macOS. Pop a small text box out of the tray/dock
+with `Ctrl/Cmd+Shift+V`, paste, and it becomes available on all your paired
+devices — instantly, with **zero servers to run**.
 
 - **Transport:** the public [ntfy.sh](https://ntfy.sh) relay by default
-  (self-hostable). It sees only ciphertext.
+  (self-hostable) for encrypted clips and file-transfer signaling; P2P file
+  transfers use WebRTC data channels.
 - **Crypto:** signed envelope encryption — XChaCha20-Poly1305 + HPKE recipient
   wrapping (RFC 9180) + Ed25519 signatures + an append-only, signed roster log
-  with epochs and revocation.
-- **Cost:** $0 to run. No accounts, no central database.
+  with epochs and revocation. File transfers use their own encrypted chunk
+  stream plus checksum verification.
+- **Cost:** $0 to run. No accounts, no central database or file storage.
 
 ## How it works
 
@@ -30,12 +32,16 @@ servers to run**.
    via HPKE) and published to the relay.
 3. **Receive** — other devices get it within ~1s, verify the sender's Ed25519
    signature, decrypt, and show a toast + **click-to-copy** (never auto-copy).
+4. **Send files** — drag in a file or choose one from the Files tab. Fwoosh sends
+   encrypted WebRTC signaling over ntfy, then streams the file directly to the
+   selected paired device over a WebRTC data channel.
 
 ## Status
 
-**Working & tested:** crypto core, roster epochs, HMAC-authenticated pairing,
-encrypted history, keychain storage, ntfy transport, replay cache, tray/hotkey,
-manual send UI, and admin revocation with encrypted topic-rotation notice.
+**Working:** crypto core, roster epochs, HMAC-authenticated pairing, encrypted
+history, keychain storage, ntfy transport, replay cache, tray/hotkey, manual
+send UI, P2P file transfers, and admin revocation with encrypted topic-rotation
+notice.
 
 **Still before public MVP:** QR scanning, custom relay settings UI, pause sync,
 full room-repair UX, installer packaging via Tauri bundling, and cargo/npm audit
@@ -49,12 +55,14 @@ automation in CI.
 | OS keychain (`keychain.rs`) | OS keychain by default; file fallback only by explicit dev opt-in |
 | ntfy transport (`ntfy.rs`) | ✅ 7 tests |
 | Pairing (`pairing.rs`) | ✅ 8 tests |
+| P2P file transfer (`commands.rs`) | WebRTC data channels; encrypted chunks; accept/save UI |
 | Desktop shell (tray, hotkey, popup UI) | ✅ builds |
 | CI / release pipeline | Tests plus cargo/npm audit in CI; release workflow written |
 
 ## Threat model (honest)
 
-- ✅ **Content is E2E encrypted.** The relay sees only ciphertext.
+- ✅ **Content is E2E encrypted.** The relay sees ciphertext for clips and file
+  signaling; file bytes stream over WebRTC and are encrypted in chunks.
 - ✅ **Sender authenticity** (Ed25519 signatures over canonical bytes).
 - ✅ **Replay/roster-tamper resistance** (signed epochs, strict current-epoch
   checks, and a local seen-message cache).
@@ -63,8 +71,9 @@ automation in CI.
 - **Known limit: relay metadata.** The relay can observe topic URLs, timing,
   message sizes, and IPs. The default public relay also keeps encrypted messages
   briefly for offline catch-up.
-- **Known limit: no forward secrecy in v1.** Message ratcheting is deferred
-  because it is easy to get wrong over a lossy relay with offline catch-up.
+- **Known limit: no forward secrecy.** Fwoosh uses stable device keys for v1
+  because lossy networks, offline catch-up, and portable devices make ratcheting
+  hard to do reliably.
 - **Known limit: endpoint compromise.** Malware running as the same logged-in
   user can access OS-keychain-backed secrets; this is a standard OS credential
   storage boundary.
