@@ -55,7 +55,7 @@ automation in CI.
 | OS keychain (`keychain.rs`) | OS keychain by default; file fallback only by explicit dev opt-in |
 | ntfy transport (`ntfy.rs`) | ✅ 7 tests |
 | Pairing (`pairing.rs`) | ✅ 8 tests |
-| P2P file transfer (`commands.rs`) | WebRTC data channels; encrypted chunks; accept/save UI |
+| P2P file transfer (`commands.rs`) | WebRTC data channels; streamed encrypted chunks; configurable timeout |
 | Desktop shell (tray, hotkey, popup UI) | ✅ builds |
 | CI / release pipeline | Tests plus cargo/npm audit in CI; release workflow written |
 

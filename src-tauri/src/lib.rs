@@ -189,6 +189,7 @@ pub fn run() {
             commands::suggest_device_label,
             commands::rename_device,
             commands::network_settings,
+            commands::set_network_settings,
             commands::set_stun_servers,
             commands::room_state,
             commands::roster_devices,
