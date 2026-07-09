@@ -496,9 +496,9 @@ async fn configured_device_label(state: &Arc<AppState>) -> String {
 }
 
 fn safe_default_file_name(file_name: &str) -> String {
-    let raw_name = Path::new(file_name)
-        .file_name()
-        .and_then(|name| name.to_str())
+    let raw_name = file_name
+        .rsplit(['/', '\\'])
+        .find(|part| !part.is_empty())
         .unwrap_or(file_name);
     let mut out = String::new();
     for ch in raw_name.chars().take(MAX_FILE_NAME_CHARS) {

@@ -7,6 +7,7 @@ pub mod roster;
 pub mod store;
 
 use commands::AppState;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{
     menu::{Menu, MenuItem},
@@ -40,6 +41,27 @@ fn hide_popup(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.hide();
     }
+}
+
+fn grant_dropped_paths(app: tauri::AppHandle, paths: &[PathBuf]) {
+    let path = match paths {
+        [path] => path.clone(),
+        _ => {
+            let _ = app.emit("file-drop-rejected", "Drop one file at a time");
+            return;
+        }
+    };
+    let state = app.state::<Arc<AppState>>().inner().clone();
+    tauri::async_runtime::spawn(async move {
+        match commands::grant_dropped_file(&state, path).await {
+            Ok(grant) => {
+                let _ = app.emit("file-drop-granted", grant);
+            }
+            Err(e) => {
+                let _ = app.emit("file-drop-rejected", e);
+            }
+        }
+    });
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -150,27 +172,13 @@ pub fn run() {
                 api.prevent_close();
                 hide_popup(window.app_handle());
             }
+            if let WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. }) = event {
+                grant_dropped_paths(window.app_handle().clone(), paths);
+            }
         })
         .on_webview_event(|webview, event| {
             if let WebviewEvent::DragDrop(DragDropEvent::Drop { paths, .. }) = event {
-                let app = webview.app_handle().clone();
-                let path = if paths.len() == 1 {
-                    paths[0].clone()
-                } else {
-                    let _ = app.emit("file-drop-rejected", "Drop one file at a time");
-                    return;
-                };
-                let state = app.state::<Arc<AppState>>().inner().clone();
-                tauri::async_runtime::spawn(async move {
-                    match commands::grant_dropped_file(&state, path).await {
-                        Ok(grant) => {
-                            let _ = app.emit("file-drop-granted", grant);
-                        }
-                        Err(e) => {
-                            let _ = app.emit("file-drop-rejected", e);
-                        }
-                    }
-                });
+                grant_dropped_paths(webview.app_handle().clone(), paths);
             }
         })
         .invoke_handler(tauri::generate_handler![
