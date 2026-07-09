@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    Manager, WindowEvent,
+    DragDropEvent, Emitter, Manager, WebviewEvent, WindowEvent,
 };
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
 
@@ -93,19 +93,10 @@ pub fn run() {
                 *settings = commands::load_settings(&settings_path);
             }
             let mut startup_topic = None;
-            if let Some(entry) = commands::load_persisted_roster(&roster_path) {
-                let verified = if entry.epoch == 0 {
-                    roster::VerifiedRoster::verify_first(entry).ok()
-                } else if roster::verify_entry_sig_only(&entry).is_ok() {
-                    Some(roster::VerifiedRoster::from_entry(entry))
-                } else {
-                    None
-                };
-                if let Some(v) = verified {
-                    startup_topic = Some(v.topic().to_string());
-                    if let Ok(mut r) = state.roster.try_lock() {
-                        *r = Some(v);
-                    }
+            if let Some(verified) = commands::load_persisted_roster(&roster_path) {
+                startup_topic = Some(verified.topic().to_string());
+                if let Ok(mut r) = state.roster.try_lock() {
+                    *r = Some(verified);
                 }
             }
 
@@ -158,6 +149,28 @@ pub fn run() {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
                 hide_popup(window.app_handle());
+            }
+        })
+        .on_webview_event(|webview, event| {
+            if let WebviewEvent::DragDrop(DragDropEvent::Drop { paths, .. }) = event {
+                let app = webview.app_handle().clone();
+                let path = if paths.len() == 1 {
+                    paths[0].clone()
+                } else {
+                    let _ = app.emit("file-drop-rejected", "Drop one file at a time");
+                    return;
+                };
+                let state = app.state::<Arc<AppState>>().inner().clone();
+                tauri::async_runtime::spawn(async move {
+                    match commands::grant_dropped_file(&state, path).await {
+                        Ok(grant) => {
+                            let _ = app.emit("file-drop-granted", grant);
+                        }
+                        Err(e) => {
+                            let _ = app.emit("file-drop-rejected", e);
+                        }
+                    }
+                });
             }
         })
         .invoke_handler(tauri::generate_handler![

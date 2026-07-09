@@ -26,10 +26,12 @@ use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
+use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_notification::NotificationExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
@@ -56,6 +58,15 @@ const DEFAULT_STUN_SERVER: &str = "stun:stun.cloudflare.com:3478";
 const MAX_STUN_SERVERS: usize = 4;
 const MAX_DEVICE_LABEL_CHARS: usize = 48;
 const FILE_CHUNK_SIZE: usize = 8 * 1024;
+const MAX_FILE_TRANSFER_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_ACTIVE_FILE_TRANSFERS: usize = 8;
+const FILE_GRANT_TTL_SECS: u64 = 60;
+const FILE_TRANSFER_TIMEOUT_SECS: u64 = 10 * 60;
+const FILE_BACKPRESSURE_TIMEOUT_SECS: u64 = 30;
+const ICE_GATHER_TIMEOUT_SECS: u64 = 20;
+const MAX_FILE_NAME_CHARS: usize = 255;
+const MAX_SDP_JSON_BYTES: usize = 256 * 1024;
+const MAX_FILE_FRAME_BYTES: usize = FILE_CHUNK_SIZE + 1024;
 const FILE_NONCE_PREFIX_LEN: usize = 16;
 const FILE_NONCE_LEN: usize = 24;
 
@@ -87,6 +98,8 @@ pub struct AppState {
     pub settings: Mutex<AppSettings>,
     /// Active large-file transfer sessions keyed by session_id.
     pub file_transfers: Mutex<HashMap<String, TransferRecord>>,
+    /// Short-lived OS file-drop grants keyed by an unguessable id.
+    pub file_grants: Mutex<HashMap<String, FileGrant>>,
 }
 
 /// A partially-received clip awaiting all its chunks.
@@ -98,6 +111,11 @@ pub struct PendingClip {
 pub struct PendingPairingSecret {
     secret: [u8; 32],
     expires_at: u64,
+}
+
+pub struct FileGrant {
+    path: PathBuf,
+    created_at: u64,
 }
 
 impl AppState {
@@ -116,6 +134,7 @@ impl AppState {
             settings_path: Mutex::new(None),
             settings: Mutex::new(AppSettings::default()),
             file_transfers: Mutex::new(HashMap::new()),
+            file_grants: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -146,6 +165,7 @@ pub enum TransferRecord {
     Incoming(IncomingTransfer),
 }
 
+#[derive(Clone)]
 pub struct PendingIncomingTransfer {
     sender_id: crypto::Ed25519PubKey,
     file_name: String,
@@ -195,6 +215,13 @@ pub struct FileTransferProgressDto {
     pub message: String,
 }
 
+#[derive(Clone, Serialize)]
+pub struct FileDropGrantDto {
+    pub grant_id: String,
+    pub file_name: String,
+    pub size: u64,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub enum FileSignal {
     Offer {
@@ -227,6 +254,12 @@ enum FileFrame {
     Cancel { reason: String },
 }
 
+#[derive(Serialize, Deserialize)]
+struct PersistedRosterChain {
+    version: u8,
+    entries: Vec<roster::RosterEntry>,
+}
+
 struct ReceiverWriteState {
     session_id: String,
     file_name: String,
@@ -241,6 +274,16 @@ struct ReceiverWriteState {
     part_path: PathBuf,
     hasher: Sha256,
     done: bool,
+}
+
+#[derive(Clone)]
+struct OutgoingFilePayload {
+    path: PathBuf,
+    file_name: String,
+    total: u64,
+    sha256: [u8; 32],
+    content_key: [u8; 32],
+    nonce_prefix: [u8; FILE_NONCE_PREFIX_LEN],
 }
 
 // ---- Wire message kinds (postcard-encoded, then base64 by ntfy.rs) ----
@@ -452,6 +495,139 @@ async fn configured_device_label(state: &Arc<AppState>) -> String {
         .unwrap_or_else(detected_device_label)
 }
 
+fn safe_default_file_name(file_name: &str) -> String {
+    let raw_name = Path::new(file_name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(file_name);
+    let mut out = String::new();
+    for ch in raw_name.chars().take(MAX_FILE_NAME_CHARS) {
+        if ch.is_control() || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+            out.push('_');
+        } else {
+            out.push(ch);
+        }
+    }
+    let trimmed = out.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        "fwoosh-file".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn is_valid_session_id(session_id: &str) -> bool {
+    session_id.len() == 32 && session_id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn validate_sdp_json(sdp_json: &str) -> Result<(), String> {
+    if sdp_json.len() > MAX_SDP_JSON_BYTES {
+        return Err("file transfer signal is too large".to_string());
+    }
+    Ok(())
+}
+
+fn validate_file_size(size: u64) -> Result<(), String> {
+    if size > MAX_FILE_TRANSFER_BYTES {
+        return Err(format!(
+            "file is too large; maximum supported size is {} MB",
+            MAX_FILE_TRANSFER_BYTES / 1024 / 1024
+        ));
+    }
+    Ok(())
+}
+
+fn inspect_local_file(path: PathBuf) -> Result<(PathBuf, String, u64), String> {
+    let path = std::fs::canonicalize(&path).map_err(|e| e.to_string())?;
+    let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("Only single files can be sent".to_string());
+    }
+    validate_file_size(meta.len())?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(safe_default_file_name)
+        .ok_or_else(|| "file name is not valid UTF-8".to_string())?;
+    Ok((path, file_name, meta.len()))
+}
+
+fn prune_file_grants(grants: &mut HashMap<String, FileGrant>, now: u64) {
+    grants.retain(|_, grant| now.saturating_sub(grant.created_at) <= FILE_GRANT_TTL_SECS);
+}
+
+pub async fn grant_dropped_file(
+    state: &Arc<AppState>,
+    path: PathBuf,
+) -> Result<FileDropGrantDto, String> {
+    let (path, file_name, size) = inspect_local_file(path)?;
+    let grant_id = new_session_id();
+    let mut grants = state.file_grants.lock().await;
+    let now = now_unix();
+    prune_file_grants(&mut grants, now);
+    if grants.len() >= MAX_ACTIVE_FILE_TRANSFERS * 2 {
+        return Err("too many pending dropped files".to_string());
+    }
+    grants.insert(
+        grant_id.clone(),
+        FileGrant {
+            path,
+            created_at: now,
+        },
+    );
+    Ok(FileDropGrantDto {
+        grant_id,
+        file_name,
+        size,
+    })
+}
+
+async fn consume_file_grant(state: &Arc<AppState>, grant_id: &str) -> Result<PathBuf, String> {
+    if !is_valid_session_id(grant_id) {
+        return Err("file drop grant is invalid".to_string());
+    }
+    let mut grants = state.file_grants.lock().await;
+    let now = now_unix();
+    prune_file_grants(&mut grants, now);
+    let grant = grants
+        .remove(grant_id)
+        .ok_or_else(|| "file drop grant expired".to_string())?;
+    Ok(grant.path)
+}
+
+fn dialog_file_path_to_pathbuf(path: tauri_plugin_dialog::FilePath) -> Result<PathBuf, String> {
+    path.into_path()
+        .map_err(|_| "dialog returned an invalid local file path".to_string())
+}
+
+fn pick_file_for_send(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let selected = app
+        .dialog()
+        .file()
+        .set_title("Choose file to send")
+        .blocking_pick_file()
+        .ok_or_else(|| "File selection cancelled".to_string())?;
+    dialog_file_path_to_pathbuf(selected)
+}
+
+fn pick_save_path(app: &tauri::AppHandle, file_name: &str) -> Result<PathBuf, String> {
+    let selected = app
+        .dialog()
+        .file()
+        .set_title("Save incoming file")
+        .set_file_name(safe_default_file_name(file_name))
+        .blocking_save_file()
+        .ok_or_else(|| "Save cancelled".to_string())?;
+    dialog_file_path_to_pathbuf(selected)
+}
+
+fn ensure_transfer_capacity(transfers: &HashMap<String, TransferRecord>) -> Result<(), String> {
+    if transfers.len() >= MAX_ACTIVE_FILE_TRANSFERS {
+        return Err("too many active file transfers".to_string());
+    }
+    Ok(())
+}
+
 fn normalize_stun_servers(input: Vec<String>) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     for raw in input {
@@ -657,7 +833,8 @@ pub async fn rename_device(
             .verify_next(signed.clone())
             .map_err(|e| e.to_string())?;
         let topic = next.topic().to_string();
-        *state.roster.lock().await = Some(next);
+        *state.roster.lock().await = Some(next.clone());
+        cancel_transfers_not_in_roster(&state, &app, &next).await;
         persist_roster(&state, &signed).await;
         broadcast_roster(&state, &signed, &topic).await;
         let _ = app.emit("roster-updated", ());
@@ -745,10 +922,11 @@ async fn broadcast_roster(state: &Arc<AppState>, entry: &roster::RosterEntry, to
     }
 }
 
-/// Persist the current roster entry to disk so it survives restarts.
+/// Persist the current roster chain to disk so it survives restarts without
+/// trusting a lone non-genesis snapshot.
 async fn persist_roster(state: &Arc<AppState>, entry: &roster::RosterEntry) {
     if let Some(path) = state.roster_path.lock().await.clone() {
-        match postcard::to_allocvec(entry) {
+        match build_persisted_roster_chain(&path, entry) {
             Ok(bytes) => {
                 if let Err(e) = std::fs::write(&path, &bytes) {
                     eprintln!("failed to persist roster: {e}");
@@ -760,9 +938,73 @@ async fn persist_roster(state: &Arc<AppState>, entry: &roster::RosterEntry) {
 }
 
 /// Load a persisted roster from disk (called at startup).
-pub fn load_persisted_roster(path: &std::path::Path) -> Option<roster::RosterEntry> {
+pub fn load_persisted_roster(path: &std::path::Path) -> Option<VerifiedRoster> {
     let bytes = std::fs::read(path).ok()?;
-    postcard::from_bytes(&bytes).ok()
+    let entries = decode_persisted_roster_entries(&bytes)?;
+    verify_persisted_roster_entries(entries).ok()
+}
+
+fn build_persisted_roster_chain(
+    path: &Path,
+    entry: &roster::RosterEntry,
+) -> Result<Vec<u8>, String> {
+    let mut entries = if entry.epoch == 0 {
+        Vec::new()
+    } else if let Ok(bytes) = std::fs::read(path) {
+        decode_persisted_roster_entries(&bytes).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+
+    if entry.epoch == 0 {
+        entries.push(entry.clone());
+    } else if let Ok(current) = verify_persisted_roster_entries(entries.clone()) {
+        if entry.epoch == current.epoch() + 1 && current.verify_next(entry.clone()).is_ok() {
+            entries.push(entry.clone());
+        } else if entry.epoch == current.epoch() {
+            entries.pop();
+            entries.push(entry.clone());
+        } else {
+            return Err("refusing to persist roster without a verified chain".to_string());
+        }
+    } else {
+        return Err("refusing to persist roster without a verified chain".to_string());
+    }
+
+    let verified = verify_persisted_roster_entries(entries.clone())?;
+    if verified.epoch() != entry.epoch {
+        return Err("persisted roster chain ended at the wrong epoch".to_string());
+    }
+    let chain = PersistedRosterChain {
+        version: 2,
+        entries,
+    };
+    postcard::to_allocvec(&chain).map_err(|e| e.to_string())
+}
+
+fn decode_persisted_roster_entries(bytes: &[u8]) -> Option<Vec<roster::RosterEntry>> {
+    if let Ok(chain) = postcard::from_bytes::<PersistedRosterChain>(bytes) {
+        if chain.version == 2 {
+            return Some(chain.entries);
+        }
+    }
+    postcard::from_bytes::<roster::RosterEntry>(bytes)
+        .ok()
+        .map(|entry| vec![entry])
+}
+
+fn verify_persisted_roster_entries(
+    entries: Vec<roster::RosterEntry>,
+) -> Result<VerifiedRoster, String> {
+    let mut iter = entries.into_iter();
+    let first = iter
+        .next()
+        .ok_or_else(|| "persisted roster chain is empty".to_string())?;
+    let mut verified = VerifiedRoster::verify_first(first).map_err(|e| e.to_string())?;
+    for entry in iter {
+        verified = verified.verify_next(entry).map_err(|e| e.to_string())?;
+    }
+    Ok(verified)
 }
 
 /// Leave the current room: clear the in-memory roster, stop the subscriber,
@@ -906,20 +1148,18 @@ pub async fn send_clip(
 pub async fn start_file_send(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
-    path: String,
     recipient_id: String,
+    grant_id: Option<String>,
 ) -> Result<TransferDto, String> {
-    let path = PathBuf::from(path);
-    let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
-    if !meta.is_file() {
-        return Err("Only single files can be sent".to_string());
-    }
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| "file name is not valid UTF-8".to_string())?
-        .to_string();
-    let size = meta.len();
+    let path = match grant_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        Some(id) => consume_file_grant(state.inner(), id).await?,
+        None => pick_file_for_send(&app)?,
+    };
+    let (path, file_name, size) = inspect_local_file(path)?;
     let recipient = parse_device_id(&recipient_id)?;
     let (recipient_label, recipient_identity, topic, epoch) =
         recipient_for_transfer(state.inner(), &recipient).await?;
@@ -943,17 +1183,20 @@ pub async fn start_file_send(
         .create_data_channel("fwoosh-file", None)
         .await
         .map_err(|e| e.to_string())?;
+    let outgoing_file = OutgoingFilePayload {
+        path: path.clone(),
+        file_name: file_name.clone(),
+        total: size,
+        sha256,
+        content_key,
+        nonce_prefix,
+    };
     install_sender_channel(
         data_channel,
         app.clone(),
         state.inner().clone(),
         session_id.clone(),
-        path.clone(),
-        file_name.clone(),
-        size,
-        sha256,
-        content_key,
-        nonce_prefix,
+        outgoing_file,
     );
 
     let offer = peer.create_offer(None).await.map_err(|e| e.to_string())?;
@@ -961,20 +1204,33 @@ pub async fn start_file_send(
     peer.set_local_description(offer)
         .await
         .map_err(|e| e.to_string())?;
-    let _ = gather_complete.recv().await;
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(ICE_GATHER_TIMEOUT_SECS),
+        gather_complete.recv(),
+    )
+    .await;
     let local = peer
         .local_description()
         .await
         .ok_or_else(|| "failed to create local WebRTC offer".to_string())?;
     let sdp_json = serde_json::to_string(&local).map_err(|e| e.to_string())?;
+    validate_sdp_json(&sdp_json)?;
 
-    state.file_transfers.lock().await.insert(
-        session_id.clone(),
-        TransferRecord::Outgoing(OutgoingTransfer {
-            recipient_id: recipient.clone(),
-            peer: peer.clone(),
-        }),
-    );
+    {
+        let mut transfers = state.file_transfers.lock().await;
+        if let Err(e) = ensure_transfer_capacity(&transfers) {
+            let _ = peer.close().await;
+            return Err(e);
+        }
+        transfers.insert(
+            session_id.clone(),
+            TransferRecord::Outgoing(OutgoingTransfer {
+                recipient_id: recipient.clone(),
+                peer: peer.clone(),
+            }),
+        );
+    }
+    spawn_transfer_timeout(app.clone(), state.inner().clone(), session_id.clone());
 
     let signal = FileSignal::Offer {
         session_id: session_id.clone(),
@@ -1010,8 +1266,23 @@ pub async fn accept_file_transfer(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
     session_id: String,
-    save_path: String,
-) -> Result<(), String> {
+) -> Result<TransferDto, String> {
+    if !is_valid_session_id(&session_id) {
+        return Err("transfer id is invalid".to_string());
+    }
+    let pending_for_dialog = {
+        let transfers = state.file_transfers.lock().await;
+        match transfers.get(&session_id) {
+            Some(TransferRecord::PendingIncoming(pending)) => pending.clone(),
+            Some(_) => return Err("transfer is not waiting for acceptance".to_string()),
+            None => return Err("transfer not found".to_string()),
+        }
+    };
+    let save_path = pick_save_path(&app, &pending_for_dialog.file_name)?;
+    ensure_receive_destination_available(&save_path)?;
+    let part_path = part_path_for(&save_path);
+    ensure_receive_destination_available(&part_path)?;
+
     let pending = {
         let mut transfers = state.file_transfers.lock().await;
         match transfers.remove(&session_id) {
@@ -1023,17 +1294,31 @@ pub async fn accept_file_transfer(
             None => return Err("transfer not found".to_string()),
         }
     };
-    let save_path = PathBuf::from(save_path);
-    if save_path.exists() && save_path.is_dir() {
-        return Err("save path points to a folder".to_string());
-    }
-    let part_path = part_path_for(&save_path);
-    let file = tokio::fs::File::create(&part_path)
-        .await
-        .map_err(|e| e.to_string())?;
 
     let stun_servers = state.settings.lock().await.stun_servers.clone();
-    let peer = new_peer_connection(stun_servers).await?;
+    let peer = match new_peer_connection(stun_servers).await {
+        Ok(peer) => peer,
+        Err(e) => {
+            state
+                .file_transfers
+                .lock()
+                .await
+                .insert(session_id.clone(), TransferRecord::PendingIncoming(pending));
+            return Err(e);
+        }
+    };
+    {
+        let transfers = state.file_transfers.lock().await;
+        if let Err(e) = ensure_transfer_capacity(&transfers) {
+            state
+                .file_transfers
+                .lock()
+                .await
+                .insert(session_id.clone(), TransferRecord::PendingIncoming(pending));
+            let _ = peer.close().await;
+            return Err(e);
+        }
+    }
     install_peer_state_handler(
         &peer,
         app.clone(),
@@ -1041,37 +1326,118 @@ pub async fn accept_file_transfer(
         session_id.clone(),
         pending.size,
     );
+
+    let offer: RTCSessionDescription = match serde_json::from_str(&pending.offer_sdp_json) {
+        Ok(offer) => offer,
+        Err(e) => {
+            let _ = peer.close().await;
+            state
+                .file_transfers
+                .lock()
+                .await
+                .insert(session_id.clone(), TransferRecord::PendingIncoming(pending));
+            return Err(e.to_string());
+        }
+    };
+    if let Err(e) = peer.set_remote_description(offer).await {
+        let _ = peer.close().await;
+        state
+            .file_transfers
+            .lock()
+            .await
+            .insert(session_id.clone(), TransferRecord::PendingIncoming(pending));
+        return Err(e.to_string());
+    }
+    let answer = match peer.create_answer(None).await {
+        Ok(answer) => answer,
+        Err(e) => {
+            let _ = peer.close().await;
+            state
+                .file_transfers
+                .lock()
+                .await
+                .insert(session_id.clone(), TransferRecord::PendingIncoming(pending));
+            return Err(e.to_string());
+        }
+    };
+    let mut gather_complete = peer.gathering_complete_promise().await;
+    if let Err(e) = peer.set_local_description(answer).await {
+        let _ = peer.close().await;
+        state
+            .file_transfers
+            .lock()
+            .await
+            .insert(session_id.clone(), TransferRecord::PendingIncoming(pending));
+        return Err(e.to_string());
+    }
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(ICE_GATHER_TIMEOUT_SECS),
+        gather_complete.recv(),
+    )
+    .await;
+    let Some(local) = peer.local_description().await else {
+        let _ = peer.close().await;
+        state
+            .file_transfers
+            .lock()
+            .await
+            .insert(session_id.clone(), TransferRecord::PendingIncoming(pending));
+        return Err("failed to create local WebRTC answer".to_string());
+    };
+    let sdp_json = match serde_json::to_string(&local) {
+        Ok(sdp_json) => sdp_json,
+        Err(e) => {
+            let _ = peer.close().await;
+            state
+                .file_transfers
+                .lock()
+                .await
+                .insert(session_id.clone(), TransferRecord::PendingIncoming(pending));
+            return Err(e.to_string());
+        }
+    };
+    if let Err(e) = validate_sdp_json(&sdp_json) {
+        let _ = peer.close().await;
+        state
+            .file_transfers
+            .lock()
+            .await
+            .insert(session_id.clone(), TransferRecord::PendingIncoming(pending));
+        return Err(e);
+    }
+
+    let file = match create_new_file(&part_path).await {
+        Ok(file) => file,
+        Err(e) => {
+            let _ = peer.close().await;
+            state
+                .file_transfers
+                .lock()
+                .await
+                .insert(session_id.clone(), TransferRecord::PendingIncoming(pending));
+            return Err(e);
+        }
+    };
     install_receiver_channel(
         &peer,
         app.clone(),
         state.inner().clone(),
-        session_id.clone(),
-        pending.file_name.clone(),
-        pending.size,
-        pending.sha256,
-        pending.content_key,
-        pending.nonce_prefix,
-        file,
-        save_path.clone(),
-        part_path.clone(),
+        ReceiverWriteState {
+            session_id: session_id.clone(),
+            file_name: pending.file_name.clone(),
+            total: pending.size,
+            received: 0,
+            next_index: 0,
+            sha256: pending.sha256,
+            content_key: pending.content_key,
+            nonce_prefix: pending.nonce_prefix,
+            file: Some(file),
+            final_path: save_path.clone(),
+            part_path: part_path.clone(),
+            hasher: Sha256::new(),
+            done: false,
+        },
     );
-
-    let offer: RTCSessionDescription =
-        serde_json::from_str(&pending.offer_sdp_json).map_err(|e| e.to_string())?;
-    peer.set_remote_description(offer)
-        .await
-        .map_err(|e| e.to_string())?;
-    let answer = peer.create_answer(None).await.map_err(|e| e.to_string())?;
-    let mut gather_complete = peer.gathering_complete_promise().await;
-    peer.set_local_description(answer)
-        .await
-        .map_err(|e| e.to_string())?;
-    let _ = gather_complete.recv().await;
-    let local = peer
-        .local_description()
-        .await
-        .ok_or_else(|| "failed to create local WebRTC answer".to_string())?;
-    let sdp_json = serde_json::to_string(&local).map_err(|e| e.to_string())?;
 
     state.file_transfers.lock().await.insert(
         session_id.clone(),
@@ -1081,21 +1447,36 @@ pub async fn accept_file_transfer(
             part_path,
         }),
     );
+    spawn_transfer_timeout(app.clone(), state.inner().clone(), session_id.clone());
 
     let (topic, epoch) = current_room_topic_epoch(state.inner()).await?;
     let recipient = active_device_identity(state.inner(), &pending.sender_id).await?;
-    publish_file_signal(
+    let peer_label = recipient.label.clone();
+    if let Err(e) = publish_file_signal(
         state.inner(),
         &topic,
         epoch,
         &recipient,
         FileSignal::Answer {
-            session_id,
+            session_id: session_id.clone(),
             sdp_json,
         },
         "file-answer",
     )
     .await
+    {
+        cleanup_transfer(state.inner(), &session_id).await;
+        return Err(e);
+    }
+
+    Ok(TransferDto {
+        session_id,
+        file_name: pending.file_name,
+        size: pending.size,
+        peer_label,
+        direction: "incoming".to_string(),
+        status: "connecting".to_string(),
+    })
 }
 
 #[tauri::command]
@@ -1224,7 +1605,8 @@ pub async fn revoke_device(
     let base = state.ntfy_base.lock().await.clone();
     publish_sealed_clip(&base, &old_topic, sealed).await?;
 
-    *state.roster.lock().await = Some(next);
+    *state.roster.lock().await = Some(next.clone());
+    cancel_transfers_not_in_roster(&state, &app, &next).await;
     state.pending.lock().await.clear();
     persist_roster(&state, &signed).await;
     start_subscriber(&state, app.clone(), &new_topic).await;
@@ -1491,7 +1873,8 @@ pub async fn handle_relay_message(
                 Ok(signed) => match verified.verify_next(signed.clone()) {
                     Ok(next) => {
                         let topic = next.topic().to_string();
-                        *state.roster.lock().await = Some(next);
+                        *state.roster.lock().await = Some(next.clone());
+                        cancel_transfers_not_in_roster(state, app, &next).await;
                         persist_roster(state, &signed).await;
                         broadcast_roster(state, &signed, &topic).await;
                         let _ = app.emit("roster-updated", ());
@@ -1522,7 +1905,8 @@ pub async fn handle_relay_message(
                         match prev.verify_next(entry.clone()) {
                             Ok(next) => {
                                 let new_topic = next.topic().to_string();
-                                *state.roster.lock().await = Some(next);
+                                *state.roster.lock().await = Some(next.clone());
+                                cancel_transfers_not_in_roster(state, app, &next).await;
                                 persist_roster(state, &entry).await;
                                 if new_topic != old_topic {
                                     state.pending.lock().await.clear();
@@ -1631,7 +2015,8 @@ async fn handle_rename_device(
         Ok(signed) => match verified.verify_next(signed.clone()) {
             Ok(next) => {
                 let topic = next.topic().to_string();
-                *state.roster.lock().await = Some(next);
+                *state.roster.lock().await = Some(next.clone());
+                cancel_transfers_not_in_roster(state, app, &next).await;
                 persist_roster(state, &signed).await;
                 broadcast_roster(state, &signed, &topic).await;
                 let _ = app.emit("roster-updated", ());
@@ -1835,7 +2220,8 @@ async fn apply_roster_update(
         .map_err(|e| e.to_string())?;
     let new_topic = next.topic().to_string();
 
-    *state.roster.lock().await = Some(next);
+    *state.roster.lock().await = Some(next.clone());
+    cancel_transfers_not_in_roster(state, app, &next).await;
     persist_roster(state, &entry).await;
     if new_topic != old_topic {
         state.pending.lock().await.clear();
@@ -1970,22 +2356,43 @@ async fn handle_file_signal(
             nonce_prefix,
             sdp_json,
         } => {
+            if !is_valid_session_id(&session_id) {
+                eprintln!("file offer ignored: invalid session id");
+                return;
+            }
+            if let Err(e) = validate_file_size(size).and_then(|_| validate_sdp_json(&sdp_json)) {
+                eprintln!("file offer ignored: {e}");
+                return;
+            }
+            let file_name = safe_default_file_name(&file_name);
             let sender_label = active_device_identity(state, &sender_id)
                 .await
                 .map(|d| d.label)
                 .unwrap_or_else(|_| hex::encode(&sender_id.0[..4]));
-            state.file_transfers.lock().await.insert(
-                session_id.clone(),
-                TransferRecord::PendingIncoming(PendingIncomingTransfer {
-                    sender_id: sender_id.clone(),
-                    file_name: file_name.clone(),
-                    size,
-                    sha256,
-                    content_key,
-                    nonce_prefix,
-                    offer_sdp_json: sdp_json,
-                }),
-            );
+            {
+                let mut transfers = state.file_transfers.lock().await;
+                if transfers.contains_key(&session_id) {
+                    eprintln!("file offer ignored: duplicate session id");
+                    return;
+                }
+                if let Err(e) = ensure_transfer_capacity(&transfers) {
+                    eprintln!("file offer ignored: {e}");
+                    return;
+                }
+                transfers.insert(
+                    session_id.clone(),
+                    TransferRecord::PendingIncoming(PendingIncomingTransfer {
+                        sender_id: sender_id.clone(),
+                        file_name: file_name.clone(),
+                        size,
+                        sha256,
+                        content_key,
+                        nonce_prefix,
+                        offer_sdp_json: sdp_json,
+                    }),
+                );
+            }
+            spawn_transfer_timeout(app.clone(), state.clone(), session_id.clone());
             let _ = app.emit(
                 "file-offer-received",
                 FileOfferDto {
@@ -2002,10 +2409,25 @@ async fn handle_file_signal(
             session_id,
             sdp_json,
         } => {
+            if !is_valid_session_id(&session_id) {
+                return;
+            }
+            if let Err(e) = validate_sdp_json(&sdp_json) {
+                emit_file_failed(app, state, &session_id, &e).await;
+                return;
+            }
             let peer = {
                 let transfers = state.file_transfers.lock().await;
                 match transfers.get(&session_id) {
-                    Some(TransferRecord::Outgoing(outgoing)) => Some(outgoing.peer.clone()),
+                    Some(TransferRecord::Outgoing(outgoing))
+                        if outgoing.recipient_id == sender_id =>
+                    {
+                        Some(outgoing.peer.clone())
+                    }
+                    Some(TransferRecord::Outgoing(_)) => {
+                        eprintln!("file answer ignored: sender did not match transfer");
+                        None
+                    }
                     _ => None,
                 }
             };
@@ -2015,18 +2437,32 @@ async fn handle_file_signal(
             match serde_json::from_str::<RTCSessionDescription>(&sdp_json) {
                 Ok(answer) => {
                     if let Err(e) = peer.set_remote_description(answer).await {
-                        emit_file_failed(app, &state, &session_id, &format!("{e}")).await;
+                        emit_file_failed(app, state, &session_id, &format!("{e}")).await;
                     }
                 }
                 Err(e) => emit_file_failed(app, state, &session_id, &e.to_string()).await,
             }
         }
         FileSignal::Reject { session_id, reason } => {
-            if let Some(TransferRecord::Outgoing(outgoing)) =
-                state.file_transfers.lock().await.remove(&session_id)
-            {
-                let _ = outgoing.peer.close().await;
+            if !is_valid_session_id(&session_id) {
+                return;
             }
+            let record = {
+                let mut transfers = state.file_transfers.lock().await;
+                let matches_sender = matches!(
+                    transfers.get(&session_id),
+                    Some(TransferRecord::Outgoing(outgoing)) if outgoing.recipient_id == sender_id
+                );
+                if matches_sender {
+                    transfers.remove(&session_id)
+                } else {
+                    None
+                }
+            };
+            if record.is_none() {
+                return;
+            }
+            cleanup_transfer_record(record).await;
             let _ = app.emit(
                 "file-transfer-cancelled",
                 FileTransferProgressDto {
@@ -2039,7 +2475,14 @@ async fn handle_file_signal(
             );
         }
         FileSignal::Cancel { session_id, reason } => {
-            cleanup_transfer(state, &session_id).await;
+            if !is_valid_session_id(&session_id) {
+                return;
+            }
+            let record = remove_transfer_matching_sender(state, &session_id, &sender_id).await;
+            if record.is_none() {
+                return;
+            }
+            cleanup_transfer_record(record).await;
             let _ = app.emit(
                 "file-transfer-cancelled",
                 FileTransferProgressDto {
@@ -2135,12 +2578,7 @@ fn install_sender_channel(
     app: tauri::AppHandle,
     state: Arc<AppState>,
     session_id: String,
-    path: PathBuf,
-    file_name: String,
-    total: u64,
-    sha256: [u8; 32],
-    content_key: [u8; 32],
-    nonce_prefix: [u8; FILE_NONCE_PREFIX_LEN],
+    payload: OutgoingFilePayload,
 ) {
     let open_channel = data_channel.clone();
     data_channel.on_open(Box::new(move || {
@@ -2148,22 +2586,11 @@ fn install_sender_channel(
         let app = app.clone();
         let state = state.clone();
         let session_id = session_id.clone();
-        let path = path.clone();
-        let file_name = file_name.clone();
+        let payload = payload.clone();
         Box::pin(async move {
-            if let Err(e) = send_file_over_channel(
-                dc,
-                app.clone(),
-                state.clone(),
-                session_id.clone(),
-                path,
-                file_name,
-                total,
-                sha256,
-                content_key,
-                nonce_prefix,
-            )
-            .await
+            if let Err(e) =
+                send_file_over_channel(dc, app.clone(), state.clone(), session_id.clone(), payload)
+                    .await
             {
                 emit_file_failed(&app, &state, &session_id, &e).await;
             }
@@ -2175,31 +2602,9 @@ fn install_receiver_channel(
     peer: &Arc<RTCPeerConnection>,
     app: tauri::AppHandle,
     state: Arc<AppState>,
-    session_id: String,
-    file_name: String,
-    total: u64,
-    sha256: [u8; 32],
-    content_key: [u8; 32],
-    nonce_prefix: [u8; FILE_NONCE_PREFIX_LEN],
-    file: tokio::fs::File,
-    final_path: PathBuf,
-    part_path: PathBuf,
+    receiver_state: ReceiverWriteState,
 ) {
-    let write_state = Arc::new(Mutex::new(ReceiverWriteState {
-        session_id,
-        file_name,
-        total,
-        received: 0,
-        next_index: 0,
-        sha256,
-        content_key,
-        nonce_prefix,
-        file: Some(file),
-        final_path,
-        part_path,
-        hasher: Sha256::new(),
-        done: false,
-    }));
+    let write_state = Arc::new(Mutex::new(receiver_state));
     peer.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
         let app = app.clone();
         let state = state.clone();
@@ -2228,17 +2633,12 @@ async fn send_file_over_channel(
     app: tauri::AppHandle,
     state: Arc<AppState>,
     session_id: String,
-    path: PathBuf,
-    file_name: String,
-    total: u64,
-    sha256: [u8; 32],
-    content_key: [u8; 32],
-    nonce_prefix: [u8; FILE_NONCE_PREFIX_LEN],
+    payload: OutgoingFilePayload,
 ) -> Result<(), String> {
-    let mut file = tokio::fs::File::open(path)
+    let mut file = tokio::fs::File::open(&payload.path)
         .await
         .map_err(|e| e.to_string())?;
-    let cipher = XChaCha20Poly1305::new(&content_key.into());
+    let cipher = XChaCha20Poly1305::new(&payload.content_key.into());
     let mut buf = vec![0u8; FILE_CHUNK_SIZE];
     let mut index = 0u64;
     let mut sent = 0u64;
@@ -2247,7 +2647,7 @@ async fn send_file_over_channel(
         if n == 0 {
             break;
         }
-        let nonce = file_chunk_nonce(&nonce_prefix, index);
+        let nonce = file_chunk_nonce(&payload.nonce_prefix, index);
         let aad = file_chunk_aad(&session_id, index);
         let ct = cipher
             .encrypt(
@@ -2260,7 +2660,13 @@ async fn send_file_over_channel(
             .map_err(|_| "file chunk encryption failed".to_string())?;
         let frame =
             postcard::to_allocvec(&FileFrame::Chunk { index, ct }).map_err(|e| e.to_string())?;
+        let wait_started = std::time::Instant::now();
         while dc.buffered_amount().await > 512 * 1024 {
+            if wait_started.elapsed()
+                > std::time::Duration::from_secs(FILE_BACKPRESSURE_TIMEOUT_SECS)
+            {
+                return Err("file transfer stalled".to_string());
+            }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         dc.send(&Bytes::from(frame))
@@ -2273,9 +2679,9 @@ async fn send_file_over_channel(
             FileTransferProgressDto {
                 session_id: session_id.clone(),
                 transferred: sent,
-                total,
+                total: payload.total,
                 status: "sending".to_string(),
-                message: file_name.clone(),
+                message: payload.file_name.clone(),
             },
         );
     }
@@ -2287,9 +2693,9 @@ async fn send_file_over_channel(
         "file-transfer-complete",
         serde_json::json!({
             "session_id": session_id,
-            "file_name": file_name,
-            "size": total,
-            "sha256": hex::encode(sha256),
+            "file_name": payload.file_name,
+            "size": payload.total,
+            "sha256": hex::encode(payload.sha256),
             "direction": "outgoing"
         }),
     );
@@ -2303,6 +2709,9 @@ async fn handle_file_frame(
     write_state: Arc<Mutex<ReceiverWriteState>>,
     msg: DataChannelMessage,
 ) -> Result<(), String> {
+    if msg.data.len() > MAX_FILE_FRAME_BYTES {
+        return Err("file transfer frame is too large".to_string());
+    }
     let frame: FileFrame = postcard::from_bytes(&msg.data).map_err(|e| e.to_string())?;
     match frame {
         FileFrame::Chunk { index, ct } => {
@@ -2380,14 +2789,7 @@ async fn handle_file_frame(
                 let _ = tokio::fs::remove_file(&part_path).await;
                 return Err("received file checksum did not match".to_string());
             }
-            if final_path.exists() {
-                tokio::fs::remove_file(&final_path)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-            tokio::fs::rename(&part_path, &final_path)
-                .await
-                .map_err(|e| e.to_string())?;
+            finalize_received_file_no_overwrite(&part_path, &final_path).await?;
             state.file_transfers.lock().await.remove(&session_id);
             let _ = app.emit(
                 "file-transfer-complete",
@@ -2440,6 +2842,67 @@ fn part_path_for(path: &Path) -> PathBuf {
     PathBuf::from(part)
 }
 
+fn ensure_receive_destination_available(path: &Path) -> Result<(), String> {
+    if path.exists() {
+        if path.is_dir() {
+            return Err("save path points to a folder".to_string());
+        }
+        return Err("a file already exists at that path; choose a new name".to_string());
+    }
+    let Some(parent) = path.parent() else {
+        return Err("save path has no parent folder".to_string());
+    };
+    if !parent.exists() || !parent.is_dir() {
+        return Err("save folder does not exist".to_string());
+    }
+    Ok(())
+}
+
+async fn create_new_file(path: &Path) -> Result<tokio::fs::File, String> {
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await
+        .map_err(|e| {
+            if e.kind() == ErrorKind::AlreadyExists {
+                "a file already exists at that path; choose a new name".to_string()
+            } else {
+                e.to_string()
+            }
+        })
+}
+
+async fn finalize_received_file_no_overwrite(
+    part_path: &Path,
+    final_path: &Path,
+) -> Result<(), String> {
+    let mut source = tokio::fs::File::open(part_path)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut dest = create_new_file(final_path).await?;
+    if let Err(e) = tokio::io::copy(&mut source, &mut dest).await {
+        let _ = tokio::fs::remove_file(final_path).await;
+        return Err(e.to_string());
+    }
+    if let Err(e) = dest.flush().await {
+        let _ = tokio::fs::remove_file(final_path).await;
+        return Err(e.to_string());
+    }
+    drop(dest);
+    drop(source);
+    tokio::fs::remove_file(part_path)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+fn spawn_transfer_timeout(app: tauri::AppHandle, state: Arc<AppState>, session_id: String) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(FILE_TRANSFER_TIMEOUT_SECS)).await;
+        emit_file_failed_if_active(&app, &state, &session_id, "File transfer timed out").await;
+    });
+}
+
 async fn emit_file_failed(
     app: &tauri::AppHandle,
     state: &Arc<AppState>,
@@ -2459,8 +2922,111 @@ async fn emit_file_failed(
     );
 }
 
-async fn cleanup_transfer(state: &Arc<AppState>, session_id: &str) {
+async fn emit_file_failed_if_active(
+    app: &tauri::AppHandle,
+    state: &Arc<AppState>,
+    session_id: &str,
+    message: &str,
+) {
+    if cleanup_transfer(state, session_id).await {
+        let _ = app.emit(
+            "file-transfer-failed",
+            FileTransferProgressDto {
+                session_id: session_id.to_string(),
+                transferred: 0,
+                total: 0,
+                status: "failed".to_string(),
+                message: message.to_string(),
+            },
+        );
+    }
+}
+
+async fn cleanup_transfer(state: &Arc<AppState>, session_id: &str) -> bool {
     let record = state.file_transfers.lock().await.remove(session_id);
+    let had_record = record.is_some();
+    cleanup_transfer_record(record).await;
+    had_record
+}
+
+async fn remove_transfer_matching_sender(
+    state: &Arc<AppState>,
+    session_id: &str,
+    sender_id: &crypto::Ed25519PubKey,
+) -> Option<TransferRecord> {
+    let mut transfers = state.file_transfers.lock().await;
+    let matches_sender = match transfers.get(session_id) {
+        Some(TransferRecord::Outgoing(outgoing)) => &outgoing.recipient_id == sender_id,
+        Some(TransferRecord::Incoming(incoming)) => &incoming.sender_id == sender_id,
+        Some(TransferRecord::PendingIncoming(pending)) => &pending.sender_id == sender_id,
+        None => false,
+    };
+    if matches_sender {
+        transfers.remove(session_id)
+    } else {
+        None
+    }
+}
+
+async fn cancel_transfers_not_in_roster(
+    state: &Arc<AppState>,
+    app: &tauri::AppHandle,
+    roster: &VerifiedRoster,
+) {
+    let stale = {
+        let mut transfers = state.file_transfers.lock().await;
+        let stale_ids: Vec<String> = transfers
+            .iter()
+            .filter_map(|(session_id, record)| {
+                if transfer_is_stale_for_roster(record, roster, &state.device.signing_pub) {
+                    Some(session_id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        stale_ids
+            .into_iter()
+            .filter_map(|session_id| {
+                transfers
+                    .remove(&session_id)
+                    .map(|record| (session_id, record))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    for (session_id, record) in stale {
+        cleanup_transfer_record(Some(record)).await;
+        let _ = app.emit(
+            "file-transfer-cancelled",
+            FileTransferProgressDto {
+                session_id,
+                transferred: 0,
+                total: 0,
+                status: "cancelled".to_string(),
+                message: "Peer is no longer in this room".to_string(),
+            },
+        );
+    }
+}
+
+fn transfer_is_stale_for_roster(
+    record: &TransferRecord,
+    roster: &VerifiedRoster,
+    self_id: &crypto::Ed25519PubKey,
+) -> bool {
+    if !roster.is_active(self_id) {
+        return true;
+    }
+    let peer_id = match record {
+        TransferRecord::PendingIncoming(pending) => &pending.sender_id,
+        TransferRecord::Outgoing(outgoing) => &outgoing.recipient_id,
+        TransferRecord::Incoming(incoming) => &incoming.sender_id,
+    };
+    !roster.is_active(peer_id)
+}
+
+async fn cleanup_transfer_record(record: Option<TransferRecord>) {
     match record {
         Some(TransferRecord::Incoming(incoming)) => {
             let _ = incoming.peer.close().await;
@@ -2470,6 +3036,97 @@ async fn cleanup_transfer(state: &Arc<AppState>, session_id: &str) {
             let _ = outgoing.peer.close().await;
         }
         Some(TransferRecord::PendingIncoming(_)) | None => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::DeviceKeypairs;
+    use crate::roster::DeviceIdentity;
+
+    fn identity(device: &DeviceKeypairs, label: &str) -> DeviceIdentity {
+        DeviceIdentity {
+            signing_pub: device.signing_pub.clone(),
+            x25519_pub: device.x25519_pub.clone(),
+            label: label.to_string(),
+        }
+    }
+
+    #[test]
+    fn safe_default_file_name_removes_paths_and_unsafe_chars() {
+        assert_eq!(safe_default_file_name(r"..\..\secret?.txt"), "secret_.txt");
+        assert_eq!(safe_default_file_name("bad:name.txt"), "bad_name.txt");
+        assert_eq!(safe_default_file_name(""), "fwoosh-file");
+        assert_eq!(safe_default_file_name("."), "fwoosh-file");
+    }
+
+    #[test]
+    fn receive_destination_rejects_existing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let final_path = dir.path().join("incoming.txt");
+        std::fs::write(&final_path, b"existing").unwrap();
+
+        assert!(ensure_receive_destination_available(&final_path)
+            .unwrap_err()
+            .contains("already exists"));
+        assert!(ensure_receive_destination_available(&dir.path().join("new.txt")).is_ok());
+    }
+
+    #[tokio::test]
+    async fn finalization_refuses_to_overwrite_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let part_path = dir.path().join("incoming.txt.fwoosh-part");
+        let final_path = dir.path().join("incoming.txt");
+        tokio::fs::write(&part_path, b"new").await.unwrap();
+        tokio::fs::write(&final_path, b"old").await.unwrap();
+
+        assert!(finalize_received_file_no_overwrite(&part_path, &final_path)
+            .await
+            .unwrap_err()
+            .contains("already exists"));
+        assert_eq!(tokio::fs::read(&final_path).await.unwrap(), b"old");
+        assert_eq!(tokio::fs::read(&part_path).await.unwrap(), b"new");
+    }
+
+    #[test]
+    fn persisted_roster_chain_must_verify_from_genesis() {
+        let admin = DeviceKeypairs::generate();
+        let bob = DeviceKeypairs::generate();
+        let genesis = roster::build_genesis(&admin, "admin", "topic");
+        let signed0 = roster::sign_and_chain(&admin, genesis, None).unwrap();
+        let verified0 = VerifiedRoster::verify_first(signed0.clone()).unwrap();
+        let unsigned1 = roster::build_add_device(&verified0.entry, identity(&bob, "bob"));
+        let signed1 = roster::sign_and_chain(&admin, unsigned1, Some(&verified0.entry)).unwrap();
+
+        let chain = PersistedRosterChain {
+            version: 2,
+            entries: vec![signed0, signed1.clone()],
+        };
+        let bytes = postcard::to_allocvec(&chain).unwrap();
+        let loaded = verify_persisted_roster_entries(
+            decode_persisted_roster_entries(&bytes).expect("chain decodes"),
+        )
+        .unwrap();
+        assert_eq!(loaded.epoch(), 1);
+
+        let lone_non_genesis = postcard::to_allocvec(&signed1).unwrap();
+        let entries = decode_persisted_roster_entries(&lone_non_genesis).unwrap();
+        assert!(verify_persisted_roster_entries(entries).is_err());
+    }
+
+    #[test]
+    fn legacy_genesis_roster_still_loads() {
+        let admin = DeviceKeypairs::generate();
+        let genesis = roster::build_genesis(&admin, "admin", "topic");
+        let signed0 = roster::sign_and_chain(&admin, genesis, None).unwrap();
+        let bytes = postcard::to_allocvec(&signed0).unwrap();
+
+        let loaded = verify_persisted_roster_entries(
+            decode_persisted_roster_entries(&bytes).expect("legacy entry decodes"),
+        )
+        .unwrap();
+        assert_eq!(loaded.epoch(), 0);
     }
 }
 

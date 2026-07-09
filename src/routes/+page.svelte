@@ -3,7 +3,6 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import { save } from "@tauri-apps/plugin-dialog";
   import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 
   type Theme = "hacker" | "light" | "onyx";
@@ -20,6 +19,7 @@
   let showPairing = $state(false);
   let inRoom = $state(false);
   let toast = $state<ToastInfo | null>(null);
+  let privateSend = $state(false);
   let activeView = $state<"compose" | "history" | "files">("compose");
   let devices = $state<DeviceDto[]>([]);
   let theme = $state<Theme>("hacker");
@@ -70,8 +70,14 @@
     can_revoke: boolean;
   }
   interface DroppedFile {
-    path: string;
+    grant_id: string | null;
     name: string;
+    size?: number;
+  }
+  interface FileDropGrantDto {
+    grant_id: string;
+    file_name: string;
+    size: number;
   }
   interface TransferDto {
     session_id: string;
@@ -159,10 +165,20 @@
             fileHover = true;
           } else if (payload.type === "drop") {
             fileHover = false;
-            void handleDroppedPaths(payload.paths);
           } else {
             fileHover = false;
           }
+        })
+      );
+      unlisteners.push(
+        await listen("file-drop-granted", (e) => {
+          void handleDroppedFile(e.payload as FileDropGrantDto);
+        })
+      );
+      unlisteners.push(
+        await listen("file-drop-rejected", (e) => {
+          status = "err";
+          statusMsg = String(e.payload);
         })
       );
       unlisteners.push(
@@ -251,22 +267,13 @@
     }
   }
 
-  function fileNameFromPath(path: string) {
-    return path.split(/[\\/]/).filter(Boolean).pop() ?? "Dropped file";
-  }
-
-  async function handleDroppedPaths(paths: string[]) {
+  async function handleDroppedFile(grant: FileDropGrantDto) {
     if (!inRoom) {
       status = "err";
       statusMsg = "Pair another device before sending files";
       return;
     }
-    if (paths.length !== 1) {
-      status = "err";
-      statusMsg = "Drop one file at a time";
-      return;
-    }
-    const file = { path: paths[0], name: fileNameFromPath(paths[0]) };
+    const file = { grant_id: grant.grant_id, name: grant.file_name, size: grant.size };
     if (peerDevices.length === 0) {
       status = "err";
       statusMsg = "No paired device is available";
@@ -279,7 +286,25 @@
     pendingFile = file;
   }
 
-  async function sendFileTo(file: DroppedFile, recipientId: string) {
+  async function chooseFileForSend() {
+    if (!inRoom) {
+      status = "err";
+      statusMsg = "Pair another device before sending files";
+      return;
+    }
+    if (peerDevices.length === 0) {
+      status = "err";
+      statusMsg = "No paired device is available";
+      return;
+    }
+    if (peerDevices.length === 1) {
+      await sendFileTo(null, peerDevices[0].id);
+      return;
+    }
+    pendingFile = { grant_id: null, name: "Choose a file" };
+  }
+
+  async function sendFileTo(file: DroppedFile | null, recipientId: string) {
     if (sendingFile) return;
     sendingFile = true;
     pendingFile = null;
@@ -287,8 +312,8 @@
     statusMsg = "Preparing file transfer";
     try {
       const transfer = await invoke<TransferDto>("start_file_send", {
-        path: file.path,
         recipientId,
+        grantId: file?.grant_id ?? null,
       });
       status = "idle";
       transfers = {
@@ -317,31 +342,30 @@
     if (!incomingFileOffer || acceptingFile) return;
     acceptingFile = true;
     try {
-      const savePath = await save({ defaultPath: incomingFileOffer.file_name });
-      if (!savePath) return;
       const offer = incomingFileOffer;
-      incomingFileOffer = null;
+      const transfer = await invoke<TransferDto>("accept_file_transfer", {
+        sessionId: offer.session_id,
+      });
       transfers = {
         ...transfers,
-        [offer.session_id]: {
-          session_id: offer.session_id,
-          file_name: offer.file_name,
-          peer_label: offer.sender_label,
-          direction: "incoming",
+        [transfer.session_id]: {
+          session_id: transfer.session_id,
+          file_name: transfer.file_name,
+          peer_label: transfer.peer_label,
+          direction: transfer.direction,
           transferred: 0,
-          total: offer.size,
-          status: "connecting",
+          total: transfer.size,
+          status: transfer.status,
           message: "Preparing direct connection",
         },
       };
+      incomingFileOffer = null;
       activeView = "files";
-      await invoke("accept_file_transfer", {
-        sessionId: offer.session_id,
-        savePath,
-      });
     } catch (e) {
-      status = "err";
-      statusMsg = String(e);
+      if (String(e) !== "Save cancelled") {
+        status = "err";
+        statusMsg = String(e);
+      }
     } finally {
       acceptingFile = false;
     }
@@ -483,9 +507,9 @@
     sending = true;
     status = "idle";
     try {
-      await invoke("send_clip", { text, private: false });
+      await invoke("send_clip", { text, private: privateSend });
       status = "ok";
-      statusMsg = "Sent and saved to history";
+      statusMsg = privateSend ? "Sent privately" : "Sent and saved to history";
       text = "";
       setTimeout(() => (status = "idle"), 2000);
     } catch (e) {
@@ -874,6 +898,15 @@
           </div>
         {:else}
           <span class="compose-control-spacer" aria-hidden="true"></span>
+        {/if}
+        {#if inRoom}
+          <button class="ghost file-action" onclick={chooseFileForSend} disabled={sendingFile}>
+            File
+          </button>
+          <label class="private-toggle">
+            <input type="checkbox" bind:checked={privateSend} />
+            <span>Private</span>
+          </label>
         {/if}
         <button class="send-btn" onclick={send} disabled={sending || !text.trim()}>
           {sending ? "Sending..." : "Send"}
@@ -1581,7 +1614,27 @@
   .compose-controls {
     display: flex;
     align-items: center;
+    gap: 8px;
     justify-content: flex-end;
+  }
+  .file-action {
+    min-height: 34px;
+    padding-inline: 12px;
+  }
+  .private-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 34px;
+    padding: 0 8px;
+    color: #a1a1aa;
+    font-size: 12px;
+    user-select: none;
+  }
+  .private-toggle input {
+    width: 14px;
+    height: 14px;
+    accent-color: #6366f1;
   }
   .send-btn {
     background: #6366f1;
