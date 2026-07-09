@@ -121,9 +121,9 @@ Before tagging a release, move the relevant `CHANGELOG.md` entries from
 
 > **Windows + Git Bash:** because Git Bash's `/usr/bin/link` (GNU coreutils)
 > shadows MSVC's `link.exe` in PATH, builds from Git Bash use
-> `src-tauri/cargo-dev.cmd` (which loads `vcvars64.bat`) and a linker pin in
-> `.cargo/config.toml`. This is purely a shell-PATH issue, not a project
-> workaround — PowerShell, cmd, and CI all build normally.
+> `src-tauri/cargo-dev.cmd`, which discovers Visual Studio locally, loads
+> `vcvars64.bat`, and sets a wrapper-scoped Cargo linker override. CI and
+> normal PowerShell/cmd builds should use Cargo's default MSVC discovery.
 
 ## Project layout
 
