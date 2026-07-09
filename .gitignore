@@ -9,6 +9,9 @@ node_modules
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 
+# Local Cargo/toolchain overrides
+src-tauri/.cargo/config.toml
+
 # Local promo/export assets
 promo-site/
 fwoosh_icon2.png
