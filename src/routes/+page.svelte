@@ -34,6 +34,7 @@
   let deviceLabelDraft = $state("");
   let savingDeviceLabel = $state(false);
   let stunServersText = $state("");
+  let transferTimeoutMinutes = $state(60);
   let savingNetwork = $state(false);
   let fileHover = $state(false);
   let pendingFile = $state<DroppedFile | null>(null);
@@ -54,6 +55,7 @@
   let pairingSecondsLeft = $derived(Math.max(0, pairingExpiresAt - nowSeconds));
   let pairingExpiryLabel = $derived(formatPairingExpiry(pairingSecondsLeft));
   let toastTimer: ReturnType<typeof setTimeout> | null = null;
+  let statusTimer: ReturnType<typeof setTimeout> | null = null;
   let pairingTickTimer: ReturnType<typeof setInterval> | null = null;
 
   interface PairingCodeDto {
@@ -153,10 +155,15 @@
         deviceLabelDraft = deviceLabel;
       }
       try {
-        const network = await invoke<{ stun_servers: string[] }>("network_settings");
+        const network = await invoke<{
+          stun_servers: string[];
+          transfer_timeout_minutes: number;
+        }>("network_settings");
         stunServersText = network.stun_servers.join(", ");
+        transferTimeoutMinutes = network.transfer_timeout_minutes || 60;
       } catch {
         stunServersText = "stun:stun.cloudflare.com:3478";
+        transferTimeoutMinutes = 60;
       }
       try {
         clips = await invoke<ClipDto[]>("recent_clips", { limit: 50 });
@@ -194,8 +201,7 @@
       );
       unlisteners.push(
         await listen("file-drop-rejected", (e) => {
-          status = "err";
-          statusMsg = String(e.payload);
+          showStatus("err", String(e.payload));
         })
       );
       unlisteners.push(
@@ -240,9 +246,34 @@
         clearInterval(pairingTickTimer);
         pairingTickTimer = null;
       }
+      clearStatusTimer();
       unlisteners.forEach((u) => void u());
     };
   });
+
+  function clearStatusTimer() {
+    if (statusTimer) {
+      clearTimeout(statusTimer);
+      statusTimer = null;
+    }
+  }
+
+  function clearStatus() {
+    clearStatusTimer();
+    status = "idle";
+    statusMsg = "";
+  }
+
+  function showStatus(next: "ok" | "err", message: string, durationMs = next === "err" ? 10000 : 2000) {
+    clearStatusTimer();
+    status = next;
+    statusMsg = message;
+    if (durationMs > 0) {
+      statusTimer = setTimeout(() => {
+        if (status === next && statusMsg === message) clearStatus();
+      }, durationMs);
+    }
+  }
 
   // ---- Actions ----
   function setTheme(next: Theme) {
@@ -258,13 +289,10 @@
     try {
       await invoke("rename_device", { label: deviceLabelDraft });
       deviceLabel = deviceLabelDraft.trim();
-      status = "ok";
-      statusMsg = "Device name updated";
+      showStatus("ok", "Device name updated");
       await refreshRoom();
-      setTimeout(() => (status = "idle"), 2000);
     } catch (e) {
-      status = "err";
-      statusMsg = String(e);
+      showStatus("err", String(e));
     } finally {
       savingDeviceLabel = false;
     }
@@ -278,13 +306,15 @@
         .split(",")
         .map((s) => s.trim())
         .filter(Boolean);
-      await invoke("set_stun_servers", { stunServers });
-      status = "ok";
-      statusMsg = "Network settings updated";
-      setTimeout(() => (status = "idle"), 2000);
+      const transferTimeout = Math.trunc(Number(transferTimeoutMinutes));
+      await invoke("set_network_settings", {
+        stunServers,
+        transferTimeoutMinutes: transferTimeout,
+      });
+      transferTimeoutMinutes = transferTimeout;
+      showStatus("ok", "Network settings updated");
     } catch (e) {
-      status = "err";
-      statusMsg = String(e);
+      showStatus("err", String(e));
     } finally {
       savingNetwork = false;
     }
@@ -292,14 +322,12 @@
 
   async function handleDroppedFile(grant: FileDropGrantDto) {
     if (!inRoom) {
-      status = "err";
-      statusMsg = "Pair another device before sending files";
+      showStatus("err", "Pair another device before sending files");
       return;
     }
     const file = { grant_id: grant.grant_id, name: grant.file_name, size: grant.size };
     if (peerDevices.length === 0) {
-      status = "err";
-      statusMsg = "No paired device is available";
+      showStatus("err", "No paired device is available");
       return;
     }
     if (peerDevices.length === 1) {
@@ -311,13 +339,11 @@
 
   async function chooseFileForSend() {
     if (!inRoom) {
-      status = "err";
-      statusMsg = "Pair another device before sending files";
+      showStatus("err", "Pair another device before sending files");
       return;
     }
     if (peerDevices.length === 0) {
-      status = "err";
-      statusMsg = "No paired device is available";
+      showStatus("err", "No paired device is available");
       return;
     }
     if (peerDevices.length === 1) {
@@ -331,14 +357,13 @@
     if (sendingFile) return;
     sendingFile = true;
     pendingFile = null;
-    status = "ok";
-    statusMsg = "Preparing file transfer";
+    showStatus("ok", "Preparing file transfer", 0);
     try {
       const transfer = await invoke<TransferDto>("start_file_send", {
         recipientId,
         grantId: file?.grant_id ?? null,
       });
-      status = "idle";
+      clearStatus();
       transfers = {
         ...transfers,
         [transfer.session_id]: {
@@ -354,8 +379,7 @@
       };
       activeView = "files";
     } catch (e) {
-      status = "err";
-      statusMsg = String(e);
+      showStatus("err", String(e));
     } finally {
       sendingFile = false;
     }
@@ -386,8 +410,7 @@
       activeView = "files";
     } catch (e) {
       if (String(e) !== "Save cancelled") {
-        status = "err";
-        statusMsg = String(e);
+        showStatus("err", String(e));
       }
     } finally {
       acceptingFile = false;
@@ -453,6 +476,7 @@
   }
 
   function failTransfer(p: FileTransferProgressDto) {
+    if (incomingFileOffer?.session_id === p.session_id) incomingFileOffer = null;
     const existing = transfers[p.session_id];
     transfers = {
       ...transfers,
@@ -527,8 +551,7 @@
       return true;
     } catch (e) {
       clearPairingCode();
-      status = "err";
-      statusMsg = String(e);
+      showStatus("err", String(e));
       return false;
     } finally {
       pairingRefreshing = false;
@@ -573,16 +596,13 @@
   async function send() {
     if (!text.trim() || sending) return;
     sending = true;
-    status = "idle";
+    clearStatus();
     try {
       await invoke("send_clip", { text, private: privateSend });
-      status = "ok";
-      statusMsg = privateSend ? "Sent privately" : "Sent and saved to history";
+      showStatus("ok", privateSend ? "Sent privately" : "Sent and saved to history");
       text = "";
-      setTimeout(() => (status = "idle"), 2000);
     } catch (e) {
-      status = "err";
-      statusMsg = String(e);
+      showStatus("err", String(e));
     } finally {
       sending = false;
     }
@@ -636,25 +656,21 @@
       await invoke("delete_clip", { id });
       clips = clips.filter((c) => c.id !== id);
     } catch (e) {
-      status = "err";
-      statusMsg = String(e);
+      showStatus("err", String(e));
     }
   }
 
   async function deleteAllClips() {
     if (deletingAll) return;
     deletingAll = true;
-    status = "idle";
+    clearStatus();
     try {
       await invoke("delete_all_clips");
       clips = [];
       confirmDeleteAllOpen = false;
-      status = "ok";
-      statusMsg = "History cleared";
-      setTimeout(() => (status = "idle"), 2000);
+      showStatus("ok", "History cleared");
     } catch (e) {
-      status = "err";
-      statusMsg = String(e);
+      showStatus("err", String(e));
     } finally {
       deletingAll = false;
     }
@@ -667,8 +683,7 @@
       await refreshRoom(true);
       applyPairingCode(code);
     } catch (e) {
-      status = "err";
-      statusMsg = String(e);
+      showStatus("err", String(e));
     }
   }
 
@@ -775,10 +790,9 @@
       devices = [];
       devicesExpanded = false;
       clearPairingCode();
-      status = "idle";
+      clearStatus();
     } catch (e) {
-      status = "err";
-      statusMsg = String(e);
+      showStatus("err", String(e));
     }
   }
 
@@ -787,12 +801,9 @@
     try {
       await invoke("join_room", { uri: joinUri, label: preferredDeviceLabel() });
       joinUri = "";
-      status = "ok";
-      statusMsg = "Joining room - waiting for admin to add you...";
-      setTimeout(() => (status = "idle"), 4000);
+      showStatus("ok", "Joining room - waiting for admin to add you...", 4000);
     } catch (e) {
-      status = "err";
-      statusMsg = String(e);
+      showStatus("err", String(e));
     }
   }
 
@@ -806,8 +817,7 @@
       await invoke("revoke_device", { deviceId: id });
       await refreshRoom();
     } catch (e) {
-      status = "err";
-      statusMsg = String(e);
+      showStatus("err", String(e));
     }
   }
 </script>
@@ -919,6 +929,17 @@
               bind:value={stunServersText}
               onkeydown={(e) => e.stopPropagation()}
             ></textarea>
+            <label class="settings-title" for="transfer-timeout">Transfer timeout (minutes)</label>
+            <input
+              id="transfer-timeout"
+              class="settings-input"
+              type="number"
+              min="1"
+              max="10080"
+              step="1"
+              bind:value={transferTimeoutMinutes}
+              onkeydown={(e) => e.stopPropagation()}
+            />
             <button class="mini-action full" onclick={saveNetworkSettings} disabled={savingNetwork}>
               {savingNetwork ? "Saving..." : "Save network"}
             </button>
@@ -967,8 +988,16 @@
             File
           </button>
           <label class="private-toggle">
-            <input type="checkbox" bind:checked={privateSend} />
+            <input
+              type="checkbox"
+              bind:checked={privateSend}
+              aria-describedby="private-mode-help"
+            />
             <span>Private</span>
+            <span id="private-mode-help" class="private-tooltip" role="tooltip">
+              Skips local history and asks the relay not to cache. If the receiver is offline now,
+              it will not arrive.
+            </span>
           </label>
         {/if}
         <button class="send-btn" onclick={send} disabled={sending || !text.trim()}>
@@ -1688,12 +1717,14 @@
     padding-inline: 12px;
   }
   .private-toggle {
+    position: relative;
     display: inline-flex;
     align-items: center;
     gap: 6px;
     min-height: 34px;
     padding: 0 8px;
     color: #a1a1aa;
+    cursor: help;
     font-size: 12px;
     user-select: none;
   }
@@ -1701,6 +1732,51 @@
     width: 14px;
     height: 14px;
     accent-color: #6366f1;
+  }
+  .private-tooltip {
+    position: absolute;
+    right: 0;
+    bottom: calc(100% + 10px);
+    z-index: 45;
+    width: min(245px, calc(100vw - 32px));
+    padding: 8px 10px;
+    border: 1px solid var(--line-strong, rgba(139, 197, 72, 0.36));
+    border-radius: 7px;
+    background: var(--field-strong, rgba(11, 18, 10, 0.96));
+    color: var(--text, #d9ded2);
+    box-shadow:
+      0 12px 28px rgba(0, 0, 0, 0.38),
+      inset 0 1px 0 rgba(255, 255, 255, 0.05);
+    backdrop-filter: blur(14px);
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 1.35;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(4px);
+    transition:
+      opacity 0.14s ease,
+      transform 0.14s ease,
+      visibility 0.14s ease;
+    visibility: hidden;
+  }
+  .private-tooltip::after {
+    content: "";
+    position: absolute;
+    right: 24px;
+    bottom: -5px;
+    width: 9px;
+    height: 9px;
+    border-right: 1px solid var(--line-strong, rgba(139, 197, 72, 0.36));
+    border-bottom: 1px solid var(--line-strong, rgba(139, 197, 72, 0.36));
+    background: var(--field-strong, rgba(11, 18, 10, 0.96));
+    transform: rotate(45deg);
+  }
+  .private-toggle:hover .private-tooltip,
+  .private-toggle:focus-within .private-tooltip {
+    opacity: 1;
+    transform: translateY(0);
+    visibility: visible;
   }
   .send-btn {
     background: #6366f1;
@@ -2814,6 +2890,21 @@
   :global(html[data-theme="light"]) .send-btn:hover:not(:disabled) {
     background: var(--accent-hover);
   }
+  :global(html[data-theme="light"]) .private-tooltip {
+    border-color: rgba(0, 174, 184, 0.38);
+    background:
+      linear-gradient(135deg, rgba(255, 253, 246, 0.98), rgba(237, 249, 240, 0.96)),
+      var(--field-strong);
+    color: var(--text-strong);
+    box-shadow:
+      0 12px 26px rgba(38, 66, 82, 0.16),
+      inset 0 1px 0 rgba(255, 255, 255, 0.72);
+  }
+  :global(html[data-theme="light"]) .private-tooltip::after {
+    border-right-color: rgba(0, 174, 184, 0.38);
+    border-bottom-color: rgba(0, 174, 184, 0.38);
+    background: rgba(246, 252, 239, 0.98);
+  }
   :global(html[data-theme="onyx"]) .scheme-toggle button,
   :global(html[data-theme="onyx"]) .mini-action,
   :global(html[data-theme="onyx"]) .ghost,
@@ -2875,6 +2966,21 @@
       linear-gradient(180deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.025)),
       #020202;
     border-color: rgba(255, 255, 255, 0.32);
+  }
+  :global(html[data-theme="onyx"]) .private-tooltip {
+    border-color: rgba(255, 255, 255, 0.28);
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.065), rgba(255, 255, 255, 0.018)),
+      #050505;
+    color: #ffffff;
+    box-shadow:
+      0 12px 28px rgba(0, 0, 0, 0.58),
+      inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  }
+  :global(html[data-theme="onyx"]) .private-tooltip::after {
+    border-right-color: rgba(255, 255, 255, 0.28);
+    border-bottom-color: rgba(255, 255, 255, 0.28);
+    background: #050505;
   }
 
   .compose {

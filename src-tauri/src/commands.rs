@@ -58,10 +58,11 @@ const DEFAULT_STUN_SERVER: &str = "stun:stun.cloudflare.com:3478";
 const MAX_STUN_SERVERS: usize = 4;
 const MAX_DEVICE_LABEL_CHARS: usize = 48;
 const FILE_CHUNK_SIZE: usize = 8 * 1024;
-const MAX_FILE_TRANSFER_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_ACTIVE_FILE_TRANSFERS: usize = 8;
 const FILE_GRANT_TTL_SECS: u64 = 60;
-const FILE_TRANSFER_TIMEOUT_SECS: u64 = 10 * 60;
+const DEFAULT_FILE_TRANSFER_TIMEOUT_MINUTES: u64 = 60;
+const MIN_FILE_TRANSFER_TIMEOUT_MINUTES: u64 = 1;
+const MAX_FILE_TRANSFER_TIMEOUT_MINUTES: u64 = 7 * 24 * 60;
 const FILE_BACKPRESSURE_TIMEOUT_SECS: u64 = 30;
 const ICE_GATHER_TIMEOUT_SECS: u64 = 20;
 const MAX_FILE_NAME_CHARS: usize = 255;
@@ -143,6 +144,8 @@ impl AppState {
 pub struct AppSettings {
     pub device_label: Option<String>,
     pub stun_servers: Vec<String>,
+    #[serde(default = "default_file_transfer_timeout_minutes")]
+    pub transfer_timeout_minutes: u64,
 }
 
 impl Default for AppSettings {
@@ -150,6 +153,7 @@ impl Default for AppSettings {
         Self {
             device_label: None,
             stun_servers: vec![DEFAULT_STUN_SERVER.to_string()],
+            transfer_timeout_minutes: DEFAULT_FILE_TRANSFER_TIMEOUT_MINUTES,
         }
     }
 }
@@ -157,6 +161,7 @@ impl Default for AppSettings {
 #[derive(Serialize)]
 pub struct NetworkSettingsDto {
     pub stun_servers: Vec<String>,
+    pub transfer_timeout_minutes: u64,
 }
 
 #[derive(Serialize)]
@@ -180,17 +185,20 @@ pub struct PendingIncomingTransfer {
     content_key: [u8; 32],
     nonce_prefix: [u8; FILE_NONCE_PREFIX_LEN],
     offer_sdp_json: String,
+    timeout_token: u64,
 }
 
 pub struct OutgoingTransfer {
     recipient_id: crypto::Ed25519PubKey,
     peer: Arc<RTCPeerConnection>,
+    timeout_token: u64,
 }
 
 pub struct IncomingTransfer {
     sender_id: crypto::Ed25519PubKey,
     peer: Arc<RTCPeerConnection>,
     part_path: PathBuf,
+    timeout_token: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -445,6 +453,10 @@ fn pairing_expires_at(now: u64) -> u64 {
     now + PAIRING_SECRET_TTL_SECS
 }
 
+fn default_file_transfer_timeout_minutes() -> u64 {
+    DEFAULT_FILE_TRANSFER_TIMEOUT_MINUTES
+}
+
 async fn issue_pairing_code(state: &Arc<AppState>, topic: &str) -> PairingCodeDto {
     let secret = crate::pairing::random_secret();
     let expires_at = pairing_expires_at(now_unix());
@@ -473,6 +485,9 @@ pub fn load_settings(path: &Path) -> AppSettings {
             settings.device_label = settings
                 .device_label
                 .and_then(|label| sanitize_device_label(&label).ok());
+            if normalize_transfer_timeout_minutes(settings.transfer_timeout_minutes).is_err() {
+                settings.transfer_timeout_minutes = DEFAULT_FILE_TRANSFER_TIMEOUT_MINUTES;
+            }
             settings
         }
         Err(_) => AppSettings::default(),
@@ -547,23 +562,12 @@ fn validate_sdp_json(sdp_json: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_file_size(size: u64) -> Result<(), String> {
-    if size > MAX_FILE_TRANSFER_BYTES {
-        return Err(format!(
-            "file is too large; maximum supported size is {} MB",
-            MAX_FILE_TRANSFER_BYTES / 1024 / 1024
-        ));
-    }
-    Ok(())
-}
-
 fn inspect_local_file(path: PathBuf) -> Result<(PathBuf, String, u64), String> {
     let path = std::fs::canonicalize(&path).map_err(|e| e.to_string())?;
     let meta = std::fs::metadata(&path).map_err(|e| e.to_string())?;
     if !meta.is_file() {
         return Err("Only single files can be sent".to_string());
     }
-    validate_file_size(meta.len())?;
     let file_name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -648,6 +652,16 @@ fn ensure_transfer_capacity(transfers: &HashMap<String, TransferRecord>) -> Resu
     Ok(())
 }
 
+fn normalize_transfer_timeout_minutes(minutes: u64) -> Result<u64, String> {
+    if !(MIN_FILE_TRANSFER_TIMEOUT_MINUTES..=MAX_FILE_TRANSFER_TIMEOUT_MINUTES).contains(&minutes) {
+        return Err(format!(
+            "transfer timeout must be between {} minute and {} minutes",
+            MIN_FILE_TRANSFER_TIMEOUT_MINUTES, MAX_FILE_TRANSFER_TIMEOUT_MINUTES
+        ));
+    }
+    Ok(minutes)
+}
+
 fn normalize_stun_servers(input: Vec<String>) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     for raw in input {
@@ -693,7 +707,24 @@ pub async fn network_settings(
     let settings = state.settings.lock().await.clone();
     Ok(NetworkSettingsDto {
         stun_servers: settings.stun_servers,
+        transfer_timeout_minutes: settings.transfer_timeout_minutes,
     })
+}
+
+#[tauri::command]
+pub async fn set_network_settings(
+    state: State<'_, Arc<AppState>>,
+    stun_servers: Vec<String>,
+    transfer_timeout_minutes: u64,
+) -> Result<(), String> {
+    let normalized_stun_servers = normalize_stun_servers(stun_servers)?;
+    let normalized_timeout = normalize_transfer_timeout_minutes(transfer_timeout_minutes)?;
+    {
+        let mut settings = state.settings.lock().await;
+        settings.stun_servers = normalized_stun_servers;
+        settings.transfer_timeout_minutes = normalized_timeout;
+    }
+    persist_settings(state.inner()).await
 }
 
 #[tauri::command]
@@ -1198,7 +1229,14 @@ pub async fn start_file_send(
     let mut nonce_prefix = [0u8; FILE_NONCE_PREFIX_LEN];
     rand::rng().fill_bytes(&mut nonce_prefix);
     let session_id = new_session_id();
-    let stun_servers = state.settings.lock().await.stun_servers.clone();
+    let timeout_token = new_timeout_token();
+    let (stun_servers, transfer_timeout_minutes) = {
+        let settings = state.settings.lock().await;
+        (
+            settings.stun_servers.clone(),
+            settings.transfer_timeout_minutes,
+        )
+    };
     let peer = new_peer_connection(stun_servers).await?;
     install_peer_state_handler(
         &peer,
@@ -1255,10 +1293,17 @@ pub async fn start_file_send(
             TransferRecord::Outgoing(OutgoingTransfer {
                 recipient_id: recipient.clone(),
                 peer: peer.clone(),
+                timeout_token,
             }),
         );
     }
-    spawn_transfer_timeout(app.clone(), state.inner().clone(), session_id.clone());
+    spawn_transfer_timeout(
+        app.clone(),
+        state.inner().clone(),
+        session_id.clone(),
+        timeout_token,
+        transfer_timeout_minutes,
+    );
 
     let signal = FileSignal::Offer {
         session_id: session_id.clone(),
@@ -1323,7 +1368,14 @@ pub async fn accept_file_transfer(
         }
     };
 
-    let stun_servers = state.settings.lock().await.stun_servers.clone();
+    let timeout_token = new_timeout_token();
+    let (stun_servers, transfer_timeout_minutes) = {
+        let settings = state.settings.lock().await;
+        (
+            settings.stun_servers.clone(),
+            settings.transfer_timeout_minutes,
+        )
+    };
     let peer = match new_peer_connection(stun_servers).await {
         Ok(peer) => peer,
         Err(e) => {
@@ -1473,9 +1525,16 @@ pub async fn accept_file_transfer(
             sender_id: pending.sender_id.clone(),
             peer: peer.clone(),
             part_path,
+            timeout_token,
         }),
     );
-    spawn_transfer_timeout(app.clone(), state.inner().clone(), session_id.clone());
+    spawn_transfer_timeout(
+        app.clone(),
+        state.inner().clone(),
+        session_id.clone(),
+        timeout_token,
+        transfer_timeout_minutes,
+    );
 
     let (topic, epoch) = current_room_topic_epoch(state.inner()).await?;
     let recipient = active_device_identity(state.inner(), &pending.sender_id).await?;
@@ -2278,6 +2337,12 @@ fn new_session_id() -> String {
     hex::encode(bytes)
 }
 
+fn new_timeout_token() -> u64 {
+    let mut bytes = [0u8; 8];
+    rand::rng().fill_bytes(&mut bytes);
+    u64::from_be_bytes(bytes)
+}
+
 async fn current_room_topic_epoch(state: &Arc<AppState>) -> Result<(String, u64), String> {
     let guard = state.roster.lock().await;
     let verified = guard.as_ref().ok_or("not in a room")?;
@@ -2388,7 +2453,7 @@ async fn handle_file_signal(
                 eprintln!("file offer ignored: invalid session id");
                 return;
             }
-            if let Err(e) = validate_file_size(size).and_then(|_| validate_sdp_json(&sdp_json)) {
+            if let Err(e) = validate_sdp_json(&sdp_json) {
                 eprintln!("file offer ignored: {e}");
                 return;
             }
@@ -2397,6 +2462,8 @@ async fn handle_file_signal(
                 .await
                 .map(|d| d.label)
                 .unwrap_or_else(|_| hex::encode(&sender_id.0[..4]));
+            let timeout_token = new_timeout_token();
+            let transfer_timeout_minutes = state.settings.lock().await.transfer_timeout_minutes;
             {
                 let mut transfers = state.file_transfers.lock().await;
                 if transfers.contains_key(&session_id) {
@@ -2417,10 +2484,17 @@ async fn handle_file_signal(
                         content_key,
                         nonce_prefix,
                         offer_sdp_json: sdp_json,
+                        timeout_token,
                     }),
                 );
             }
-            spawn_transfer_timeout(app.clone(), state.clone(), session_id.clone());
+            spawn_transfer_timeout(
+                app.clone(),
+                state.clone(),
+                session_id.clone(),
+                timeout_token,
+                transfer_timeout_minutes,
+            );
             let _ = app.emit(
                 "file-offer-received",
                 FileOfferDto {
@@ -2924,10 +2998,26 @@ async fn finalize_received_file_no_overwrite(
         .map_err(|e| e.to_string())
 }
 
-fn spawn_transfer_timeout(app: tauri::AppHandle, state: Arc<AppState>, session_id: String) {
+fn spawn_transfer_timeout(
+    app: tauri::AppHandle,
+    state: Arc<AppState>,
+    session_id: String,
+    timeout_token: u64,
+    timeout_minutes: u64,
+) {
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_secs(FILE_TRANSFER_TIMEOUT_SECS)).await;
-        emit_file_failed_if_active(&app, &state, &session_id, "File transfer timed out").await;
+        tokio::time::sleep(std::time::Duration::from_secs(
+            timeout_minutes.saturating_mul(60),
+        ))
+        .await;
+        emit_file_failed_if_active(
+            &app,
+            &state,
+            &session_id,
+            timeout_token,
+            "File transfer timed out",
+        )
+        .await;
     });
 }
 
@@ -2954,9 +3044,10 @@ async fn emit_file_failed_if_active(
     app: &tauri::AppHandle,
     state: &Arc<AppState>,
     session_id: &str,
+    timeout_token: u64,
     message: &str,
 ) {
-    if cleanup_transfer(state, session_id).await {
+    if cleanup_transfer_if_timeout_token(state, session_id, timeout_token).await {
         let _ = app.emit(
             "file-transfer-failed",
             FileTransferProgressDto {
@@ -2968,6 +3059,33 @@ async fn emit_file_failed_if_active(
             },
         );
     }
+}
+
+fn transfer_timeout_token(record: &TransferRecord) -> u64 {
+    match record {
+        TransferRecord::PendingIncoming(pending) => pending.timeout_token,
+        TransferRecord::Outgoing(outgoing) => outgoing.timeout_token,
+        TransferRecord::Incoming(incoming) => incoming.timeout_token,
+    }
+}
+
+async fn cleanup_transfer_if_timeout_token(
+    state: &Arc<AppState>,
+    session_id: &str,
+    timeout_token: u64,
+) -> bool {
+    let record = {
+        let mut transfers = state.file_transfers.lock().await;
+        match transfers.get(session_id) {
+            Some(record) if transfer_timeout_token(record) == timeout_token => {
+                transfers.remove(session_id)
+            }
+            _ => None,
+        }
+    };
+    let had_record = record.is_some();
+    cleanup_transfer_record(record).await;
+    had_record
 }
 
 async fn cleanup_transfer(state: &Arc<AppState>, session_id: &str) -> bool {
@@ -3087,6 +3205,58 @@ mod tests {
         assert_eq!(safe_default_file_name("bad:name.txt"), "bad_name.txt");
         assert_eq!(safe_default_file_name(""), "fwoosh-file");
         assert_eq!(safe_default_file_name("."), "fwoosh-file");
+    }
+
+    #[test]
+    fn legacy_settings_default_transfer_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"device_label":"Desk","stun_servers":["stun:example.com:3478"]}"#,
+        )
+        .unwrap();
+
+        let settings = load_settings(&path);
+        assert_eq!(settings.device_label.as_deref(), Some("Desk"));
+        assert_eq!(settings.stun_servers, vec!["stun:example.com:3478"]);
+        assert_eq!(
+            settings.transfer_timeout_minutes,
+            DEFAULT_FILE_TRANSFER_TIMEOUT_MINUTES
+        );
+    }
+
+    #[test]
+    fn transfer_timeout_bounds_are_validated() {
+        assert!(normalize_transfer_timeout_minutes(0).is_err());
+        assert!(normalize_transfer_timeout_minutes(DEFAULT_FILE_TRANSFER_TIMEOUT_MINUTES).is_ok());
+        assert!(normalize_transfer_timeout_minutes(MAX_FILE_TRANSFER_TIMEOUT_MINUTES).is_ok());
+        assert!(normalize_transfer_timeout_minutes(MAX_FILE_TRANSFER_TIMEOUT_MINUTES + 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn stale_transfer_timeout_token_does_not_cleanup() {
+        let store = HistoryStore::open(Path::new(":memory:"), &[7u8; 32]).unwrap();
+        let state = Arc::new(AppState::new(DeviceKeypairs::generate(), store));
+        let session_id = "0123456789abcdef0123456789abcdef";
+        state.file_transfers.lock().await.insert(
+            session_id.to_string(),
+            TransferRecord::PendingIncoming(PendingIncomingTransfer {
+                sender_id: crypto::Ed25519PubKey([1u8; 32]),
+                file_name: "large.bin".to_string(),
+                size: u64::from(u32::MAX) + 1,
+                sha256: [2u8; 32],
+                content_key: [3u8; 32],
+                nonce_prefix: [4u8; FILE_NONCE_PREFIX_LEN],
+                offer_sdp_json: "{}".to_string(),
+                timeout_token: 100,
+            }),
+        );
+
+        assert!(!cleanup_transfer_if_timeout_token(&state, session_id, 99).await);
+        assert!(state.file_transfers.lock().await.contains_key(session_id));
+        assert!(cleanup_transfer_if_timeout_token(&state, session_id, 100).await);
+        assert!(!state.file_transfers.lock().await.contains_key(session_id));
     }
 
     #[test]
