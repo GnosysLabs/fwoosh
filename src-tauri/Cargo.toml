@@ -59,3 +59,9 @@ zbus-secret-service-keyring-store = { version = "1.0.0", features = ["crypto-rus
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-native-keyring-store = "1.1.0"
+
+# Temporary source-compatible security patch for RUSTSEC-2026-0194 and RUSTSEC-2026-0195.
+# Remove once wayland-scanner publishes a crates.io release containing this fix.
+# Tracking: https://github.com/GnosysLabs/fwoosh/issues/6
+[patch.crates-io]
+wayland-scanner = { path = "vendor/wayland-scanner" }

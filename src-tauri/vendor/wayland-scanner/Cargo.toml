@@ -1,0 +1,53 @@
+# Vendored from the MIT-licensed wayland-scanner 0.31.10 release.
+# Fwoosh backports its quick-xml 0.41 compatibility changes only; see issue #6.
+
+[package]
+edition = "2021"
+rust-version = "1.79"
+name = "wayland-scanner"
+version = "0.31.10"
+authors = ["Elinor Berger <elinor@safaradeg.net>"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Wayland Scanner for generating rust APIs from XML wayland protocol files."
+documentation = "https://docs.rs/wayland-scanner/"
+readme = "README.md"
+keywords = [
+    "wayland",
+    "codegen",
+]
+categories = [
+    "gui",
+    "api-bindings",
+]
+license = "MIT"
+repository = "https://github.com/smithay/wayland-rs"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = [
+    "--cfg",
+    "docsrs",
+]
+
+[lib]
+name = "wayland_scanner"
+path = "src/lib.rs"
+proc-macro = true
+
+[dependencies.proc-macro2]
+version = "1.0.11"
+
+[dependencies.quick-xml]
+# Backported from Smithay/wayland-rs commits ec2d932 and d07c4f9.
+version = "0.41"
+
+[dependencies.quote]
+version = "1.0"
+
+[dev-dependencies.similar]
+version = "2"

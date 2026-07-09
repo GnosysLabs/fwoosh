@@ -1,0 +1,3 @@
+# Cargo creates these when the vendored proc macro is checked directly.
+/target/
+/Cargo.lock
