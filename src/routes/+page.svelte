@@ -6,7 +6,7 @@
   import { save } from "@tauri-apps/plugin-dialog";
   import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
 
-  type Theme = "dark" | "light";
+  type Theme = "hacker" | "light" | "onyx";
 
   // ---- State ----
   let text = $state("");
@@ -20,9 +20,9 @@
   let showPairing = $state(false);
   let inRoom = $state(false);
   let toast = $state<ToastInfo | null>(null);
-  let activeView = $state<"compose" | "history">("compose");
+  let activeView = $state<"compose" | "history" | "files">("compose");
   let devices = $state<DeviceDto[]>([]);
-  let theme = $state<Theme>("dark");
+  let theme = $state<Theme>("hacker");
   let settingsOpen = $state(false);
   let devicesExpanded = $state(false);
   let confirmDeleteAllOpen = $state(false);
@@ -38,7 +38,13 @@
   let incomingFileOffer = $state<FileOfferDto | null>(null);
   let acceptingFile = $state(false);
   let transfers = $state<Record<string, TransferView>>({});
-  let logoSrc = $derived(theme === "dark" ? "/fwoosh_light.webp" : "/fwoosh_dark.webp");
+  let logoSrc = $derived(
+    theme === "light"
+      ? "/fwoosh_dark.webp"
+      : theme === "onyx"
+        ? "/fwoosh_onyx.webp"
+        : "/fwoosh_light.webp"
+  );
   let historySearching = $derived(query.trim().length > 0);
   let peerDevices = $derived(devices.filter((d) => !d.is_self));
   let transferList = $derived(Object.values(transfers));
@@ -106,11 +112,13 @@
   onMount(() => {
     const savedTheme = localStorage.getItem("fwoosh-theme");
     const preferredTheme =
-      savedTheme === "light" || savedTheme === "dark"
-        ? savedTheme
+      savedTheme === "dark"
+        ? "hacker"
+        : savedTheme === "light" || savedTheme === "hacker" || savedTheme === "onyx"
+          ? savedTheme
         : window.matchMedia?.("(prefers-color-scheme: light)").matches
           ? "light"
-          : "dark";
+          : "hacker";
     setTheme(preferredTheme);
 
     (async () => {
@@ -201,7 +209,7 @@
   function setTheme(next: Theme) {
     theme = next;
     document.documentElement.dataset.theme = next;
-    document.documentElement.style.colorScheme = next;
+    document.documentElement.style.colorScheme = next === "light" ? "light" : "dark";
     localStorage.setItem("fwoosh-theme", next);
   }
 
@@ -296,6 +304,7 @@
           message: "Waiting for recipient",
         },
       };
+      activeView = "files";
     } catch (e) {
       status = "err";
       statusMsg = String(e);
@@ -325,6 +334,7 @@
           message: "Preparing direct connection",
         },
       };
+      activeView = "files";
       await invoke("accept_file_transfer", {
         sessionId: offer.session_id,
         savePath,
@@ -739,6 +749,11 @@
         class:active={activeView === "history"}
         onclick={() => (activeView = "history")}>History</button
       >
+      <button
+        class="tab"
+        class:active={activeView === "files"}
+        onclick={() => (activeView = "files")}>Files</button
+      >
     </div>
     <div class="window-actions" data-tauri-drag-region="false">
       <button
@@ -789,16 +804,22 @@
             <div class="settings-title">Color scheme</div>
             <div class="scheme-toggle" role="radiogroup" aria-label="Color scheme">
               <button
-                class:active={theme === "dark"}
+                class:active={theme === "hacker"}
                 role="radio"
-                aria-checked={theme === "dark"}
-                onclick={() => setTheme("dark")}>Dark</button
+                aria-checked={theme === "hacker"}
+                onclick={() => setTheme("hacker")}>Hacker</button
               >
               <button
                 class:active={theme === "light"}
                 role="radio"
                 aria-checked={theme === "light"}
                 onclick={() => setTheme("light")}>Light</button
+              >
+              <button
+                class:active={theme === "onyx"}
+                role="radio"
+                aria-checked={theme === "onyx"}
+                onclick={() => setTheme("onyx")}>Onyx</button
               >
             </div>
           </div>
@@ -865,41 +886,6 @@
         </div>
       {/if}
 
-      {#if transferList.length > 0}
-        <div class="transfer-list">
-          {#each transferList as t (t.session_id)}
-            <div class="transfer-item" class:complete={t.status === "complete"} class:failed={t.status === "failed" || t.status === "cancelled"}>
-              <div class="transfer-head">
-                <div class="transfer-main">
-                  <span class="transfer-file">{t.file_name}</span>
-                  <span class="transfer-meta">
-                    {t.direction === "incoming" ? "from" : "to"} {t.peer_label || "peer"} -
-                    {formatBytes(t.transferred)} / {formatBytes(t.total)}
-                  </span>
-                </div>
-                {#if t.status !== "complete" && t.status !== "failed" && t.status !== "cancelled"}
-                  <button
-                    class="transfer-cancel"
-                    aria-label="Cancel transfer"
-                    title="Cancel transfer"
-                    onclick={() => cancelTransfer(t.session_id)}
-                  >
-                    <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
-                      <path d="M6 6l12 12" />
-                      <path d="M18 6 6 18" />
-                    </svg>
-                  </button>
-                {/if}
-              </div>
-              <div class="transfer-track" aria-hidden="true">
-                <div class="transfer-fill" style={`width: ${progressPct(t)}%`}></div>
-              </div>
-              <div class="transfer-message">{t.message}</div>
-            </div>
-          {/each}
-        </div>
-      {/if}
-
       {#if !inRoom}
         <div class="room-empty">
           <p class="muted">Not connected to any device yet.</p>
@@ -933,9 +919,59 @@
                 {/if}
               </div>
             {/each}
+            <button class="unpair-btn" onclick={leaveRoom}>Unpair Device</button>
           </div>
         {/if}
-        <button class="leave-link" onclick={leaveRoom}>Leave room</button>
+      {/if}
+    </div>
+  {:else if activeView === "files"}
+    <div class="files">
+      {#if status !== "idle"}
+        <div class="status" class:ok={status === "ok"} class:err={status === "err"}>
+          {statusMsg}
+        </div>
+      {/if}
+      {#if transferList.length > 0}
+        <div class="transfer-list">
+          {#each transferList as t (t.session_id)}
+            <div class="transfer-item" class:complete={t.status === "complete"} class:failed={t.status === "failed" || t.status === "cancelled"}>
+              <div class="transfer-head">
+                <span class="transfer-file">{t.file_name}</span>
+                <span class="transfer-progress">
+                  {formatBytes(t.transferred)} / {formatBytes(t.total)}
+                  {#if t.status === "complete"}
+                    <svg class="transfer-check" viewBox="0 0 24 24" aria-label="Complete" role="img">
+                      <path d="M20 6 9 17l-5-5" />
+                    </svg>
+                  {/if}
+                </span>
+                {#if t.status !== "complete" && t.status !== "failed" && t.status !== "cancelled"}
+                  <button
+                    class="transfer-cancel"
+                    aria-label="Cancel transfer"
+                    title="Cancel transfer"
+                    onclick={() => cancelTransfer(t.session_id)}
+                  >
+                    <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M6 6l12 12" />
+                      <path d="M18 6 6 18" />
+                    </svg>
+                  </button>
+                {/if}
+              </div>
+              <div class="transfer-track" aria-hidden="true">
+                <div class="transfer-fill" style={`width: ${progressPct(t)}%`}></div>
+              </div>
+              {#if t.status !== "complete"}
+                <div class="transfer-message">
+                  {t.direction === "incoming" ? "from" : "to"} {t.peer_label || "peer"}{t.message ? ` - ${t.message}` : ""}
+                </div>
+              {/if}
+            </div>
+          {/each}
+        </div>
+      {:else}
+        <div class="files-empty muted">No files yet.</div>
       {/if}
     </div>
   {:else}
@@ -1423,23 +1459,6 @@
     background: #2a2a32;
     color: #e4e4e7;
   }
-  .leave-link {
-    align-self: center;
-    margin: 0 auto;
-    margin-top: auto;
-    background: transparent;
-    border: none;
-    color: #4a4a52;
-    font-size: 11px;
-    cursor: pointer;
-    padding: 4px;
-    text-decoration: underline;
-    text-underline-offset: 2px;
-  }
-  .leave-link:hover {
-    color: #f87171;
-  }
-
   .devices-panel {
     display: flex;
     flex-direction: column;
@@ -1625,12 +1644,6 @@
     justify-content: space-between;
     gap: 8px;
   }
-  .transfer-main {
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-  }
   .transfer-file {
     color: #e4e4e7;
     font-size: 12px;
@@ -1732,7 +1745,8 @@
     border-color: #52525b;
   }
 
-  .history {
+  .history,
+  .files {
     flex: 1;
     display: flex;
     flex-direction: column;
@@ -1745,6 +1759,12 @@
     grid-template-columns: 1fr 32px;
     gap: 7px;
     align-items: center;
+  }
+  .files-empty {
+    flex: 1;
+    display: grid;
+    place-items: center;
+    text-align: center;
   }
   .search {
     background: #121217;
@@ -2270,10 +2290,6 @@
   :global(html[data-theme="light"]) .pairing-card h3 {
     color: #102033;
   }
-  :global(html[data-theme="light"]) .leave-link {
-    color: #64748b;
-  }
-  :global(html[data-theme="light"]) .leave-link:hover,
   :global(html[data-theme="light"]) .revoke-btn {
     color: #b42318;
   }
@@ -2361,6 +2377,7 @@
      without disturbing the current component logic. */
   .card {
     --window-radius: 30px;
+    --footer-safe: 30px;
     --window-stroke: rgba(74, 101, 54, 0.78);
     --shell-bg: #020702;
     --shell-top: #071109;
@@ -2438,6 +2455,40 @@
       inset 0 0 40px rgba(255, 255, 255, 0.42);
   }
 
+  :global(html[data-theme="onyx"]) .card {
+    --window-stroke: rgba(255, 255, 255, 0.18);
+    --shell-bg: #000000;
+    --shell-top: #050505;
+    --panel: #040404;
+    --panel-raised: #090909;
+    --field: #010101;
+    --field-strong: #070707;
+    --line: rgba(255, 255, 255, 0.13);
+    --line-soft: rgba(255, 255, 255, 0.08);
+    --line-strong: rgba(255, 255, 255, 0.56);
+    --text: #dedede;
+    --text-strong: #ffffff;
+    --muted: #a0a0a0;
+    --muted-soft: #6e6e6e;
+    --accent: #ffffff;
+    --accent-hover: #ffffff;
+    --accent-text: #ffffff;
+    --mint: #ffffff;
+    --mint-panel: rgba(255, 255, 255, 0.075);
+    --danger: #ffffff;
+    --danger-panel: rgba(255, 255, 255, 0.055);
+    --danger-line: rgba(255, 255, 255, 0.2);
+    --focus: rgba(255, 255, 255, 0.18);
+    background:
+      radial-gradient(circle at 50% -16%, rgba(255, 255, 255, 0.12), transparent 38%),
+      radial-gradient(circle at 92% 8%, rgba(255, 255, 255, 0.06), transparent 30%),
+      linear-gradient(180deg, var(--shell-top) 0%, #010101 42%, var(--shell-bg) 100%),
+      var(--shell-bg);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.12),
+      inset 0 -42px 80px rgba(255, 255, 255, 0.02);
+  }
+
   .header {
     display: grid;
     grid-template-columns: minmax(132px, 1fr) auto auto;
@@ -2447,6 +2498,12 @@
     border-bottom-color: var(--line-soft);
     background: rgba(0, 0, 0, 0.02);
     box-sizing: border-box;
+  }
+  :global(html[data-theme="onyx"]) .header {
+    background:
+      linear-gradient(180deg, rgba(0, 0, 0, 0.94), rgba(0, 0, 0, 0.64)),
+      var(--shell-top);
+    border-bottom-color: rgba(255, 255, 255, 0.09);
   }
   .title {
     color: var(--text-strong);
@@ -2570,7 +2627,8 @@
   }
   .scheme-toggle button,
   .mini-action,
-  .ghost {
+  .ghost,
+  .unpair-btn {
     border: 1px solid var(--line);
     border-radius: 999px;
     background: var(--field-strong);
@@ -2578,11 +2636,13 @@
     font-weight: 800;
   }
   .scheme-toggle button {
+    flex: 1 1 0;
     padding: 8px 10px;
   }
   .scheme-toggle button.active,
   .mini-action:hover:not(:disabled),
-  .ghost:hover {
+  .ghost:hover,
+  .unpair-btn:hover {
     border-color: var(--line-strong);
     background: var(--mint-panel);
     color: var(--accent);
@@ -2625,6 +2685,68 @@
   }
   :global(html[data-theme="light"]) .send-btn:hover:not(:disabled) {
     background: var(--accent-hover);
+  }
+  :global(html[data-theme="onyx"]) .scheme-toggle button,
+  :global(html[data-theme="onyx"]) .mini-action,
+  :global(html[data-theme="onyx"]) .ghost,
+  :global(html[data-theme="onyx"]) .send-btn,
+  :global(html[data-theme="onyx"]) .device-toggle,
+  :global(html[data-theme="onyx"]) .pair-btn,
+  :global(html[data-theme="onyx"]) .icon-btn,
+  :global(html[data-theme="onyx"]) .tab.active,
+  :global(html[data-theme="onyx"]) .tab:hover,
+  :global(html[data-theme="onyx"]) .danger-btn,
+  :global(html[data-theme="onyx"]) .danger-icon-btn,
+  :global(html[data-theme="onyx"]) .transfer-cancel,
+  :global(html[data-theme="onyx"]) .recipient-button,
+  :global(html[data-theme="onyx"]) .toast-dismiss {
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.018)),
+      #020202;
+    border-color: rgba(255, 255, 255, 0.18);
+    color: #ffffff;
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.12),
+      inset 0 -1px 0 rgba(255, 255, 255, 0.035);
+  }
+  :global(html[data-theme="onyx"]) .scheme-toggle button.active,
+  :global(html[data-theme="onyx"]) .mini-action:hover:not(:disabled),
+  :global(html[data-theme="onyx"]) .ghost:hover,
+  :global(html[data-theme="onyx"]) .send-btn:hover:not(:disabled),
+  :global(html[data-theme="onyx"]) .device-toggle:hover,
+  :global(html[data-theme="onyx"]) .device-toggle:focus-visible,
+  :global(html[data-theme="onyx"]) .pair-btn:hover,
+  :global(html[data-theme="onyx"]) .icon-btn:hover,
+  :global(html[data-theme="onyx"]) .icon-btn:focus-visible,
+  :global(html[data-theme="onyx"]) .tab.active,
+  :global(html[data-theme="onyx"]) .tab:hover,
+  :global(html[data-theme="onyx"]) .danger-btn:hover:not(:disabled),
+  :global(html[data-theme="onyx"]) .danger-icon-btn:hover:not(:disabled),
+  :global(html[data-theme="onyx"]) .danger-icon-btn:focus-visible,
+  :global(html[data-theme="onyx"]) .transfer-cancel:hover,
+  :global(html[data-theme="onyx"]) .transfer-cancel:focus-visible,
+  :global(html[data-theme="onyx"]) .recipient-button:hover:not(:disabled),
+  :global(html[data-theme="onyx"]) .recipient-button:focus-visible,
+  :global(html[data-theme="onyx"]) .toast-dismiss:hover {
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.035)),
+      #040404;
+    border-color: rgba(255, 255, 255, 0.44);
+    color: #ffffff;
+  }
+  :global(html[data-theme="onyx"]) .send-btn,
+  :global(html[data-theme="onyx"]) .toast {
+    color: #ffffff;
+  }
+  :global(html[data-theme="onyx"]) .send-btn {
+    border: 1px solid rgba(255, 255, 255, 0.34);
+    text-shadow: 0 0 14px rgba(255, 255, 255, 0.32);
+  }
+  :global(html[data-theme="onyx"]) .toast {
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.025)),
+      #020202;
+    border-color: rgba(255, 255, 255, 0.32);
   }
 
   .compose {
@@ -2714,6 +2836,15 @@
     background: rgba(11, 95, 211, 0.08);
     color: var(--accent);
   }
+  :global(html[data-theme="onyx"]) .device-toggle {
+    border-color: rgba(255, 255, 255, 0.32);
+    color: #ffffff;
+  }
+  :global(html[data-theme="onyx"]) .device-toggle:hover,
+  :global(html[data-theme="onyx"]) .device-toggle:focus-visible {
+    border-color: rgba(255, 255, 255, 0.56);
+    color: #ffffff;
+  }
   .roster {
     display: flex;
     flex-direction: column;
@@ -2769,7 +2900,8 @@
   .revoke-btn,
   .danger-icon-btn,
   .transfer-cancel,
-  .clip-del {
+  .clip-del,
+  .unpair-btn {
     color: var(--danger);
   }
   .revoke-btn,
@@ -2779,14 +2911,6 @@
     border-radius: 14px;
     background: var(--danger-panel);
   }
-  .leave-link {
-    color: var(--muted-soft);
-    font-weight: 700;
-  }
-  .leave-link:hover {
-    color: var(--danger);
-  }
-
   .status {
     border: 1px solid var(--line-soft);
     border-radius: 16px;
@@ -2811,6 +2935,16 @@
   }
   .transfer-fill {
     background: var(--mint);
+  }
+  .transfer-check {
+    width: 13px;
+    height: 13px;
+    color: var(--mint);
+    fill: none;
+    stroke: currentColor;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    stroke-width: 3;
   }
 
   .room-empty {
@@ -2840,13 +2974,25 @@
     background: var(--line-soft);
   }
 
-  .history {
+  .history,
+  .files {
     padding: 20px 22px 22px;
     gap: 12px;
   }
   .history-toolbar {
     grid-template-columns: 1fr 44px;
     gap: 10px;
+  }
+  .files .transfer-list {
+    flex: 1;
+    max-height: none;
+    min-height: 0;
+  }
+  .files-empty {
+    border: 1px solid var(--line-soft);
+    border-radius: 18px;
+    background: var(--field);
+    font-size: 13px;
   }
   .search {
     height: 44px;
@@ -2968,6 +3114,11 @@
       0 0 0 3px var(--shell-bg),
       0 0 15px rgba(117, 239, 173, 0.8);
   }
+  :global(html[data-theme="onyx"]) .connection-indicator.live {
+    box-shadow:
+      0 0 0 3px var(--shell-bg),
+      0 0 15px rgba(255, 255, 255, 0.74);
+  }
 
   .card {
     font-family: "Geist", "Segoe UI", system-ui, sans-serif;
@@ -2981,6 +3132,7 @@
   .send-btn,
   .device-toggle,
   .pair-btn,
+  .unpair-btn,
   .mini-action,
   .ghost,
   .danger-btn,
@@ -3058,9 +3210,13 @@
     padding: 7px 9px;
     font-size: 12px;
   }
+  .scheme-toggle button {
+    min-width: 0;
+    padding-inline: 7px;
+  }
 
   .compose {
-    padding: 14px 18px 12px;
+    padding: 14px 18px calc(12px + var(--footer-safe));
     gap: 8px;
   }
   .compose.devices-open {
@@ -3075,9 +3231,9 @@
     line-height: 1.42;
   }
   .compose.devices-open .box {
-    flex-basis: 78px;
-    min-height: 72px;
-    padding-block: 13px;
+    flex: 0 1 84px;
+    min-height: 84px;
+    padding-block: 12px;
   }
   .compose-controls {
     justify-content: space-between;
@@ -3132,6 +3288,9 @@
     scrollbar-width: thin;
     scrollbar-color: var(--line-strong) transparent;
   }
+  .compose.devices-open .roster {
+    max-height: 178px;
+  }
   .roster::-webkit-scrollbar {
     width: 8px;
   }
@@ -3175,12 +3334,27 @@
     font-size: 10px;
     font-weight: 400;
   }
-  .leave-link {
-    margin-top: 0;
-    font-size: 10px;
+  .unpair-btn {
+    width: 100%;
+    margin: 2px 0 0;
+    padding: 7px 2px 5px;
+    border: 0;
+    border-top: 1px solid var(--line-soft);
+    border-radius: 0;
+    background: transparent;
+    color: var(--danger);
+    font-size: 11px;
     font-weight: 400;
+    text-align: left;
+    cursor: pointer;
   }
-
+  .unpair-btn:hover,
+  .unpair-btn:focus-visible {
+    background: transparent;
+    border-color: var(--line-soft);
+    color: var(--danger);
+    outline: none;
+  }
   .room-empty {
     padding-top: 0;
   }
@@ -3205,13 +3379,25 @@
     font-size: 12px;
   }
 
-  .history {
-    padding: 16px 18px 18px;
+  .history,
+  .files {
+    padding: 16px 18px calc(18px + var(--footer-safe));
     gap: 10px;
   }
   .history-toolbar {
     grid-template-columns: 1fr 38px;
     gap: 8px;
+  }
+  .files .transfer-list {
+    max-height: none;
+    min-height: 0;
+    flex: 1;
+    padding-right: 2px;
+  }
+  .files-empty {
+    min-height: 0;
+    border-radius: 14px;
+    font-size: 12px;
   }
   .search {
     height: 38px;
@@ -3285,6 +3471,54 @@
     border-radius: 14px;
     padding: 7px 9px;
   }
+  .transfer-list {
+    gap: 5px;
+  }
+  .transfer-item {
+    gap: 5px;
+    padding: 6px 8px;
+  }
+  .transfer-head {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    align-items: center;
+    gap: 7px;
+  }
+  .transfer-file {
+    min-width: 0;
+    font-size: 11.5px;
+    line-height: 1.1;
+  }
+  .transfer-progress {
+    display: inline-flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 4px;
+    color: var(--muted);
+    font-size: 10.5px;
+    line-height: 1;
+    white-space: nowrap;
+  }
+  .transfer-track {
+    height: 4px;
+  }
+  .transfer-message {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 9.5px;
+    line-height: 1.05;
+  }
+  .transfer-cancel {
+    width: 22px;
+    height: 22px;
+    flex-basis: 22px;
+    border-radius: 9px;
+  }
+  .transfer-cancel .icon-svg {
+    width: 13px;
+    height: 13px;
+  }
   .status {
     padding: 7px 10px;
     border-radius: 13px;
@@ -3299,18 +3533,18 @@
   .toast {
     left: 18px;
     right: 44px;
-    bottom: 14px;
+    bottom: calc(14px + var(--footer-safe));
     border-radius: 16px;
   }
 
   .footer-security {
     position: absolute;
-    right: 14px;
-    bottom: 13px;
+    right: 18px;
+    bottom: 16px;
     z-index: 12;
     display: inline-flex;
     align-items: center;
-    gap: 7px;
+    gap: 8px;
     pointer-events: none;
   }
   .security-fragment {
@@ -3342,6 +3576,11 @@
     box-shadow:
       0 0 0 2px var(--shell-bg),
       0 0 12px rgba(117, 239, 173, 0.78);
+  }
+  :global(html[data-theme="onyx"]) .footer-security .connection-indicator.live {
+    box-shadow:
+      0 0 0 2px var(--shell-bg),
+      0 0 12px rgba(255, 255, 255, 0.72);
   }
 
   @media (max-width: 410px) {
