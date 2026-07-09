@@ -30,6 +30,8 @@
   let devicesExpanded = $state(false);
   let confirmDeleteAllOpen = $state(false);
   let deletingAll = $state(false);
+  let confirmDeleteAllFilesOpen = $state(false);
+  let deletingAllFiles = $state(false);
   let deviceLabel = $state("");
   let deviceLabelDraft = $state("");
   let savingDeviceLabel = $state(false);
@@ -42,6 +44,7 @@
   let incomingFileOffer = $state<FileOfferDto | null>(null);
   let acceptingFile = $state(false);
   let transfers = $state<Record<string, TransferView>>({});
+  let dismissedTransferIds = $state<Set<string>>(new Set());
   let confettiPieces = $state<ConfettiPiece[]>([]);
   let logoSrc = $derived(
     theme === "light"
@@ -485,17 +488,62 @@
   }
 
   async function cancelTransfer(sessionId: string) {
+    dismissedTransferIds = new Set(dismissedTransferIds).add(sessionId);
     try {
       await invoke("cancel_file_transfer", { sessionId });
     } catch {
       /* best effort */
     }
+    removeTransfer(sessionId);
+  }
+
+  function removeTransfer(sessionId: string) {
     const next = { ...transfers };
     delete next[sessionId];
     transfers = next;
   }
 
+  function isTerminalTransfer(transfer: TransferView) {
+    return transfer.status === "complete" || transfer.status === "failed" || transfer.status === "cancelled";
+  }
+
+  async function deleteTransfer(transfer: TransferView) {
+    if (isTerminalTransfer(transfer)) {
+      removeTransfer(transfer.session_id);
+      return;
+    }
+    await cancelTransfer(transfer.session_id);
+  }
+
+  async function deleteAllTransfers() {
+    if (deletingAllFiles) return;
+    deletingAllFiles = true;
+    clearStatus();
+    const activeTransfers = transferList.filter((transfer) => !isTerminalTransfer(transfer));
+    dismissedTransferIds = new Set([
+      ...dismissedTransferIds,
+      ...activeTransfers.map((transfer) => transfer.session_id),
+    ]);
+    try {
+      await Promise.all(
+        activeTransfers.map(async (transfer) => {
+          try {
+            await invoke("cancel_file_transfer", { sessionId: transfer.session_id });
+          } catch {
+            /* best effort */
+          }
+        })
+      );
+      transfers = {};
+      confirmDeleteAllFilesOpen = false;
+      showStatus("ok", "File history cleared");
+    } finally {
+      deletingAllFiles = false;
+    }
+  }
+
   function upsertTransferProgress(p: FileTransferProgressDto) {
+    if (dismissedTransferIds.has(p.session_id)) return;
     const existing = transfers[p.session_id];
     if (existing?.status === "complete") return;
     transfers = {
@@ -515,7 +563,7 @@
 
   function completeTransfer(payload: Record<string, unknown>) {
     const sessionId = String(payload.session_id ?? "");
-    if (!sessionId) return;
+    if (!sessionId || dismissedTransferIds.has(sessionId)) return;
     const existing = transfers[sessionId];
     transfers = {
       ...transfers,
@@ -538,6 +586,7 @@
 
   function failTransfer(p: FileTransferProgressDto) {
     if (incomingFileOffer?.session_id === p.session_id) incomingFileOffer = null;
+    if (dismissedTransferIds.has(p.session_id)) return;
     const existing = transfers[p.session_id];
     if (existing?.status === "complete") return;
     transfers = {
@@ -1117,6 +1166,24 @@
     </div>
   {:else if activeView === "files"}
     <div class="files">
+      <div class="files-toolbar">
+        <span class="files-title">File history</span>
+        <button
+          class="danger-icon-btn"
+          aria-label="Delete all file history"
+          title="Delete all file history"
+          disabled={transferList.length === 0}
+          onclick={() => (confirmDeleteAllFilesOpen = true)}
+        >
+          <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M3 6h18" />
+            <path d="M8 6V4h8v2" />
+            <path d="M7 6l1 15h8l1-15" />
+            <path d="M10 10v7" />
+            <path d="M14 10v7" />
+          </svg>
+        </button>
+      </div>
       {#if status !== "idle"}
         <div
           class="status"
@@ -1142,31 +1209,32 @@
                     </svg>
                   {/if}
                 </span>
-                {#if t.status === "complete" && t.direction === "incoming" && t.path}
-                  <button
-                    class="transfer-reveal"
-                    aria-label={`Show ${t.file_name} in file manager`}
-                    title="Show in file manager"
-                    onclick={() => revealReceivedFile(t)}
-                  >
-                    <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
-                      <path d="M3.5 7.5h6l2-2h9v13h-17z" />
-                      <path d="M3.5 9.5h17" />
-                    </svg>
-                  </button>
-                {:else if t.status !== "complete" && t.status !== "failed" && t.status !== "cancelled"}
+                <div class="transfer-actions">
+                  {#if t.status === "complete" && t.direction === "incoming" && t.path}
+                    <button
+                      class="transfer-reveal"
+                      aria-label={`Show ${t.file_name} in file manager`}
+                      title="Show in file manager"
+                      onclick={() => revealReceivedFile(t)}
+                    >
+                      <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M3.5 7.5h6l2-2h9v13h-17z" />
+                        <path d="M3.5 9.5h17" />
+                      </svg>
+                    </button>
+                  {/if}
                   <button
                     class="transfer-cancel"
-                    aria-label="Cancel transfer"
-                    title="Cancel transfer"
-                    onclick={() => cancelTransfer(t.session_id)}
+                    aria-label={isTerminalTransfer(t) ? "Delete file transfer" : "Cancel transfer"}
+                    title={isTerminalTransfer(t) ? "Delete file transfer" : "Cancel transfer"}
+                    onclick={() => deleteTransfer(t)}
                   >
                     <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
                       <path d="M6 6l12 12" />
                       <path d="M18 6 6 18" />
                     </svg>
                   </button>
-                {/if}
+                </div>
               </div>
               <div class="transfer-track" aria-hidden="true">
                 <div class="transfer-fill" style={`width: ${progressPct(t)}%`}></div>
@@ -1314,6 +1382,41 @@
           </button>
           <button class="danger-btn" onclick={deleteAllClips} disabled={deletingAll}>
             {deletingAll ? "Deleting..." : "Delete all"}
+          </button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  {#if confirmDeleteAllFilesOpen}
+    <div
+      class="modal-overlay"
+      role="button"
+      tabindex="0"
+      onclick={() => (confirmDeleteAllFilesOpen = false)}
+      onkeydown={(e) => {
+        if (e.key === "Escape" || e.key === "Enter") confirmDeleteAllFilesOpen = false;
+      }}
+    >
+      <div
+        class="confirm-dialog"
+        role="dialog"
+        tabindex="-1"
+        aria-modal="true"
+        aria-labelledby="delete-all-files-title"
+        onclick={(e) => e.stopPropagation()}
+        onkeydown={(e) => e.stopPropagation()}
+      >
+        <h3 id="delete-all-files-title">Delete all file history?</h3>
+        <p class="muted small">
+          This removes every file transfer from this list and cancels any transfers still in progress.
+        </p>
+        <div class="dialog-actions">
+          <button class="ghost" onclick={() => (confirmDeleteAllFilesOpen = false)} disabled={deletingAllFiles}>
+            Cancel
+          </button>
+          <button class="danger-btn" onclick={deleteAllTransfers} disabled={deletingAllFiles}>
+            {deletingAllFiles ? "Deleting..." : "Delete all"}
           </button>
         </div>
       </div>
@@ -1971,6 +2074,12 @@
     justify-content: space-between;
     gap: 8px;
   }
+  .transfer-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    min-width: 26px;
+  }
   .transfer-file {
     color: #e4e4e7;
     font-size: 12px;
@@ -2086,6 +2195,20 @@
     grid-template-columns: 1fr 32px;
     gap: 7px;
     align-items: center;
+  }
+  .files-toolbar {
+    min-height: 32px;
+    display: grid;
+    grid-template-columns: 1fr 32px;
+    gap: 7px;
+    align-items: center;
+  }
+  .files-title {
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
   }
   .files-empty {
     flex: 1;
@@ -3439,7 +3562,8 @@
     padding: 20px 22px 22px;
     gap: 12px;
   }
-  .history-toolbar {
+  .history-toolbar,
+  .files-toolbar {
     grid-template-columns: 1fr 44px;
     gap: 10px;
   }
@@ -3854,7 +3978,8 @@
     padding: 16px 18px calc(18px + var(--footer-safe));
     gap: 10px;
   }
-  .history-toolbar {
+  .history-toolbar,
+  .files-toolbar {
     grid-template-columns: 1fr 38px;
     gap: 8px;
   }
