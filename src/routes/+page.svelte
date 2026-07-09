@@ -42,6 +42,7 @@
   let incomingFileOffer = $state<FileOfferDto | null>(null);
   let acceptingFile = $state(false);
   let transfers = $state<Record<string, TransferView>>({});
+  let confettiPieces = $state<ConfettiPiece[]>([]);
   let logoSrc = $derived(
     theme === "light"
       ? "/fwoosh_dark.webp"
@@ -57,6 +58,7 @@
   let toastTimer: ReturnType<typeof setTimeout> | null = null;
   let statusTimer: ReturnType<typeof setTimeout> | null = null;
   let pairingTickTimer: ReturnType<typeof setInterval> | null = null;
+  let confettiTimer: ReturnType<typeof setTimeout> | null = null;
 
   interface PairingCodeDto {
     uri: string;
@@ -122,6 +124,17 @@
     total: number;
     status: string;
     message: string;
+    path?: string;
+  }
+  interface ConfettiPiece {
+    id: number;
+    x: number;
+    drift: number;
+    delay: number;
+    duration: number;
+    rotation: number;
+    color: string;
+    round: boolean;
   }
 
   // ---- Load recent clips on mount + listen for events ----
@@ -214,7 +227,14 @@
       );
       unlisteners.push(
         await listen("roster-updated", async () => {
+          const previousPeerIds = new Set(peerDevices.map((device) => device.id));
           await refreshRoom(true);
+          const pairedDevice = peerDevices.find((device) => !previousPeerIds.has(device.id));
+          if (pairedDevice) {
+            clearPairingCode();
+            showStatus("ok", `Paired with ${pairedDevice.label}`, 4000);
+            launchPairingConfetti();
+          }
         })
       );
       unlisteners.push(
@@ -250,6 +270,7 @@
         pairingTickTimer = null;
       }
       clearStatusTimer();
+      clearConfettiTimer();
       unlisteners.forEach((u) => void u());
     };
   });
@@ -265,6 +286,38 @@
     clearStatusTimer();
     status = "idle";
     statusMsg = "";
+  }
+
+  function clearConfettiTimer() {
+    if (confettiTimer) {
+      clearTimeout(confettiTimer);
+      confettiTimer = null;
+    }
+  }
+
+  function launchPairingConfetti() {
+    clearConfettiTimer();
+    if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) {
+      confettiPieces = [];
+      return;
+    }
+
+    const palette = ["var(--accent)", "var(--mint)", "var(--text-strong)"];
+    const run = Date.now();
+    confettiPieces = Array.from({ length: 36 }, (_, index) => ({
+      id: run + index,
+      x: 5 + ((index * 37) % 90),
+      drift: -54 + ((index * 29) % 109),
+      delay: (index % 9) * 32,
+      duration: 1040 + ((index * 47) % 520),
+      rotation: 280 + ((index * 83) % 520),
+      color: palette[index % palette.length],
+      round: index % 5 === 0,
+    }));
+    confettiTimer = setTimeout(() => {
+      confettiPieces = [];
+      confettiTimer = null;
+    }, 1900);
   }
 
   function showStatus(next: "ok" | "err", message: string, durationMs = next === "err" ? 10000 : 2000) {
@@ -444,6 +497,7 @@
 
   function upsertTransferProgress(p: FileTransferProgressDto) {
     const existing = transfers[p.session_id];
+    if (existing?.status === "complete") return;
     transfers = {
       ...transfers,
       [p.session_id]: {
@@ -474,6 +528,10 @@
         total: Number(payload.size ?? existing?.total ?? 0),
         status: "complete",
         message: "Complete",
+        path:
+          typeof payload.path === "string" && payload.path.length > 0
+            ? payload.path
+            : existing?.path,
       },
     };
   }
@@ -481,6 +539,7 @@
   function failTransfer(p: FileTransferProgressDto) {
     if (incomingFileOffer?.session_id === p.session_id) incomingFileOffer = null;
     const existing = transfers[p.session_id];
+    if (existing?.status === "complete") return;
     transfers = {
       ...transfers,
       [p.session_id]: {
@@ -494,6 +553,15 @@
         message: p.message,
       },
     };
+  }
+
+  async function revealReceivedFile(transfer: TransferView) {
+    if (transfer.direction !== "incoming" || !transfer.path) return;
+    try {
+      await invoke("reveal_received_file", { path: transfer.path });
+    } catch (e) {
+      showStatus("err", `Could not show file: ${String(e)}`);
+    }
   }
 
   function formatBytes(bytes: number) {
@@ -992,30 +1060,19 @@
         {:else}
           <span class="compose-control-spacer" aria-hidden="true"></span>
         {/if}
-        {#if inRoom}
-          <button class="ghost file-action" onclick={chooseFileForSend} disabled={sendingFile}>
-            File
-          </button>
-          <label class="private-toggle">
-            <input
-              type="checkbox"
-              bind:checked={privateSend}
-              aria-describedby="private-mode-help"
-            />
-            <span>Private</span>
-            <span id="private-mode-help" class="private-tooltip" role="tooltip">
-              Skips local history and asks the relay not to cache. If the receiver is offline now,
-              it will not arrive.
-            </span>
-          </label>
-        {/if}
         <button class="send-btn" onclick={send} disabled={sending || !text.trim()}>
           {sending ? "Sending..." : "Send"}
         </button>
       </div>
 
       {#if status !== "idle"}
-        <div class="status" class:ok={status === "ok"} class:err={status === "err"}>
+        <div
+          class="status"
+          class:ok={status === "ok"}
+          class:err={status === "err"}
+          role="status"
+          aria-live="polite"
+        >
           {statusMsg}
         </div>
       {/if}
@@ -1061,7 +1118,13 @@
   {:else if activeView === "files"}
     <div class="files">
       {#if status !== "idle"}
-        <div class="status" class:ok={status === "ok"} class:err={status === "err"}>
+        <div
+          class="status"
+          class:ok={status === "ok"}
+          class:err={status === "err"}
+          role="status"
+          aria-live="polite"
+        >
           {statusMsg}
         </div>
       {/if}
@@ -1079,7 +1142,19 @@
                     </svg>
                   {/if}
                 </span>
-                {#if t.status !== "complete" && t.status !== "failed" && t.status !== "cancelled"}
+                {#if t.status === "complete" && t.direction === "incoming" && t.path}
+                  <button
+                    class="transfer-reveal"
+                    aria-label={`Show ${t.file_name} in file manager`}
+                    title="Show in file manager"
+                    onclick={() => revealReceivedFile(t)}
+                  >
+                    <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d="M3.5 7.5h6l2-2h9v13h-17z" />
+                      <path d="M3.5 9.5h17" />
+                    </svg>
+                  </button>
+                {:else if t.status !== "complete" && t.status !== "failed" && t.status !== "cancelled"}
                   <button
                     class="transfer-cancel"
                     aria-label="Cancel transfer"
@@ -1133,7 +1208,13 @@
         </button>
       </div>
       {#if status !== "idle"}
-        <div class="status" class:ok={status === "ok"} class:err={status === "err"}>
+        <div
+          class="status"
+          class:ok={status === "ok"}
+          class:err={status === "err"}
+          role="status"
+          aria-live="polite"
+        >
           {statusMsg}
         </div>
       {/if}
@@ -1348,20 +1429,66 @@
     </div>
   {/if}
 
-  <div class="footer-security" aria-label="End-to-end encrypted connection status">
-    <span class="security-fragment" title="End-to-end encrypted">
-      <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
-        <rect x="5" y="11" width="14" height="10" rx="2" />
-        <path d="M8 11V8a4 4 0 0 1 8 0v3" />
-      </svg>
-      E2E
-    </span>
-    <span
-      class="connection-indicator"
-      class:live={inRoom}
-      aria-label={inRoom ? "Connected" : "Not connected"}
-      title={inRoom ? "Connected" : "Not connected"}
-    ></span>
+  {#if confettiPieces.length > 0}
+    <div class="confetti-layer" aria-hidden="true">
+      {#each confettiPieces as piece (piece.id)}
+        <span
+          class="confetti-piece"
+          class:round={piece.round}
+          style={`--confetti-x: ${piece.x}%; --confetti-drift: ${piece.drift}px; --confetti-delay: ${piece.delay}ms; --confetti-duration: ${piece.duration}ms; --confetti-rotation: ${piece.rotation}deg; --confetti-color: ${piece.color};`}
+        ></span>
+      {/each}
+    </div>
+  {/if}
+
+  <div class="utility-footer" data-tauri-drag-region="false">
+    {#if activeView === "compose" && inRoom}
+      <div class="footer-tools" data-tauri-drag-region="false">
+        <button
+          class="footer-tool"
+          aria-label="Send a file"
+          title="Send a file"
+          onclick={chooseFileForSend}
+          disabled={sendingFile}
+        >
+          <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M6.5 3.5h7l4 4v13h-11z" />
+            <path d="M13.5 3.5v4h4" />
+          </svg>
+        </button>
+        <label class="private-toggle" class:active={privateSend} title="Send privately">
+          <input
+            type="checkbox"
+            bind:checked={privateSend}
+            aria-label="Send privately"
+            aria-describedby="private-mode-help"
+          />
+          <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M3 10.5h2l1.1 4.1a2.8 2.8 0 0 0 5.4-.2l.5-1.9.5 1.9a2.8 2.8 0 0 0 5.4.2l1.1-4.1h2" />
+            <path d="M5.3 11h5.8M12.9 11h5.8M11.1 12h1.8" />
+          </svg>
+          <span id="private-mode-help" class="private-tooltip" role="tooltip">
+            Skips local history and asks the relay not to cache. If the receiver is offline now,
+            it will not arrive.
+          </span>
+        </label>
+      </div>
+    {/if}
+    <div class="footer-security" aria-label="End-to-end encrypted connection status">
+      <span class="security-fragment" title="End-to-end encrypted">
+        <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
+          <rect x="5" y="11" width="14" height="10" rx="2" />
+          <path d="M8 11V8a4 4 0 0 1 8 0v3" />
+        </svg>
+        E2E
+      </span>
+      <span
+        class="connection-indicator"
+        class:live={inRoom}
+        aria-label={inRoom ? "Connected" : "Not connected"}
+        title={inRoom ? "Connected" : "Not connected"}
+      ></span>
+    </div>
   </div>
 </div>
 
@@ -1720,10 +1847,6 @@
     align-items: center;
     gap: 8px;
     justify-content: flex-end;
-  }
-  .file-action {
-    min-height: 34px;
-    padding-inline: 12px;
   }
   .private-toggle {
     position: relative;
@@ -3889,13 +4012,14 @@
     right: 18px;
     bottom: 16px;
     z-index: 12;
+    height: 24px;
     display: inline-flex;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
     pointer-events: none;
   }
   .security-fragment {
-    height: auto;
+    height: 24px;
     padding: 0;
     display: inline-flex;
     align-items: center;
@@ -3905,34 +4029,240 @@
     color: var(--mint);
     font-size: 10px;
     line-height: 1;
+    letter-spacing: 0.04em;
   }
   .security-fragment .icon-svg {
-    width: 12px;
-    height: 12px;
+    width: 14px;
+    height: 14px;
     stroke-width: 2.3;
   }
   .footer-security .connection-indicator {
     position: static;
     right: auto;
     bottom: auto;
-    width: 10px;
-    height: 10px;
+    width: 6px;
+    height: 6px;
+    flex: 0 0 6px;
     box-shadow: 0 0 0 2px var(--shell-bg);
   }
   .footer-security .connection-indicator.live {
     box-shadow:
       0 0 0 2px var(--shell-bg),
-      0 0 12px rgba(117, 239, 173, 0.78);
+      0 0 7px rgba(117, 239, 173, 0.55);
   }
   :global(html[data-theme="onyx"]) .footer-security .connection-indicator.live {
     box-shadow:
       0 0 0 2px var(--shell-bg),
-      0 0 12px rgba(255, 255, 255, 0.72);
+      0 0 7px rgba(255, 255, 255, 0.52);
   }
   :global(html[data-theme="melanzana"]) .footer-security .connection-indicator.live {
     box-shadow:
       0 0 0 2px var(--shell-bg),
-      0 0 12px rgba(158, 242, 214, 0.74);
+      0 0 7px rgba(158, 242, 214, 0.52);
+  }
+
+  /* Compact utility footer: sending tools on the left, trust status on the right. */
+  .utility-footer {
+    position: absolute;
+    left: 18px;
+    right: 18px;
+    bottom: 10px;
+    z-index: 9;
+    min-height: 24px;
+    display: flex;
+    align-items: center;
+    pointer-events: none;
+  }
+  .footer-tools {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    pointer-events: auto;
+  }
+  .footer-tool,
+  .footer-tools .private-toggle {
+    position: relative;
+    width: 24px;
+    height: 24px;
+    min-height: 0;
+    padding: 0;
+    display: grid;
+    place-items: center;
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    transition:
+      color 220ms cubic-bezier(0.32, 0.72, 0, 1),
+      opacity 220ms cubic-bezier(0.32, 0.72, 0, 1),
+      transform 220ms cubic-bezier(0.32, 0.72, 0, 1);
+  }
+  .footer-tool .icon-svg,
+  .footer-tools .private-toggle > .icon-svg {
+    width: 14px;
+    height: 14px;
+    stroke-width: 1.65;
+    pointer-events: none;
+  }
+  .footer-tool:hover:not(:disabled),
+  .footer-tool:focus-visible,
+  .footer-tools .private-toggle:hover,
+  .footer-tools .private-toggle:focus-within,
+  .footer-tools .private-toggle.active {
+    color: var(--accent);
+    outline: none;
+    transform: translateY(-1px);
+  }
+  .footer-tool:focus-visible,
+  .footer-tools .private-toggle:focus-within {
+    box-shadow: 0 0 0 2px var(--focus);
+  }
+  .footer-tool:active:not(:disabled),
+  .footer-tools .private-toggle:active {
+    transform: scale(0.94);
+  }
+  .footer-tool:disabled {
+    opacity: 0.38;
+    cursor: default;
+  }
+  .footer-tools .private-toggle input {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    opacity: 0;
+    cursor: pointer;
+  }
+  .footer-tools .private-tooltip {
+    right: auto;
+    left: 0;
+    bottom: calc(100% + 9px);
+    cursor: default;
+  }
+  .footer-tools .private-tooltip::after {
+    right: auto;
+    left: 8px;
+  }
+  .utility-footer .footer-security {
+    position: static;
+    right: auto;
+    bottom: auto;
+    margin-left: auto;
+  }
+
+  .title {
+    cursor: default;
+    user-select: none;
+  }
+  .brand-logo {
+    pointer-events: none;
+    cursor: inherit;
+    -webkit-user-drag: none;
+  }
+
+  .transfer-reveal {
+    width: 22px;
+    height: 22px;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateX(3px);
+    transition:
+      color 220ms cubic-bezier(0.32, 0.72, 0, 1),
+      opacity 220ms cubic-bezier(0.32, 0.72, 0, 1),
+      transform 220ms cubic-bezier(0.32, 0.72, 0, 1);
+  }
+  .transfer-reveal .icon-svg {
+    width: 14px;
+    height: 14px;
+    stroke-width: 1.65;
+  }
+  .transfer-item:hover .transfer-reveal,
+  .transfer-reveal:focus-visible {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateX(0);
+  }
+  .transfer-reveal:hover,
+  .transfer-reveal:focus-visible {
+    color: var(--accent);
+    outline: none;
+  }
+
+  .confetti-layer {
+    position: absolute;
+    inset: 0;
+    z-index: 40;
+    overflow: hidden;
+    pointer-events: none;
+  }
+  .confetti-piece {
+    position: absolute;
+    top: -14px;
+    left: var(--confetti-x);
+    width: 5px;
+    height: 9px;
+    border-radius: 1px;
+    background: var(--confetti-color);
+    opacity: 0;
+    animation: confetti-fall var(--confetti-duration)
+      cubic-bezier(0.22, 0.74, 0.23, 1) var(--confetti-delay) both;
+    will-change: transform, opacity;
+  }
+  .confetti-piece.round {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+  }
+  @keyframes confetti-fall {
+    0% {
+      opacity: 0;
+      transform: translate3d(-50%, -14px, 0) rotate(0deg);
+    }
+    10% {
+      opacity: 1;
+    }
+    82% {
+      opacity: 1;
+    }
+    100% {
+      opacity: 0;
+      transform: translate3d(
+          calc(-50% + var(--confetti-drift)),
+          calc(100vh + 28px),
+          0
+        )
+        rotate(var(--confetti-rotation));
+    }
+  }
+
+  @media (hover: none) {
+    .transfer-reveal {
+      opacity: 1;
+      pointer-events: auto;
+      transform: none;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .confetti-layer {
+      display: none;
+    }
+    .footer-tool,
+    .footer-tools .private-toggle,
+    .transfer-reveal {
+      transition: none;
+    }
   }
 
   @media (max-width: 410px) {

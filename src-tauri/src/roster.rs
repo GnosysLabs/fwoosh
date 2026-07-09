@@ -307,16 +307,20 @@ pub fn build_genesis(admin: &DeviceKeypairs, admin_label: &str, topic: &str) -> 
 
 /// Build a new epoch that ADDS a device. Admin signs; prev_hash/topic filled in.
 pub fn build_add_device(prev: &RosterEntry, new_device: DeviceIdentity) -> RosterEntry {
+    let new_device_id = new_device.signing_pub.clone();
     let mut devices = prev.devices.clone();
-    // Avoid duplicates / re-adding a revoked device without clearing revocation.
-    devices.retain(|d| d.signing_pub != new_device.signing_pub);
+    // A fresh authenticated pairing may reactivate a stable device identity.
+    // Keep it in exactly one membership set and replace any stale active entry.
+    devices.retain(|d| d.signing_pub != new_device_id);
     devices.push(new_device);
+    let mut revoked = prev.revoked.clone();
+    revoked.retain(|d| d.signing_pub != new_device_id);
     RosterEntry {
         epoch: prev.epoch + 1,
         prev_hash: [0u8; 32], // filled by sign_and_chain
         topic: prev.topic.clone(),
         devices,
-        revoked: prev.revoked.clone(),
+        revoked,
         admin_id: prev.admin_id.clone(),
         signature: Vec::new(),
     }
@@ -494,6 +498,61 @@ mod tests {
         assert!(!v2.is_active(&bob.signing_pub));
         assert_eq!(v2.entry.devices.len(), 1);
         assert_eq!(v2.entry.revoked.len(), 1);
+    }
+
+    #[test]
+    fn readd_revoked_device_clears_current_revocation() {
+        let admin = gen_admin();
+        let bob = DeviceKeypairs::generate();
+        let topic0 = new_topic();
+        let g = genesis(&admin, &topic0);
+        let v0 = VerifiedRoster::verify_first(g.clone()).unwrap();
+
+        // epoch 1: add bob
+        let e1 = sign_and_chain(
+            &admin,
+            build_add_device(&g, DeviceIdentity::from_keypairs(&bob, "bob-pc")),
+            Some(&g),
+        )
+        .unwrap();
+        let v1 = v0.verify_next(e1.clone()).unwrap();
+
+        // epoch 2: revoke bob + rotate topic
+        let topic2 = new_topic();
+        let e2 = sign_and_chain(
+            &admin,
+            build_revoke_device(&e1, &bob.signing_pub, &topic2).unwrap(),
+            Some(&e1),
+        )
+        .unwrap();
+        let v2 = v1.verify_next(e2.clone()).unwrap();
+        assert!(!v2.is_active(&bob.signing_pub));
+
+        // epoch 3: a new pairing re-adds the same long-lived device identity.
+        let e3 = sign_and_chain(
+            &admin,
+            build_add_device(&e2, DeviceIdentity::from_keypairs(&bob, "bob-repaired")),
+            Some(&e2),
+        )
+        .unwrap();
+        let v3 = v2.verify_next(e3).unwrap();
+
+        assert_eq!(v3.epoch(), 3);
+        assert_eq!(v3.topic(), topic2);
+        assert!(v3.is_active(&bob.signing_pub));
+        assert_eq!(
+            v3.entry
+                .devices
+                .iter()
+                .filter(|d| d.signing_pub == bob.signing_pub)
+                .count(),
+            1
+        );
+        assert!(v3
+            .entry
+            .revoked
+            .iter()
+            .all(|d| d.signing_pub != bob.signing_pub));
     }
 
     #[test]
