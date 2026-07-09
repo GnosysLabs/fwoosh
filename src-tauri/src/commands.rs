@@ -25,7 +25,7 @@ use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -70,6 +70,7 @@ const MAX_SDP_JSON_BYTES: usize = 256 * 1024;
 const MAX_FILE_FRAME_BYTES: usize = FILE_CHUNK_SIZE + 1024;
 const FILE_NONCE_PREFIX_LEN: usize = 16;
 const FILE_NONCE_LEN: usize = 24;
+const MAX_COMPLETED_RECEIVED_FILES: usize = 256;
 
 /// App-wide shared state.
 pub struct AppState {
@@ -99,6 +100,10 @@ pub struct AppState {
     pub settings: Mutex<AppSettings>,
     /// Active large-file transfer sessions keyed by session_id.
     pub file_transfers: Mutex<HashMap<String, TransferRecord>>,
+    /// Successfully received file paths, keyed by transfer id and kept only
+    /// for the lifetime of this process. Reveal requests must match this
+    /// backend-owned allowlist, so the UI cannot open an arbitrary path.
+    pub completed_received_files: Mutex<VecDeque<(String, PathBuf)>>,
     /// Short-lived OS file-drop grants keyed by an unguessable id.
     pub file_grants: Mutex<HashMap<String, FileGrant>>,
 }
@@ -135,6 +140,7 @@ impl AppState {
             settings_path: Mutex::new(None),
             settings: Mutex::new(AppSettings::default()),
             file_transfers: Mutex::new(HashMap::new()),
+            completed_received_files: Mutex::new(VecDeque::new()),
             file_grants: Mutex::new(HashMap::new()),
         }
     }
@@ -1645,6 +1651,21 @@ pub async fn cancel_file_transfer(
 }
 
 #[tauri::command]
+pub async fn reveal_received_file(
+    state: State<'_, Arc<AppState>>,
+    path: String,
+) -> Result<(), String> {
+    let path = completed_received_file_path(state.inner(), Path::new(&path)).await?;
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|_| "Received file no longer exists at its saved location".to_string())?;
+    if !metadata.is_file() {
+        return Err("Received file no longer exists at its saved location".to_string());
+    }
+    reveal_path_in_file_manager(&path)
+}
+
+#[tauri::command]
 pub async fn revoke_device(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
@@ -2791,6 +2812,12 @@ async fn send_file_over_channel(
     dc.send(&Bytes::from(frame))
         .await
         .map_err(|e| e.to_string())?;
+    // Completion is a terminal state. Claim the active transfer before
+    // notifying the UI so a simultaneous peer failure or roster update cannot
+    // emit a second terminal event for this session.
+    if take_transfer(&state, &session_id).await.is_none() {
+        return Ok(());
+    }
     let _ = app.emit(
         "file-transfer-complete",
         serde_json::json!({
@@ -2801,7 +2828,6 @@ async fn send_file_over_channel(
             "direction": "outgoing"
         }),
     );
-    state.file_transfers.lock().await.remove(&session_id);
     Ok(())
 }
 
@@ -2893,6 +2919,7 @@ async fn handle_file_frame(
             }
             finalize_received_file_no_overwrite(&part_path, &final_path).await?;
             state.file_transfers.lock().await.remove(&session_id);
+            remember_completed_received_file(&state, &session_id, final_path.clone()).await;
             let _ = app.emit(
                 "file-transfer-complete",
                 serde_json::json!({
@@ -2908,17 +2935,18 @@ async fn handle_file_frame(
         }
         FileFrame::Cancel { reason } => {
             let session_id = write_state.lock().await.session_id.clone();
-            cleanup_transfer(&state, &session_id).await;
-            let _ = app.emit(
-                "file-transfer-cancelled",
-                FileTransferProgressDto {
-                    session_id,
-                    transferred: 0,
-                    total: 0,
-                    status: "cancelled".to_string(),
-                    message: reason,
-                },
-            );
+            if cleanup_transfer(&state, &session_id).await {
+                let _ = app.emit(
+                    "file-transfer-cancelled",
+                    FileTransferProgressDto {
+                        session_id,
+                        transferred: 0,
+                        total: 0,
+                        status: "cancelled".to_string(),
+                        message: reason,
+                    },
+                );
+            }
             Ok(())
         }
     }
@@ -3027,7 +3055,12 @@ async fn emit_file_failed(
     session_id: &str,
     message: &str,
 ) {
-    cleanup_transfer(state, session_id).await;
+    // Async WebRTC callbacks can outlive a successful transfer. Only an
+    // active session may transition to failed; completed sessions have
+    // already been removed from file_transfers.
+    if !cleanup_transfer(state, session_id).await {
+        return;
+    }
     let _ = app.emit(
         "file-transfer-failed",
         FileTransferProgressDto {
@@ -3088,11 +3121,73 @@ async fn cleanup_transfer_if_timeout_token(
     had_record
 }
 
+async fn take_transfer(state: &Arc<AppState>, session_id: &str) -> Option<TransferRecord> {
+    state.file_transfers.lock().await.remove(session_id)
+}
+
 async fn cleanup_transfer(state: &Arc<AppState>, session_id: &str) -> bool {
-    let record = state.file_transfers.lock().await.remove(session_id);
+    let record = take_transfer(state, session_id).await;
     let had_record = record.is_some();
     cleanup_transfer_record(record).await;
     had_record
+}
+
+async fn remember_completed_received_file(state: &Arc<AppState>, session_id: &str, path: PathBuf) {
+    let mut files = state.completed_received_files.lock().await;
+    files.retain(|(id, _)| id != session_id);
+    files.push_back((session_id.to_string(), path));
+    while files.len() > MAX_COMPLETED_RECEIVED_FILES {
+        files.pop_front();
+    }
+}
+
+async fn completed_received_file_path(
+    state: &Arc<AppState>,
+    requested_path: &Path,
+) -> Result<PathBuf, String> {
+    state
+        .completed_received_files
+        .lock()
+        .await
+        .iter()
+        .find_map(|(_, path)| (path == requested_path).then(|| path.clone()))
+        .ok_or_else(|| "Received file is not available to reveal".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn reveal_path_in_file_manager(path: &Path) -> Result<(), String> {
+    std::process::Command::new("open")
+        .arg("-R")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Could not open Finder: {e}"))
+}
+
+#[cfg(target_os = "windows")]
+fn reveal_path_in_file_manager(path: &Path) -> Result<(), String> {
+    std::process::Command::new("explorer.exe")
+        .arg(format!("/select,{}", path.to_string_lossy()))
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Could not open File Explorer: {e}"))
+}
+
+#[cfg(target_os = "linux")]
+fn reveal_path_in_file_manager(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "Received file has no containing folder".to_string())?;
+    std::process::Command::new("xdg-open")
+        .arg(parent)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Could not open the file manager: {e}"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+fn reveal_path_in_file_manager(_path: &Path) -> Result<(), String> {
+    Err("Revealing files is not supported on this platform".to_string())
 }
 
 async fn remove_transfer_matching_sender(
@@ -3257,6 +3352,57 @@ mod tests {
         assert!(state.file_transfers.lock().await.contains_key(session_id));
         assert!(cleanup_transfer_if_timeout_token(&state, session_id, 100).await);
         assert!(!state.file_transfers.lock().await.contains_key(session_id));
+    }
+
+    #[tokio::test]
+    async fn terminal_transfer_state_can_only_be_claimed_once() {
+        let store = HistoryStore::open(Path::new(":memory:"), &[8u8; 32]).unwrap();
+        let state = Arc::new(AppState::new(DeviceKeypairs::generate(), store));
+        let session_id = "11111111111111111111111111111111";
+        state.file_transfers.lock().await.insert(
+            session_id.to_string(),
+            TransferRecord::PendingIncoming(PendingIncomingTransfer {
+                sender_id: crypto::Ed25519PubKey([1u8; 32]),
+                file_name: "complete.bin".to_string(),
+                size: 1,
+                sha256: [2u8; 32],
+                content_key: [3u8; 32],
+                nonce_prefix: [4u8; FILE_NONCE_PREFIX_LEN],
+                offer_sdp_json: "{}".to_string(),
+                timeout_token: 101,
+            }),
+        );
+
+        assert!(take_transfer(&state, session_id).await.is_some());
+        assert!(take_transfer(&state, session_id).await.is_none());
+        assert!(!cleanup_transfer(&state, session_id).await);
+    }
+
+    #[tokio::test]
+    async fn completed_received_file_lookup_rejects_arbitrary_paths() {
+        let store = HistoryStore::open(Path::new(":memory:"), &[9u8; 32]).unwrap();
+        let state = Arc::new(AppState::new(DeviceKeypairs::generate(), store));
+        let session_id = "22222222222222222222222222222222";
+        let path = PathBuf::from("/tmp/received.txt");
+
+        remember_completed_received_file(&state, session_id, path.clone()).await;
+
+        assert_eq!(
+            completed_received_file_path(&state, &path).await.unwrap(),
+            path
+        );
+        assert!(
+            completed_received_file_path(&state, Path::new("/tmp/not-received.txt"))
+                .await
+                .unwrap_err()
+                .contains("not available")
+        );
+        assert!(
+            completed_received_file_path(&state, Path::new("../../secret"))
+                .await
+                .unwrap_err()
+                .contains("not available")
+        );
     }
 
     #[test]
