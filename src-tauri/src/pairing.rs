@@ -3,7 +3,7 @@
 //! Flow (frozen spec):
 //! 1. Admin (room creator) generates a one-time secret `s` (32 random bytes)
 //!    and encodes a pairing URI:
-//!      `fwoosh://pair?t=<topic>&pub=<base64url admin-ed25519>&s=<base64url s>`
+//!    `fwoosh://pair?t=<topic>&pub=<base64url admin-ed25519>&s=<base64url s>`
 //!    rendered as a QR code (in-app only; never logged). Short-lived + single-use.
 //! 2. Joining device scans/pastes the URI, learns (topic, admin_pub, s).
 //! 3. Joining device derives an HMAC key from `s` and produces a proof MAC over

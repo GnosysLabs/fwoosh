@@ -333,7 +333,7 @@ fn merkle_root_of(chunks: &[impl AsRef<[u8]>]) -> [u8; 32] {
         return [0u8; 32];
     }
     while level.len() > 1 {
-        let mut next = Vec::with_capacity((level.len() + 1) / 2);
+        let mut next = Vec::with_capacity(level.len().div_ceil(2));
         let mut i = 0;
         while i < level.len() {
             let left = level[i];
@@ -393,20 +393,30 @@ fn hpke_info(
 /// Wrap `content_key` for `recipient_x25519` (HPKE base mode). Returns a
 /// RecipientWrap. Authenticity comes from the Ed25519 signature, NOT HPKE auth
 /// mode, so we keep the HPKE dependency surface minimal.
+struct WrapContext<'a> {
+    sender_id: &'a Ed25519PubKey,
+    room: &'a str,
+    epoch: u64,
+    msg_id: &'a [u8; 16],
+}
+
 fn wrap_content_key(
     recipient_id: Ed25519PubKey,
     recipient_x25519: X25519PubKey,
     content_key: &[u8],
-    sender_id: &Ed25519PubKey,
-    room: &str,
-    epoch: u64,
-    msg_id: &[u8; 16],
-    rng: &mut (impl rand_core::CryptoRng + rand_core::RngCore),
+    context: &WrapContext<'_>,
+    rng: &mut impl rand_core::CryptoRng,
 ) -> Result<RecipientWrap, CryptoError> {
     let mode = OpModeS::<KemImpl>::Base;
     let pk_r = HpkePub::from_bytes(&recipient_x25519.0)
         .map_err(|_| CryptoError::BadInput("bad recipient x25519 pubkey"))?;
-    let info = hpke_info(sender_id, &recipient_id, room, epoch, msg_id);
+    let info = hpke_info(
+        context.sender_id,
+        &recipient_id,
+        context.room,
+        context.epoch,
+        context.msg_id,
+    );
     let (encapped, wrapped_ct) = single_shot_seal::<AeadImpl, KdfImpl, KemImpl, _>(
         &mode,
         &pk_r,
@@ -552,15 +562,18 @@ pub fn seal_clip(
 
     // 5. Wrap content key for each recipient via HPKE.
     let mut wraps = Vec::with_capacity(recipients.len());
+    let wrap_context = WrapContext {
+        sender_id: &sender.signing_pub,
+        room,
+        epoch,
+        msg_id: &msg_id,
+    };
     for r in recipients {
         let w = wrap_content_key(
             r.id.clone(),
             r.x25519.clone(),
             &content_key,
-            &sender.signing_pub,
-            room,
-            epoch,
-            &msg_id,
+            &wrap_context,
             &mut rng,
         )?;
         wraps.push(w);

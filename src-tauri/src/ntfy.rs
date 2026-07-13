@@ -282,7 +282,7 @@ pub fn spawn_subscriber(
                                 break;
                             }
                         };
-                        if let Some(text) = msg.into_text().ok() {
+                        if let Ok(text) = msg.into_text() {
                             let is_idle_event = text.contains(r#""event":"open""#)
                                 || text.contains(r#""event":"keepalive""#);
                             if !is_idle_event {

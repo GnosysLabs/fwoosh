@@ -153,7 +153,7 @@ fn canonical_bytes(e: &RosterEntry) -> Vec<u8> {
 /// SHA-256 of an entry's canonical bytes (used to chain the next entry).
 pub fn entry_hash(e: &RosterEntry) -> [u8; 32] {
     let mut h = Sha256::new();
-    h.update(&canonical_bytes(e));
+    h.update(canonical_bytes(e));
     h.finalize().into()
 }
 
@@ -272,7 +272,7 @@ impl VerifiedRoster {
             return Err(RosterError::BadInput("no active devices"));
         }
         // Admin must be in the active device list.
-        if !e.devices.iter().any(|d| &d.signing_pub == &e.admin_id) {
+        if !e.devices.iter().any(|d| d.signing_pub == e.admin_id) {
             return Err(RosterError::BadInput("admin not in active devices"));
         }
         // No device may be both active and revoked.

@@ -4,6 +4,7 @@
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
+  import QRCode from "qrcode";
 
   type Theme = "hacker" | "light" | "onyx" | "melanzana";
 
@@ -15,6 +16,7 @@
   let clips = $state<ClipDto[]>([]);
   let query = $state("");
   let pairingUri = $state("");
+  let pairingQrDataUrl = $state("");
   let pairingExpiresAt = $state(0);
   let pairingRefreshing = $state(false);
   let nowSeconds = $state(Math.floor(Date.now() / 1000));
@@ -27,6 +29,14 @@
   let devices = $state<DeviceDto[]>([]);
   let theme = $state<Theme>("hacker");
   let settingsOpen = $state(false);
+  let syncGroups = $state<SyncGroupDto[]>([]);
+  let switchingGroup = $state(false);
+  let syncGroupNameDraft = $state("");
+  let savingSyncGroupName = $state(false);
+  let newSyncGroupOpen = $state(false);
+  let newSyncGroupName = $state("");
+  let newSyncGroupCode = $state("");
+  let creatingSyncGroup = $state(false);
   let devicesExpanded = $state(false);
   let confirmDeleteAllOpen = $state(false);
   let deletingAll = $state(false);
@@ -46,6 +56,8 @@
   let transfers = $state<Record<string, TransferView>>({});
   let dismissedTransferIds = $state<Set<string>>(new Set());
   let confettiPieces = $state<ConfettiPiece[]>([]);
+  let settingsMenu = $state<HTMLDivElement | null>(null);
+  let settingsButton = $state<HTMLButtonElement | null>(null);
   let logoSrc = $derived(
     theme === "light"
       ? "/fwoosh_dark.webp"
@@ -55,6 +67,7 @@
   );
   let historySearching = $derived(query.trim().length > 0);
   let peerDevices = $derived(devices.filter((d) => !d.is_self));
+  let activeSyncGroup = $derived(syncGroups.find((group) => group.active) ?? null);
   let transferList = $derived(Object.values(transfers));
   let pairingSecondsLeft = $derived(Math.max(0, pairingExpiresAt - nowSeconds));
   let pairingExpiryLabel = $derived(formatPairingExpiry(pairingSecondsLeft));
@@ -85,6 +98,13 @@
     is_self: boolean;
     is_admin: boolean;
     can_revoke: boolean;
+  }
+  interface SyncGroupDto {
+    id: string;
+    name: string;
+    active: boolean;
+    connected: boolean;
+    member_count: number;
   }
   interface DroppedFile {
     grant_id: string | null;
@@ -191,6 +211,7 @@
       }
 
       // Check if we're already in a room (e.g. after restart).
+      await refreshSyncGroups();
       await refreshRoom();
 
       unlisteners.push(
@@ -238,6 +259,21 @@
             showStatus("ok", `Paired with ${pairedDevice.label}`, 4000);
             launchPairingConfetti();
           }
+        })
+      );
+      unlisteners.push(
+        await listen("sync-groups-updated", async () => {
+          await refreshSyncGroups();
+        })
+      );
+      unlisteners.push(
+        await listen("sync-group-changed", async () => {
+          await refreshSyncGroups();
+          await refreshRoom(true);
+          clips = await invoke<ClipDto[]>("recent_clips", { limit: 50 }).catch(() => []);
+          query = "";
+          transfers = {};
+          dismissedTransferIds = new Set();
         })
       );
       unlisteners.push(
@@ -636,7 +672,7 @@
     if (compact.length <= maxLength) return compact;
     const boundary = compact.lastIndexOf(" ", maxLength);
     const cutAt = boundary >= Math.floor(maxLength * 0.55) ? boundary : maxLength;
-    return `${compact.slice(0, cutAt).trimEnd()}...`;
+    return `${compact.slice(0, cutAt).trimEnd()}…`;
   }
 
   function preferredDeviceLabel() {
@@ -648,10 +684,27 @@
     pairingExpiresAt = code.expires_at;
     nowSeconds = Math.floor(Date.now() / 1000);
     showPairing = true;
+    pairingQrDataUrl = "";
+    void renderPairingQr(code.uri);
+  }
+
+  async function renderPairingQr(uri: string) {
+    try {
+      const dataUrl = await QRCode.toDataURL(uri, {
+        errorCorrectionLevel: "M",
+        margin: 2,
+        width: 320,
+        color: { dark: "#08100b", light: "#ffffff" },
+      });
+      if (pairingUri === uri) pairingQrDataUrl = dataUrl;
+    } catch {
+      if (pairingUri === uri) pairingQrDataUrl = "";
+    }
   }
 
   function clearPairingCode() {
     pairingUri = "";
+    pairingQrDataUrl = "";
     pairingExpiresAt = 0;
     showPairing = false;
   }
@@ -692,6 +745,12 @@
     await getCurrentWindow().hide();
   }
 
+  function closeSettingsOnOutsideClick(event: MouseEvent) {
+    if (!settingsOpen || !(event.target instanceof Node)) return;
+    if (settingsMenu?.contains(event.target) || settingsButton?.contains(event.target)) return;
+    settingsOpen = false;
+  }
+
   function startLogoDrag(e: MouseEvent) {
     if (e.button !== 0 || !/^Mac/.test(navigator.platform)) return;
     e.preventDefault();
@@ -710,6 +769,113 @@
     } catch {
       devices = [];
       devicesExpanded = false;
+    }
+  }
+
+  async function refreshSyncGroups() {
+    try {
+      syncGroups = await invoke<SyncGroupDto[]>("sync_groups");
+      syncGroupNameDraft = syncGroups.find((group) => group.active)?.name ?? "";
+    } catch {
+      syncGroups = [];
+      syncGroupNameDraft = "";
+    }
+  }
+
+  async function switchSyncGroup(groupId: string) {
+    if (!groupId || activeSyncGroup?.id === groupId || switchingGroup) return;
+    switchingGroup = true;
+    clearStatus();
+    try {
+      await invoke("switch_sync_group", { groupId });
+      settingsOpen = false;
+      await refreshSyncGroups();
+      await refreshRoom(true);
+      clips = await invoke<ClipDto[]>("recent_clips", { limit: 50 }).catch(() => []);
+      query = "";
+      transfers = {};
+      dismissedTransferIds = new Set();
+      showStatus("ok", `Switched to ${activeSyncGroup?.name ?? "sync group"}`);
+    } catch (e) {
+      showStatus("err", String(e));
+    } finally {
+      switchingGroup = false;
+    }
+  }
+
+  async function saveSyncGroupName() {
+    if (!activeSyncGroup || !syncGroupNameDraft.trim() || savingSyncGroupName) return;
+    savingSyncGroupName = true;
+    try {
+      await invoke("rename_sync_group", {
+        groupId: activeSyncGroup.id,
+        name: syncGroupNameDraft,
+      });
+      await refreshSyncGroups();
+      showStatus("ok", "Sync group renamed");
+    } catch (e) {
+      showStatus("err", String(e));
+    } finally {
+      savingSyncGroupName = false;
+    }
+  }
+
+  async function removeActiveSyncGroup() {
+    if (!activeSyncGroup) return;
+    if (!confirm(`Remove “${activeSyncGroup.name}” from this device?`)) return;
+    try {
+      await invoke("leave_room");
+      clearPairingCode();
+      settingsOpen = false;
+      await refreshSyncGroups();
+      await refreshRoom(true);
+      clips = activeSyncGroup
+        ? await invoke<ClipDto[]>("recent_clips", { limit: 50 }).catch(() => [])
+        : [];
+      query = "";
+      transfers = {};
+      showStatus("ok", "Sync group removed");
+    } catch (e) {
+      showStatus("err", String(e));
+    }
+  }
+
+  function openNewSyncGroup() {
+    settingsOpen = false;
+    newSyncGroupName = "";
+    newSyncGroupCode = "";
+    newSyncGroupOpen = true;
+  }
+
+  async function createOrJoinSyncGroup() {
+    if (!newSyncGroupName.trim() || creatingSyncGroup) return;
+    creatingSyncGroup = true;
+    clearStatus();
+    try {
+      if (newSyncGroupCode.trim()) {
+        await invoke("join_sync_group", {
+          name: newSyncGroupName,
+          uri: newSyncGroupCode,
+          label: preferredDeviceLabel(),
+        });
+        showStatus("ok", `Joining ${newSyncGroupName}…`, 4000);
+      } else {
+        const code = await invoke<PairingCodeDto>("create_sync_group", {
+          name: newSyncGroupName,
+          label: preferredDeviceLabel(),
+        });
+        applyPairingCode(code);
+      }
+      newSyncGroupOpen = false;
+      await refreshSyncGroups();
+      await refreshRoom(true);
+      clips = await invoke<ClipDto[]>("recent_clips", { limit: 50 }).catch(() => []);
+      query = "";
+      transfers = {};
+    } catch (e) {
+      showStatus("err", String(e));
+    } finally {
+      creatingSyncGroup = false;
     }
   }
 
@@ -800,6 +966,7 @@
     try {
       const code = await invoke<PairingCodeDto>("create_room", { label: preferredDeviceLabel() });
       inRoom = true;
+      await refreshSyncGroups();
       await refreshRoom(true);
       applyPairingCode(code);
     } catch (e) {
@@ -875,8 +1042,16 @@
         settingsOpen = false;
         return;
       }
+      if (newSyncGroupOpen) {
+        newSyncGroupOpen = false;
+        return;
+      }
       if (confirmDeleteAllOpen) {
         confirmDeleteAllOpen = false;
+        return;
+      }
+      if (confirmDeleteAllFilesOpen) {
+        confirmDeleteAllFilesOpen = false;
         return;
       }
       if (pendingFile) {
@@ -906,9 +1081,11 @@
   async function leaveRoom() {
     try {
       await invoke("leave_room");
-      inRoom = false;
-      devices = [];
-      devicesExpanded = false;
+      await refreshSyncGroups();
+      await refreshRoom(true);
+      clips = activeSyncGroup
+        ? await invoke<ClipDto[]>("recent_clips", { limit: 50 }).catch(() => [])
+        : [];
       clearPairingCode();
       clearStatus();
     } catch (e) {
@@ -921,7 +1098,8 @@
     try {
       await invoke("join_room", { uri: joinUri, label: preferredDeviceLabel() });
       joinUri = "";
-      showStatus("ok", "Joining room - waiting for admin to add you...", 4000);
+      await refreshSyncGroups();
+      showStatus("ok", "Joining sync group — waiting for the admin to add you…", 4000);
     } catch (e) {
       showStatus("err", String(e));
     }
@@ -942,7 +1120,7 @@
   }
 </script>
 
-<svelte:window on:keydown={onKeydown} />
+<svelte:window on:keydown={onKeydown} on:click={closeSettingsOnOutsideClick} />
 
 <div class="card" class:file-hover={fileHover} data-tauri-drag-region>
   <header class="header" data-tauri-drag-region>
@@ -951,6 +1129,8 @@
         class="brand-logo"
         src={logoSrc}
         alt="Fwoosh"
+        width="112"
+        height="32"
         draggable="false"
         data-tauri-drag-region
       />
@@ -975,6 +1155,7 @@
     <div class="window-actions" data-tauri-drag-region="false">
       <button
         class="icon-btn"
+        bind:this={settingsButton}
         aria-label="Settings"
         title="Settings"
         aria-expanded={settingsOpen}
@@ -994,14 +1175,66 @@
         </svg>
       </button>
       {#if settingsOpen}
-        <div class="settings-menu" data-tauri-drag-region="false">
+        <div bind:this={settingsMenu} class="settings-menu" data-tauri-drag-region="false">
+          <div class="settings-section">
+            <div class="settings-title">Sync group</div>
+            <div class="group-picker-row">
+              <select
+                class="settings-select"
+                aria-label="Active sync group"
+                value={activeSyncGroup?.id ?? ""}
+                disabled={switchingGroup || syncGroups.length === 0}
+                onchange={(event) => void switchSyncGroup(event.currentTarget.value)}
+              >
+                {#if syncGroups.length === 0}
+                  <option value="">No groups yet</option>
+                {:else}
+                  {#each syncGroups as group (group.id)}
+                    <option value={group.id}>
+                      {group.name} · {group.member_count} {group.member_count === 1 ? "device" : "devices"}
+                    </option>
+                  {/each}
+                {/if}
+              </select>
+              <button class="mini-action group-add" onclick={openNewSyncGroup}>New</button>
+            </div>
+            {#if activeSyncGroup}
+              <div class="settings-row">
+                <input
+                  id="sync-group-name"
+                  name="sync-group-name"
+                  class="settings-input"
+                  maxlength="48"
+                  autocomplete="off"
+                  aria-label="Sync group name"
+                  bind:value={syncGroupNameDraft}
+                  onkeydown={(event) => {
+                    event.stopPropagation();
+                    if (event.key === "Enter") void saveSyncGroupName();
+                  }}
+                />
+                <button
+                  class="mini-action"
+                  onclick={saveSyncGroupName}
+                  disabled={savingSyncGroupName || !syncGroupNameDraft.trim()}
+                >
+                  {savingSyncGroupName ? "Saving…" : "Rename"}
+                </button>
+              </div>
+              <button class="group-remove" onclick={removeActiveSyncGroup}>
+                Remove this group from this device
+              </button>
+            {/if}
+          </div>
           <div class="settings-section">
             <label class="settings-title" for="device-name">Device name</label>
             <div class="settings-row">
               <input
                 id="device-name"
+                name="device-name"
                 class="settings-input"
                 maxlength="48"
+                autocomplete="off"
                 bind:value={deviceLabelDraft}
                 onkeydown={(e) => {
                   e.stopPropagation();
@@ -1050,19 +1283,23 @@
             <label class="settings-title" for="stun-servers">STUN servers</label>
             <textarea
               id="stun-servers"
+              name="stun-servers"
               class="settings-textarea"
               rows="2"
+              autocomplete="off"
               bind:value={stunServersText}
               onkeydown={(e) => e.stopPropagation()}
             ></textarea>
             <label class="settings-title" for="transfer-timeout">Transfer timeout (minutes)</label>
             <input
               id="transfer-timeout"
+              name="transfer-timeout"
               class="settings-input"
               type="number"
               min="1"
               max="10080"
               step="1"
+              autocomplete="off"
               bind:value={transferTimeoutMinutes}
               onkeydown={(e) => e.stopPropagation()}
             />
@@ -1078,9 +1315,13 @@
   {#if activeView === "compose"}
     <div class="compose" class:devices-open={inRoom && devicesExpanded}>
       <textarea
+        id="clip-text"
+        name="clip-text"
         bind:value={text}
+        aria-label="Message to send"
         placeholder="Paste or type a message, or drag and drop a file to securely transfer it."
         class="box"
+        autocomplete="off"
         data-tauri-drag-region="false"></textarea>
 
       <div class="compose-controls">
@@ -1134,9 +1375,14 @@
           </div>
           <div class="divider"><span>or</span></div>
           <input
+            id="pairing-code"
+            name="pairing-code"
             class="join-input"
+            aria-label="Pairing code"
             placeholder="Paste a pairing code..."
             bind:value={joinUri}
+            autocomplete="off"
+            spellcheck="false"
             onkeydown={(e) => e.key === "Enter" && joinRoom()} />
           <button class="ghost" onclick={joinRoom} disabled={!joinUri.trim()}>Join room</button>
         </div>
@@ -1255,9 +1501,14 @@
     <div class="history">
       <div class="history-toolbar">
         <input
+          id="history-search"
+          name="history-search"
           class="search"
+          type="search"
+          aria-label="Search history"
           placeholder="Search history..."
           bind:value={query}
+          autocomplete="off"
           oninput={search} />
         <button
           class="danger-icon-btn"
@@ -1320,6 +1571,72 @@
     </div>
   {/if}
 
+  {#if newSyncGroupOpen}
+    <div
+      class="modal-overlay"
+      role="button"
+      tabindex="0"
+      onclick={() => (newSyncGroupOpen = false)}
+      onkeydown={(event) => {
+        if (event.key === "Escape") newSyncGroupOpen = false;
+      }}
+    >
+      <div
+        class="confirm-dialog group-dialog"
+        role="dialog"
+        tabindex="-1"
+        aria-modal="true"
+        aria-labelledby="new-sync-group-title"
+        onclick={(event) => event.stopPropagation()}
+        onkeydown={(event) => event.stopPropagation()}
+      >
+        <h3 id="new-sync-group-title">New sync group</h3>
+        <p class="muted small">
+          Create a fresh group, or paste an invitation to join an existing one.
+        </p>
+        <label class="settings-title" for="new-sync-group-name">Group name</label>
+        <input
+          id="new-sync-group-name"
+          name="new-sync-group-name"
+          class="settings-input"
+          maxlength="48"
+          autocomplete="off"
+          placeholder="Work, Friends, Family…"
+          bind:value={newSyncGroupName}
+        />
+        <label class="settings-title" for="new-sync-group-code">Pairing code <span>(optional)</span></label>
+        <textarea
+          id="new-sync-group-code"
+          name="new-sync-group-code"
+          class="settings-textarea group-code-input"
+          rows="3"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="Paste a pairing code to join…"
+          bind:value={newSyncGroupCode}
+        ></textarea>
+        <div class="dialog-actions">
+          <button class="ghost" onclick={() => (newSyncGroupOpen = false)} disabled={creatingSyncGroup}>
+            Cancel
+          </button>
+          <button
+            class="send-btn"
+            onclick={createOrJoinSyncGroup}
+            disabled={creatingSyncGroup || !newSyncGroupName.trim()}
+          >
+            {creatingSyncGroup
+              ? newSyncGroupCode.trim()
+                ? "Joining…"
+                : "Creating…"
+              : newSyncGroupCode.trim()
+                ? "Join group"
+                : "Create group"}
+          </button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
   {#if showPairing && pairingUri}
     <div
       class="pairing-overlay"
@@ -1341,6 +1658,20 @@
           >Scan this on another device, or share the code. Single-use - keep it
           private. Expires in {pairingExpiryLabel}.</p
         >
+        {#if pairingQrDataUrl}
+          <div class="pairing-qr-frame">
+            <img
+              class="pairing-qr"
+              src={pairingQrDataUrl}
+              alt="Pairing QR code"
+              width="148"
+              height="148"
+              draggable="false"
+            />
+          </div>
+        {:else}
+          <div class="pairing-qr-placeholder" role="status">Generating QR code…</div>
+        {/if}
         <code class="pair-code">{pairingUri}</code>
         <div class="pairing-actions">
           <button class="ghost" onclick={copyPairingCode} disabled={pairingRefreshing}
@@ -1545,6 +1876,25 @@
   {/if}
 
   <div class="utility-footer" data-tauri-drag-region="false">
+    {#if activeSyncGroup}
+      <button
+        class="group-chip"
+        aria-label={`Active sync group: ${activeSyncGroup.name}`}
+        title="Switch sync group"
+        onclick={(event) => {
+          event.stopPropagation();
+          settingsOpen = true;
+        }}
+      >
+        <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="8" cy="9" r="3" />
+          <circle cx="17" cy="8" r="2.5" />
+          <path d="M3.5 19c.7-3.2 2.2-4.8 4.5-4.8s3.8 1.6 4.5 4.8" />
+          <path d="M14 13.2c2.8-.4 4.8 1.3 5.5 4.2" />
+        </svg>
+        <span>{activeSyncGroup.name}</span>
+      </button>
+    {/if}
     {#if activeView === "compose" && inRoom}
       <div class="footer-tools" data-tauri-drag-region="false">
         <button
@@ -2381,6 +2731,32 @@
     color: #818cf8;
     word-break: break-all;
     user-select: text;
+  }
+  .pairing-qr-frame,
+  .pairing-qr-placeholder {
+    width: 148px;
+    height: 148px;
+    align-self: center;
+    border-radius: 14px;
+  }
+  .pairing-qr-frame {
+    display: grid;
+    place-items: center;
+    overflow: hidden;
+    background: #ffffff;
+    box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.16);
+  }
+  .pairing-qr {
+    display: block;
+    width: 148px;
+    height: 148px;
+  }
+  .pairing-qr-placeholder {
+    display: grid;
+    place-items: center;
+    border: 1px dashed #343440;
+    color: #81818d;
+    font-size: 11px;
   }
   .pairing-actions {
     display: flex;
@@ -4276,6 +4652,102 @@
     right: auto;
     bottom: auto;
     margin-left: auto;
+  }
+  .group-chip {
+    min-width: 0;
+    max-width: 126px;
+    height: 24px;
+    margin-right: 6px;
+    padding: 0 8px 0 6px;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    border: 1px solid var(--line-soft);
+    border-radius: 999px;
+    background: var(--field);
+    color: var(--muted);
+    pointer-events: auto;
+    cursor: pointer;
+  }
+  .group-chip:hover,
+  .group-chip:focus-visible {
+    border-color: var(--line-strong);
+    color: var(--accent);
+    outline: none;
+    box-shadow: 0 0 0 2px var(--focus);
+  }
+  .group-chip .icon-svg {
+    width: 13px;
+    height: 13px;
+    flex: 0 0 13px;
+    stroke-width: 1.8;
+  }
+  .group-chip span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 10px;
+    font-weight: 800;
+  }
+  .settings-menu {
+    max-height: calc(100vh - 76px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+  .group-picker-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 6px;
+  }
+  .settings-select {
+    min-width: 0;
+    width: 100%;
+    border: 1px solid var(--line);
+    border-radius: 15px;
+    background-color: var(--field);
+    color: var(--text);
+    padding: 8px 30px 8px 10px;
+    font: inherit;
+    font-size: 12px;
+  }
+  .settings-select:focus-visible {
+    border-color: var(--line-strong);
+    outline: none;
+    box-shadow: 0 0 0 3px var(--focus);
+  }
+  .settings-select option {
+    background-color: var(--panel);
+    color: var(--text);
+  }
+  .group-add {
+    min-width: 52px;
+  }
+  .group-remove {
+    align-self: flex-start;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--danger);
+    font: inherit;
+    font-size: 10px;
+    cursor: pointer;
+  }
+  .group-remove:hover,
+  .group-remove:focus-visible {
+    text-decoration: underline;
+    outline: none;
+  }
+  .group-dialog {
+    width: min(360px, calc(100vw - 36px));
+  }
+  .group-dialog .settings-title span {
+    color: var(--muted-soft);
+    font-weight: 500;
+  }
+  .group-code-input {
+    resize: none;
+    word-break: break-all;
   }
 
   .title {
