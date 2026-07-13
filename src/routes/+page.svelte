@@ -18,8 +18,10 @@
   let pairingUri = $state("");
   let pairingQrDataUrl = $state("");
   let pairingExpiresAt = $state(0);
-  let pairingInviteId = $state("");
   let pairingIsPermanent = $state(true);
+  let pairingTemporary = $state(false);
+  let pairingDurationSeconds = $state(600);
+  let pairingError = $state("");
   let pairingRefreshing = $state(false);
   let nowSeconds = $state(Math.floor(Date.now() / 1000));
   let joinUri = $state("");
@@ -63,6 +65,7 @@
   let settingsButton = $state<HTMLButtonElement | null>(null);
   let pendingJoins = $state<PendingJoinDto[]>([]);
   let resolvingJoinId = $state("");
+  let revokingReusableInvitation = $state(false);
   let logoSrc = $derived(
     theme === "light"
       ? "/fwoosh_dark.webp"
@@ -72,6 +75,7 @@
   );
   let historySearching = $derived(query.trim().length > 0);
   let peerDevices = $derived(devices.filter((d) => !d.is_self));
+  let isGroupAdmin = $derived(devices.some((device) => device.is_self && device.is_admin));
   let activeSyncGroup = $derived(syncGroups.find((group) => group.active) ?? null);
   let transferList = $derived(Object.values(transfers));
   let pairingSecondsLeft = $derived(Math.max(0, pairingExpiresAt - nowSeconds));
@@ -438,7 +442,7 @@
         transferTimeoutMinutes: transferTimeout,
       });
       transferTimeoutMinutes = transferTimeout;
-      showStatus("ok", "Network settings updated");
+      showStatus("ok", "Group settings updated");
     } catch (e) {
       showStatus("err", String(e));
     } finally {
@@ -704,9 +708,10 @@
 
   function applyPairingCode(code: PairingCodeDto) {
     pairingUri = code.uri;
-    pairingInviteId = code.invite_id;
     pairingExpiresAt = code.expires_at ?? 0;
     pairingIsPermanent = code.is_permanent;
+    pairingTemporary = !code.is_permanent;
+    pairingError = "";
     nowSeconds = Math.floor(Date.now() / 1000);
     showPairing = true;
     pairingQrDataUrl = "";
@@ -727,32 +732,59 @@
     }
   }
 
-  function clearPairingCode() {
+  function resetPairingResult() {
     pairingUri = "";
     pairingQrDataUrl = "";
-    pairingInviteId = "";
     pairingExpiresAt = 0;
     pairingIsPermanent = true;
+    pairingError = "";
+  }
+
+  function openPairingCreator() {
+    resetPairingResult();
+    pairingTemporary = false;
+    pairingDurationSeconds = 600;
+    showPairing = true;
+  }
+
+  function closePairingDialog() {
+    showPairing = false;
+    pairingError = "";
+  }
+
+  function clearPairingCode() {
+    resetPairingResult();
+    pairingTemporary = false;
+    pairingDurationSeconds = 600;
     showPairing = false;
   }
 
   function formatPairingExpiry(seconds: number) {
     if (seconds <= 0) return "expired";
     if (seconds < 60) return `${seconds}s`;
-    return `${Math.ceil(seconds / 60)}m`;
+    const minutes = Math.ceil(seconds / 60);
+    if (minutes < 60) return `${minutes}m`;
+    const hours = Math.floor(minutes / 60);
+    const remainingMinutes = minutes % 60;
+    if (hours < 24) return remainingMinutes ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
+    const days = Math.floor(hours / 24);
+    const remainingHours = hours % 24;
+    return remainingHours ? `${days}d ${remainingHours}h` : `${days}d`;
   }
 
-  async function refreshPairingCode() {
-    if (pairingRefreshing) return false;
+  async function generatePairingCode() {
+    if (pairingRefreshing) return;
     pairingRefreshing = true;
+    pairingError = "";
     try {
-      const code = await invoke<PairingCodeDto>("new_pairing_code");
+      const code = pairingTemporary
+        ? await invoke<PairingCodeDto>("create_temporary_pairing_code", {
+            expiresInSeconds: pairingDurationSeconds,
+          })
+        : await invoke<PairingCodeDto>("new_pairing_code");
       applyPairingCode(code);
-      return true;
     } catch (e) {
-      clearPairingCode();
-      showStatus("err", String(e));
-      return false;
+      pairingError = String(e);
     } finally {
       pairingRefreshing = false;
     }
@@ -765,45 +797,6 @@
       return;
     }
     await copyText(pairingUri, "Pairing code copied");
-  }
-
-  async function createTemporaryPairingCode(expiresInSeconds: number) {
-    if (pairingRefreshing) return;
-    pairingRefreshing = true;
-    try {
-      const code = await invoke<PairingCodeDto>("create_temporary_pairing_code", {
-        expiresInSeconds,
-      });
-      applyPairingCode(code);
-    } catch (e) {
-      showStatus("err", String(e));
-    } finally {
-      pairingRefreshing = false;
-    }
-  }
-
-  async function rotatePairingCode() {
-    if (!confirm("Revoke the permanent invitation and create a new one? Existing devices stay paired.")) return;
-    pairingRefreshing = true;
-    try {
-      const code = await invoke<PairingCodeDto>("rotate_pairing_code");
-      applyPairingCode(code);
-    } catch (e) {
-      showStatus("err", String(e));
-    } finally {
-      pairingRefreshing = false;
-    }
-  }
-
-  async function revokeVisiblePairingCode() {
-    if (!pairingInviteId || !confirm("Revoke this invitation? Existing devices stay paired.")) return;
-    try {
-      await invoke("revoke_pairing_code", { inviteId: pairingInviteId });
-      clearPairingCode();
-      showStatus("ok", "Invitation revoked");
-    } catch (e) {
-      showStatus("err", String(e));
-    }
   }
 
   async function hidePopup() {
@@ -911,6 +904,30 @@
     }
   }
 
+  async function revokeReusableInvitation() {
+    if (revokingReusableInvitation) return;
+    if (
+      !confirm(
+        "Revoke the reusable invitation for this group? Paired devices stay connected. You can create a fresh invitation later."
+      )
+    ) {
+      return;
+    }
+    revokingReusableInvitation = true;
+    try {
+      const revoked = await invoke<boolean>("revoke_permanent_pairing_code");
+      settingsOpen = false;
+      showStatus(
+        "ok",
+        revoked ? "Reusable invitation revoked" : "There is no active reusable invitation"
+      );
+    } catch (e) {
+      showStatus("err", String(e));
+    } finally {
+      revokingReusableInvitation = false;
+    }
+  }
+
   function openNewSyncGroup() {
     settingsOpen = false;
     newSyncGroupName = "";
@@ -967,7 +984,7 @@
       await invoke("approve_join_request", { requestId });
       await refreshPendingJoins();
       await refreshRoom();
-      showStatus("ok", "Device added to the network", 4000);
+      showStatus("ok", "Device added to the group", 4000);
     } catch (e) {
       showStatus("err", String(e));
     } finally {
@@ -1214,12 +1231,8 @@
     }
   }
 
-  async function createPairingCode() {
-    await refreshPairingCode();
-  }
-
   async function revokeDevice(id: string) {
-    if (!confirm("Revoke this device from the room?")) return;
+    if (!confirm("Remove this device from the group?")) return;
     try {
       await invoke("revoke_device", { deviceId: id });
       await refreshRoom();
@@ -1330,6 +1343,21 @@
                   {savingSyncGroupName ? "Saving…" : "Rename"}
                 </button>
               </div>
+              {#if isGroupAdmin}
+                <div class="group-invitation-setting">
+                  <div>
+                    <strong>Reusable invitation</strong>
+                    <span>Stop new pairing requests without removing devices already in this group.</span>
+                  </div>
+                  <button
+                    class="group-invitation-revoke"
+                    onclick={revokeReusableInvitation}
+                    disabled={revokingReusableInvitation}
+                  >
+                    {revokingReusableInvitation ? "Revoking…" : "Revoke"}
+                  </button>
+                </div>
+              {/if}
               <button class="group-remove" onclick={removeActiveSyncGroup}>
                 Remove this group from this device
               </button>
@@ -1413,7 +1441,7 @@
               onkeydown={(e) => e.stopPropagation()}
             />
             <button class="mini-action full" onclick={saveNetworkSettings} disabled={savingNetwork}>
-              {savingNetwork ? "Saving..." : "Save network"}
+              {savingNetwork ? "Saving..." : "Save group settings"}
             </button>
           </div>
         </div>
@@ -1481,9 +1509,9 @@
 
       {#if !inRoom}
         <div class="room-empty">
-          <p class="muted">Not connected to a Network yet.</p>
+          <p class="muted">Not connected to a group yet.</p>
           <div class="room-actions">
-            <button class="ghost" onclick={createRoom}>Create a Network</button>
+            <button class="ghost" onclick={createRoom}>Create a group</button>
           </div>
           <div class="divider"><span>or</span></div>
           <input
@@ -1501,8 +1529,8 @@
       {:else}
         {#if devicesExpanded}
           <div class="roster">
-            {#if devices.some((d) => d.is_self && d.is_admin)}
-              <button class="pair-btn" onclick={createPairingCode}>Add a device</button>
+            {#if isGroupAdmin}
+              <button class="pair-btn" onclick={openPairingCreator}>Add a device</button>
             {/if}
             {#if pendingJoins.length > 0}
               <div class="pending-joins">
@@ -1774,58 +1802,147 @@
     </div>
   {/if}
 
-  {#if showPairing && pairingUri}
+  {#if showPairing}
     <div
       class="pairing-overlay"
       role="button"
       tabindex="0"
-      onclick={() => (showPairing = false)}
+      onclick={closePairingDialog}
       onkeydown={(e) => {
-        if (e.key === "Escape" || e.key === "Enter") showPairing = false;
+        if (e.key === "Escape" || e.key === "Enter") closePairingDialog();
       }}
     >
       <div
         class="pairing-card"
-        role="presentation"
+        role="dialog"
+        tabindex="-1"
+        aria-modal="true"
+        aria-labelledby="pairing-title"
         onclick={(e) => e.stopPropagation()}
         onkeydown={(e) => e.stopPropagation()}
       >
-        <h3>Add a device to {networkName}</h3>
-        <p class="muted small">
-          {#if pairingIsPermanent}
-            Reusable until you revoke it. Every device still requires admin approval.
+        {#if pairingUri}
+          <div class="pairing-heading">
+            <div>
+              <span class="pairing-eyebrow" class:temporary={!pairingIsPermanent}>
+                {pairingIsPermanent ? "REUSABLE INVITATION" : "TEMPORARY INVITATION"}
+              </span>
+              <h3 id="pairing-title">Invitation ready</h3>
+            </div>
+            <span class="pairing-group-label">{networkName}</span>
+          </div>
+
+          <div class="pairing-validity" class:temporary={!pairingIsPermanent} role="status">
+            {#if pairingIsPermanent}
+              <svg class="pairing-validity-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M7.5 7.5h8.2a4.3 4.3 0 0 1 0 8.6H14" />
+                <path d="m16.5 5-2.5 2.5 2.5 2.5" />
+                <path d="M16.5 16.1H8.3a4.3 4.3 0 0 1 0-8.6H10" />
+                <path d="m7.5 18.6 2.5-2.5-2.5-2.5" />
+              </svg>
+              <div>
+                <strong>Works until revoked</strong>
+                <span>It can be reused, but every device still needs your approval.</span>
+              </div>
+            {:else}
+              <svg class="pairing-validity-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <circle cx="12" cy="12" r="8.5" />
+                <path d="M12 7.5V12l3 2" />
+              </svg>
+              <div>
+                <strong>{pairingExpiryLabel === "expired" ? "Invitation expired" : `Expires in ${pairingExpiryLabel}`}</strong>
+                <span>After that, no one can use this invitation to add another device. Devices already added stay in the group.</span>
+              </div>
+            {/if}
+          </div>
+
+          {#if pairingQrDataUrl}
+            <div class="pairing-qr-frame">
+              <img
+                class="pairing-qr"
+                src={pairingQrDataUrl}
+                alt="Pairing QR code"
+                width="148"
+                height="148"
+                draggable="false"
+              />
+            </div>
           {:else}
-            Temporary invitation · {pairingExpiryLabel} remaining. Approved devices stay paired.
+            <div class="pairing-qr-placeholder" role="status">Generating QR code…</div>
           {/if}
-        </p>
-        {#if pairingQrDataUrl}
-          <div class="pairing-qr-frame">
-            <img
-              class="pairing-qr"
-              src={pairingQrDataUrl}
-              alt="Pairing QR code"
-              width="148"
-              height="148"
-              draggable="false"
-            />
+          <code class="pair-code">{pairingUri}</code>
+          <div class="pairing-result-actions">
+            <button class="ghost" onclick={closePairingDialog}>Done</button>
+            <button
+              class="send-btn"
+              onclick={copyPairingCode}
+              disabled={pairingRefreshing || (!pairingIsPermanent && pairingSecondsLeft <= 0)}
+            >
+              {pairingIsPermanent || pairingSecondsLeft > 0 ? "Copy invitation" : "Expired"}
+            </button>
           </div>
         {:else}
-          <div class="pairing-qr-placeholder" role="status">Generating QR code…</div>
-        {/if}
-        <code class="pair-code">{pairingUri}</code>
-        <div class="pairing-actions">
-          <button class="ghost" onclick={copyPairingCode} disabled={pairingRefreshing}
-            >{pairingRefreshing ? "Working..." : "Copy invitation"}</button
-          >
-          <button class="ghost" onclick={() => createTemporaryPairingCode(600)} disabled={pairingRefreshing}
-            >Temporary · 10m</button
-          >
-          {#if pairingIsPermanent}
-            <button class="ghost" onclick={rotatePairingCode} disabled={pairingRefreshing}>Rotate</button>
+          <span class="pairing-eyebrow">ADD A DEVICE</span>
+          <h3 id="pairing-title">Invite a device to {networkName}</h3>
+          <p class="muted small pairing-intro">
+            Choose how long the invitation should work. You’ll approve the device before it joins the group.
+          </p>
+
+          <div class="pairing-option" class:temporary={pairingTemporary}>
+            <label class="pairing-checkbox-row">
+              <input type="checkbox" bind:checked={pairingTemporary} />
+              <span class="pairing-checkbox-copy">
+                <strong>Make this invitation temporary</strong>
+                <span>People can use it to add a device only until it expires.</span>
+              </span>
+            </label>
+            <button
+              type="button"
+              class="pairing-help"
+              aria-label="People can use a temporary invitation to add a device only until it expires. Devices already added remain in the group."
+              data-tooltip="Before it expires, someone can scan or open this invitation and ask you to add their device. After it expires, they can’t. Devices you already approved stay in the group."
+            >?</button>
+          </div>
+
+          {#if pairingTemporary}
+            <div class="pairing-expiry-picker">
+              <label for="pairing-duration">Invitation expires after</label>
+              <select id="pairing-duration" bind:value={pairingDurationSeconds}>
+                <option value={600}>10 minutes</option>
+                <option value={3600}>1 hour</option>
+                <option value={86400}>24 hours</option>
+                <option value={604800}>7 days</option>
+                <option value={2592000}>30 days</option>
+              </select>
+            </div>
+            <div class="pairing-temporary-preview" role="status">
+              <svg class="pairing-validity-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <circle cx="12" cy="12" r="8.5" />
+                <path d="M12 7.5V12l3 2" />
+              </svg>
+              <span><strong>Temporary mode is on.</strong> People can use this invitation only until its countdown ends.</span>
+            </div>
+          {:else}
+            <p class="pairing-permanent-note">
+              Reusable until revoked—best for adding your own devices.
+            </p>
           {/if}
-          <button class="revoke-btn" onclick={revokeVisiblePairingCode} disabled={pairingRefreshing}>Revoke</button>
-        </div>
-        <button class="send-btn" onclick={() => (showPairing = false)}>Done</button>
+
+          {#if pairingError}
+            <div class="pairing-error" role="alert">{pairingError}</div>
+          {/if}
+
+          <div class="pairing-setup-actions">
+            <button class="ghost" onclick={closePairingDialog} disabled={pairingRefreshing}>Cancel</button>
+            <button class="send-btn" onclick={generatePairingCode} disabled={pairingRefreshing}>
+              {pairingRefreshing
+                ? "Generating…"
+                : pairingTemporary
+                  ? "Generate temporary invitation"
+                  : "Generate invitation"}
+            </button>
+          </div>
+        {/if}
       </div>
     </div>
   {/if}
@@ -2217,7 +2334,7 @@
   }
   .settings-title {
     color: #a1a1aa;
-    font-size: 11px;
+    font-size: 12px;
     font-weight: 600;
   }
   .settings-row {
@@ -2402,7 +2519,7 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     color: var(--muted, #9898a5);
-    font-size: 11px;
+    font-size: 12px;
   }
   .pending-joins {
     display: flex;
@@ -2426,7 +2543,7 @@
   .pending-join-actions .send-btn {
     min-height: 30px;
     padding: 4px 9px;
-    font-size: 11px;
+    font-size: 12px;
   }
   .device-label {
     color: #d4d4d8;
@@ -2437,7 +2554,7 @@
   }
   .device-meta {
     color: #6b6b76;
-    font-size: 10px;
+    font-size: 12px;
   }
   .revoke-btn {
     background: transparent;
@@ -2445,7 +2562,7 @@
     color: #f87171;
     border-radius: 6px;
     padding: 4px 8px;
-    font-size: 11px;
+    font-size: 12px;
     cursor: pointer;
   }
   .revoke-btn:hover {
@@ -2514,7 +2631,7 @@
       0 12px 28px rgba(0, 0, 0, 0.38),
       inset 0 1px 0 rgba(255, 255, 255, 0.05);
     backdrop-filter: blur(14px);
-    font-size: 11px;
+    font-size: 12px;
     font-weight: 500;
     line-height: 1.35;
     opacity: 0;
@@ -2622,7 +2739,7 @@
   .transfer-meta,
   .transfer-message {
     color: #858590;
-    font-size: 10px;
+    font-size: 12px;
   }
   .transfer-track {
     height: 5px;
@@ -2667,7 +2784,7 @@
     font-size: 13px;
   }
   .small {
-    font-size: 11px;
+    font-size: 13px;
   }
   .room-actions {
     margin-top: 8px;
@@ -2678,7 +2795,7 @@
     gap: 8px;
     margin: 12px 0 8px;
     color: #3f3f46;
-    font-size: 11px;
+    font-size: 12px;
   }
   .divider::before,
   .divider::after {
@@ -2693,7 +2810,7 @@
     border-radius: 8px;
     color: #e4e4e7;
     padding: 7px 10px;
-    font-size: 11px;
+    font-size: 12px;
     outline: none;
     margin-bottom: 6px;
     width: 100%;
@@ -2736,7 +2853,7 @@
   }
   .files-title {
     color: var(--muted);
-    font-size: 11px;
+    font-size: 12px;
     font-weight: 700;
     letter-spacing: 0.04em;
     text-transform: uppercase;
@@ -2848,7 +2965,7 @@
   }
   .clip-meta {
     color: #5c5c66;
-    font-size: 10px;
+    font-size: 12px;
   }
   .clip-del {
     width: 32px;
@@ -2894,6 +3011,10 @@
     border-radius: 12px;
     padding: 20px;
     width: 86%;
+    max-height: calc(100% - 28px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
     display: flex;
     flex-direction: column;
     gap: 10px;
@@ -2908,7 +3029,7 @@
     border: 1px solid #2a2a32;
     border-radius: 6px;
     padding: 8px;
-    font-size: 10px;
+    font-size: 12px;
     color: #818cf8;
     word-break: break-all;
     user-select: text;
@@ -2937,16 +3058,235 @@
     place-items: center;
     border: 1px dashed #343440;
     color: #81818d;
-    font-size: 11px;
+    font-size: 12px;
   }
-  .pairing-actions {
+  .pairing-heading {
     display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
   }
-  .pairing-actions .ghost {
-    flex: 1 1 130px;
-    min-height: 36px;
+  .pairing-heading > div {
+    min-width: 0;
+  }
+  .pairing-eyebrow {
+    display: block;
+    margin-bottom: 4px;
+    color: var(--accent, #a3e635);
+    font-size: 12px;
+    font-weight: 900;
+    letter-spacing: 0.12em;
+    line-height: 1.2;
+  }
+  .pairing-eyebrow.temporary {
+    color: #f3b562;
+  }
+  .pairing-group-label {
+    max-width: 42%;
+    overflow: hidden;
+    padding: 5px 8px;
+    border: 1px solid var(--line-soft, #343440);
+    border-radius: 999px;
+    color: var(--muted, #858590);
+    font-size: 12px;
+    font-weight: 800;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .pairing-intro {
+    margin: -2px 0 2px;
+    line-height: 1.45;
+  }
+  .pairing-option {
+    position: relative;
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 11px 10px;
+    border: 1px solid var(--line-soft, #343440);
+    border-radius: 14px;
+    background: var(--field, #121217);
+    transition:
+      border-color 0.16s ease,
+      background 0.16s ease;
+  }
+  .pairing-option.temporary {
+    border-color: rgba(243, 181, 98, 0.52);
+    background: rgba(243, 181, 98, 0.08);
+  }
+  .pairing-checkbox-row {
+    display: flex;
+    flex: 1;
+    align-items: flex-start;
+    gap: 9px;
+    min-width: 0;
+    cursor: pointer;
+  }
+  .pairing-checkbox-row input {
+    flex: 0 0 auto;
+    width: 16px;
+    height: 16px;
+    margin: 1px 0 0;
+    accent-color: var(--accent, #a3e635);
+  }
+  .pairing-checkbox-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-width: 0;
+  }
+  .pairing-checkbox-copy strong {
+    color: var(--text-strong, #f4f4f5);
+    font-size: 13px;
+    line-height: 1.25;
+  }
+  .pairing-checkbox-copy > span {
+    color: var(--muted, #858590);
+    font-size: 13px;
+    line-height: 1.35;
+  }
+  .pairing-help {
+    position: relative;
+    flex: 0 0 auto;
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    border: 1px solid var(--line-soft, #343440);
+    border-radius: 50%;
+    background: transparent;
+    color: var(--muted, #858590);
+    font-size: 12px;
+    font-weight: 900;
+    line-height: 18px;
+    cursor: help;
+  }
+  .pairing-help::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    right: -4px;
+    bottom: calc(100% + 8px);
+    z-index: 2;
+    width: 220px;
+    padding: 8px 9px;
+    border: 1px solid var(--line, #343440);
+    border-radius: 9px;
+    background: var(--panel-raised, #202026);
+    box-shadow: 0 10px 24px rgba(0, 0, 0, 0.32);
+    color: var(--text-strong, #f4f4f5);
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1.4;
+    text-align: left;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(3px);
+    transition:
+      opacity 0.14s ease,
+      transform 0.14s ease;
+  }
+  .pairing-help:hover::after,
+  .pairing-help:focus-visible::after {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  .pairing-expiry-picker {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 116px;
+    align-items: center;
+    gap: 10px;
+  }
+  .pairing-expiry-picker label {
+    color: var(--text-strong, #f4f4f5);
+    font-size: 12px;
+    font-weight: 800;
+  }
+  .pairing-expiry-picker select {
+    min-width: 0;
+    height: 32px;
+    padding: 0 8px;
+    border: 1px solid var(--line-soft, #343440);
+    border-radius: 9px;
+    background: var(--field-strong, #121217);
+    color: var(--text-strong, #f4f4f5);
+    font: inherit;
+    font-size: 12px;
+  }
+  .pairing-validity,
+  .pairing-temporary-preview {
+    display: flex;
+    align-items: flex-start;
+    gap: 9px;
+    padding: 9px 10px;
+    border: 1px solid var(--line-soft, #343440);
+    border-radius: 12px;
+    background: var(--field, #121217);
+  }
+  .pairing-validity.temporary,
+  .pairing-temporary-preview {
+    border-color: rgba(243, 181, 98, 0.5);
+    background: rgba(243, 181, 98, 0.08);
+  }
+  .pairing-validity-icon {
+    flex: 0 0 auto;
+    width: 18px;
+    height: 18px;
+    stroke: var(--accent, #a3e635);
+    stroke-width: 1.8;
+    fill: none;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .pairing-validity.temporary .pairing-validity-icon,
+  .pairing-temporary-preview .pairing-validity-icon {
+    stroke: #f3b562;
+  }
+  .pairing-validity > div {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .pairing-validity strong,
+  .pairing-temporary-preview strong {
+    color: var(--text-strong, #f4f4f5);
+    font-size: 13px;
+  }
+  .pairing-validity span,
+  .pairing-temporary-preview > span {
+    color: var(--muted, #858590);
+    font-size: 12px;
+    line-height: 1.35;
+  }
+  .pairing-permanent-note {
+    margin: 0;
+    padding: 0 2px;
+    color: var(--muted, #858590);
+    font-size: 12px;
+    line-height: 1.4;
+  }
+  .pairing-error {
+    padding: 8px 10px;
+    border: 1px solid var(--danger-line, rgba(248, 113, 113, 0.4));
+    border-radius: 10px;
+    background: var(--danger-panel, rgba(127, 29, 29, 0.22));
+    color: var(--danger, #f87171);
+    font-size: 12px;
+    line-height: 1.35;
+  }
+  .pairing-setup-actions,
+  .pairing-result-actions {
+    display: grid;
+    grid-template-columns: minmax(0, 0.75fr) minmax(0, 1.4fr);
+    gap: 8px;
+    margin-top: 2px;
+  }
+  .pairing-setup-actions button,
+  .pairing-result-actions button {
+    width: 100%;
+    min-width: 0;
+  }
+  .pair-code {
+    max-height: 72px;
+    overflow: auto;
   }
   .confirm-dialog {
     width: 84%;
@@ -3003,7 +3343,7 @@
   }
   .recipient-section-title {
     color: var(--muted, #858590);
-    font-size: 10px;
+    font-size: 12px;
     font-weight: 700;
     letter-spacing: 0.08em;
   }
@@ -3046,7 +3386,7 @@
   }
   .recipient-meta {
     color: #858590;
-    font-size: 10px;
+    font-size: 12px;
     font-variant-numeric: tabular-nums;
   }
   .dialog-actions {
@@ -3145,7 +3485,7 @@
   }
   .toast-sender {
     display: block;
-    font-size: 11px;
+    font-size: 12px;
     opacity: 0.8;
   }
   .toast-preview {
@@ -3158,7 +3498,7 @@
   }
   .toast-hint {
     display: block;
-    font-size: 10px;
+    font-size: 12px;
     opacity: 0.7;
     margin-top: 3px;
   }
@@ -4331,7 +4671,7 @@
   .tab {
     height: 28px;
     padding: 0 11px;
-    font-size: 11px;
+    font-size: 12px;
   }
   .window-actions {
     gap: 8px;
@@ -4359,7 +4699,7 @@
     margin-bottom: 8px;
   }
   .settings-title {
-    font-size: 11px;
+    font-size: 12px;
   }
   .settings-input,
   .settings-textarea {
@@ -4486,13 +4826,13 @@
     font-size: 13px;
   }
   .device-meta {
-    font-size: 9.5px;
+    font-size: 12px;
   }
   .revoke-btn {
     padding: 3px 4px;
     border: 0;
     background: transparent;
-    font-size: 10px;
+    font-size: 12px;
     font-weight: 400;
   }
   .unpair-btn {
@@ -4504,7 +4844,7 @@
     border-radius: 0;
     background: transparent;
     color: var(--danger);
-    font-size: 11px;
+    font-size: 12px;
     font-weight: 400;
     text-align: left;
     cursor: pointer;
@@ -4590,7 +4930,7 @@
   }
   .clip-action {
     color: var(--accent);
-    font-size: 10px;
+    font-size: 12px;
     line-height: 1;
   }
   .clip-text {
@@ -4606,7 +4946,7 @@
     display: block;
   }
   .clip-meta {
-    font-size: 10px;
+    font-size: 12px;
     line-height: 1.1;
   }
   .clip-del {
@@ -4648,7 +4988,7 @@
   }
   .transfer-file {
     min-width: 0;
-    font-size: 11.5px;
+    font-size: 12px;
     line-height: 1.1;
   }
   .transfer-progress {
@@ -4657,7 +4997,7 @@
     justify-content: flex-end;
     gap: 4px;
     color: var(--muted);
-    font-size: 10.5px;
+    font-size: 12px;
     line-height: 1;
     white-space: nowrap;
   }
@@ -4668,7 +5008,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: 9.5px;
+    font-size: 12px;
     line-height: 1.05;
   }
   .transfer-cancel {
@@ -4684,7 +5024,7 @@
   .status {
     padding: 7px 10px;
     border-radius: 13px;
-    font-size: 11px;
+    font-size: 12px;
   }
   .drop-target {
     width: calc(100% - 44px);
@@ -4719,7 +5059,7 @@
     border: 0;
     background: transparent;
     color: var(--mint);
-    font-size: 10px;
+    font-size: 12px;
     line-height: 1;
     letter-spacing: 0.04em;
   }
@@ -4878,7 +5218,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: 10px;
+    font-size: 12px;
     font-weight: 800;
   }
   .settings-menu {
@@ -4914,6 +5254,52 @@
   .group-add {
     min-width: 52px;
   }
+  .group-invitation-setting {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 10px;
+    border: 1px solid var(--line-soft);
+    border-radius: 13px;
+    background: var(--field);
+  }
+  .group-invitation-setting > div {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+  .group-invitation-setting strong {
+    color: var(--text-strong);
+    font-size: 12px;
+  }
+  .group-invitation-setting span {
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.3;
+  }
+  .group-invitation-revoke {
+    height: 28px;
+    padding: 0 9px;
+    border: 1px solid var(--danger-line);
+    border-radius: 999px;
+    background: var(--danger-panel);
+    color: var(--danger);
+    font: inherit;
+    font-size: 12px;
+    font-weight: 800;
+    cursor: pointer;
+  }
+  .group-invitation-revoke:hover:not(:disabled),
+  .group-invitation-revoke:focus-visible {
+    border-color: var(--danger);
+    outline: none;
+  }
+  .group-invitation-revoke:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
   .group-remove {
     align-self: flex-start;
     padding: 0;
@@ -4921,7 +5307,7 @@
     background: transparent;
     color: var(--danger);
     font: inherit;
-    font-size: 10px;
+    font-size: 12px;
     cursor: pointer;
   }
   .group-remove:hover,

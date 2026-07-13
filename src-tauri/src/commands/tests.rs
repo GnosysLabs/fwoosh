@@ -53,7 +53,7 @@ async fn require_admin_roster_rejects_a_non_admin_device() {
         require_admin_roster(&state, "test authorization")
             .await
             .unwrap_err(),
-        "only the network admin can test authorization"
+        "only the group admin can test authorization"
     );
 }
 

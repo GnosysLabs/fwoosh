@@ -17,7 +17,7 @@ pub mod sync_groups;
 pub use pairing_commands::{
     approve_join_request, create_temporary_pairing_code, join_room, join_sync_group,
     load_invitations_from_keychain, new_pairing_code, pending_join_requests, reject_join_request,
-    revoke_pairing_code, rotate_pairing_code,
+    revoke_pairing_code, revoke_permanent_pairing_code, rotate_pairing_code,
 };
 use pairing_commands::{current_network_identity, issue_pairing_code, persist_invitations};
 use sync_groups::{
@@ -113,9 +113,9 @@ async fn require_admin_roster(
         .lock()
         .await
         .clone()
-        .ok_or_else(|| "not in a network".to_string())?;
+        .ok_or_else(|| "not in a group".to_string())?;
     if state.device.signing_pub != verified.entry.admin_id {
-        return Err(format!("only the network admin can {action}"));
+        return Err(format!("only the group admin can {action}"));
     }
     Ok(verified)
 }
@@ -282,12 +282,12 @@ pub async fn send_clip(
         .await
         .active_sync_group_id
         .clone()
-        .ok_or_else(|| "no default Network is configured".to_string())?;
+        .ok_or_else(|| "no default group is configured".to_string())?;
     if network_id
         .as_ref()
         .is_some_and(|requested| requested != &default_network_id)
     {
-        return Err("selected Network is not available".to_string());
+        return Err("selected group is not available".to_string());
     }
     let guard = state.roster.lock().await;
     let verified = guard.as_ref().ok_or("not in a room")?;

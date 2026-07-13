@@ -1,7 +1,7 @@
-//! Versioned product-domain types for Networks, invitations, and direct contacts.
+//! Versioned product-domain types for groups, invitations, and direct contacts.
 //!
-//! A Network is a persistent clipboard-sync trust domain. A Contact (shown as
-//! "People" in the UI) is deliberately not a Network member and can only be a
+//! A group is a persistent clipboard-sync trust domain. A Contact (shown as
+//! "People" in the UI) is deliberately not a group member and can only be a
 //! recipient of an explicit direct share.
 
 use crate::crypto::{Ed25519PubKey, X25519PubKey};
@@ -16,7 +16,7 @@ pub type NetworkId = String;
 pub type InvitationId = String;
 pub type ContactId = String;
 
-/// Metadata that remains stable while a Network's relay topic rotates.
+/// Metadata that remains stable while a group's relay topic rotates.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NetworkMetadata {
     pub id: NetworkId,
@@ -24,7 +24,7 @@ pub struct NetworkMetadata {
     pub created_at: u64,
 }
 
-/// A durable device-sync invitation owned by a Network admin.
+/// A durable device-sync invitation owned by a group admin.
 ///
 /// `secret` is serialized only into the OS-keychain-backed invitation blob.
 /// It must never be written to ordinary settings or roster files.
@@ -58,20 +58,20 @@ impl InvitationRecord {
     }
 }
 
-/// A direct-share contact. Contacts never appear in a Network roster.
+/// A direct-share contact. Contacts never appear in a group roster.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContactRecord {
     pub id: ContactId,
     pub label: String,
     pub signing_pub: Ed25519PubKey,
     pub x25519_pub: X25519PubKey,
-    /// Pairwise relay topic, unrelated to every Network topic.
+    /// Pairwise relay topic, unrelated to every group topic.
     pub topic: String,
     pub created_at: u64,
 }
 
 /// Explicit file/direct-share destinations. Clipboard commands intentionally
-/// accept a `NetworkId` instead of this enum, making `Person` unrepresentable.
+/// accept a group `NetworkId` instead of this enum, making `Person` unrepresentable.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DirectRecipientRef {

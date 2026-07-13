@@ -32,6 +32,27 @@ pub(super) async fn persist_invitations(state: &Arc<AppState>) -> Result<(), Str
     crate::keychain::save_invitation_blob(&blob).map_err(|e| e.to_string())
 }
 
+async fn remove_pairing_invitations(
+    state: &Arc<AppState>,
+    invite_ids: Vec<String>,
+) -> Result<usize, String> {
+    let removed_ids = {
+        let mut invitations = state.invitations.lock().await;
+        invite_ids
+            .into_iter()
+            .filter(|id| invitations.remove(id).is_some())
+            .collect::<Vec<_>>()
+    };
+    if removed_ids.is_empty() {
+        return Ok(0);
+    }
+    for id in &removed_ids {
+        stop_auxiliary_subscriber(state, &format!("invite:{id}")).await;
+    }
+    persist_invitations(state).await?;
+    Ok(removed_ids.len())
+}
+
 pub(super) async fn current_network_identity(
     state: &Arc<AppState>,
 ) -> Result<(String, String), String> {
@@ -39,13 +60,13 @@ pub(super) async fn current_network_identity(
     let id = settings
         .active_sync_group_id
         .clone()
-        .ok_or_else(|| "network has no stable id".to_string())?;
+        .ok_or_else(|| "group has no stable id".to_string())?;
     let name = settings
         .sync_groups
         .iter()
         .find(|group| group.id == id)
         .map(|group| group.name.clone())
-        .ok_or_else(|| "active Network metadata is missing".to_string())?;
+        .ok_or_else(|| "active group metadata is missing".to_string())?;
     Ok((id, name))
 }
 
@@ -143,31 +164,34 @@ pub async fn rotate_pairing_code(
     require_admin_roster(state.inner(), "rotate invitations").await?;
     let (network_id, _) = current_network_identity(state.inner()).await?;
     let revoked_ids = {
-        let mut invitations = state.invitations.lock().await;
-        let ids: Vec<String> = invitations
+        let invitations = state.invitations.lock().await;
+        invitations
             .values()
             .filter(|invite| invite.network_id == network_id && invite.expires_at.is_none())
             .map(|invite| invite.id.clone())
-            .collect();
-        for id in &ids {
-            invitations.remove(id);
-        }
-        ids
+            .collect()
     };
-    for id in revoked_ids {
-        if let Some(tx) = state
-            .auxiliary_subscriber_shutdowns
-            .lock()
-            .await
-            .remove(&format!("invite:{id}"))
-        {
-            let _ = tx.send(());
-        }
-    }
-    persist_invitations(state.inner()).await?;
+    remove_pairing_invitations(state.inner(), revoked_ids).await?;
     let code = issue_pairing_code(state.inner(), None, false).await?;
     start_invitation_subscribers(state.inner(), app).await;
     Ok(code)
+}
+
+#[tauri::command]
+pub async fn revoke_permanent_pairing_code(
+    state: State<'_, Arc<AppState>>,
+) -> Result<bool, String> {
+    require_admin_roster(state.inner(), "revoke invitations").await?;
+    let (network_id, _) = current_network_identity(state.inner()).await?;
+    let invite_ids = {
+        let invitations = state.invitations.lock().await;
+        invitations
+            .values()
+            .filter(|invite| invite.network_id == network_id && invite.expires_at.is_none())
+            .map(|invite| invite.id.clone())
+            .collect()
+    };
+    Ok(remove_pairing_invitations(state.inner(), invite_ids).await? > 0)
 }
 
 #[tauri::command]
@@ -176,21 +200,7 @@ pub async fn revoke_pairing_code(
     invite_id: String,
 ) -> Result<(), String> {
     require_admin_roster(state.inner(), "revoke invitations").await?;
-    let changed = {
-        let mut invitations = state.invitations.lock().await;
-        invitations.remove(&invite_id).is_some()
-    };
-    if changed {
-        persist_invitations(state.inner()).await?;
-    }
-    if let Some(tx) = state
-        .auxiliary_subscriber_shutdowns
-        .lock()
-        .await
-        .remove(&format!("invite:{invite_id}"))
-    {
-        let _ = tx.send(());
-    }
+    remove_pairing_invitations(state.inner(), vec![invite_id]).await?;
     Ok(())
 }
 

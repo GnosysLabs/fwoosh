@@ -219,6 +219,7 @@ pub fn run() {
             commands::pairing_commands::create_temporary_pairing_code,
             commands::pairing_commands::rotate_pairing_code,
             commands::pairing_commands::revoke_pairing_code,
+            commands::pairing_commands::revoke_permanent_pairing_code,
             commands::pairing_commands::pending_join_requests,
             commands::pairing_commands::approve_join_request,
             commands::pairing_commands::reject_join_request,
