@@ -1,9 +1,10 @@
 # Fwoosh
 
 A free, open-source, **end-to-end-encrypted clipboard sync and P2P file
-sharing** app for Windows & macOS. Pop a small text box out of the tray/dock
-with `Ctrl/Cmd+Shift+V`, paste, and it becomes available on all your paired
-devices — instantly, with **zero servers to run**.
+sharing** app for Windows, macOS, and Linux (planned). Pop a small text box
+out of the tray/dock with `Ctrl/Cmd+Shift+V`, paste, and it becomes available
+on all your paired devices, instantly, using the free public
+[ntfy.sh](https://ntfy.sh) relay. **No servers to set up.**
 
 - **Transport:** the public [ntfy.sh](https://ntfy.sh) relay by default
   (self-hostable) for encrypted clips and file-transfer signaling; P2P file
@@ -12,7 +13,8 @@ devices — instantly, with **zero servers to run**.
   wrapping (RFC 9180) + Ed25519 signatures + an append-only, signed roster log
   with epochs and revocation. File transfers use their own encrypted chunk
   stream plus checksum verification.
-- **Cost:** $0 to run. No accounts, no central database or file storage.
+- **Cost:** $0 to run. Uses the free public [ntfy.sh](https://ntfy.sh) relay by
+  default. No accounts, no central database or file storage.
 
 ## How it works
 
@@ -24,8 +26,8 @@ devices — instantly, with **zero servers to run**.
        └────────────── paired via QR (proof-of-knowledge) ───────────────┘
 ```
 
-1. **Pair** — the first device creates a room and shows a single-use pairing
-   code. Other devices paste it; the join is authenticated with an HMAC
+1. **Pair** — the first device creates a Sync Group and shows a single-use QR
+   code plus a copyable pairing URI. Other devices scan or paste it; the join is authenticated with an HMAC
    proof-of-knowledge so eavesdroppers can't inject bogus devices.
 2. **Send** — press `Ctrl/Cmd+Shift+V`, paste into the popup, hit Enter. The
    clip is encrypted (one fresh content key per clip, wrapped per recipient
@@ -41,11 +43,12 @@ devices — instantly, with **zero servers to run**.
 **Working:** crypto core, roster epochs, HMAC-authenticated pairing, encrypted
 history, keychain storage, ntfy transport, replay cache, tray/hotkey, manual
 send UI, P2P file transfers, and admin revocation with encrypted topic-rotation
-notice.
+notice. Multiple named Sync Groups keep membership, relay topics, and history
+separate, with an active-group switcher for deliberate sends.
 
-**Still before public MVP:** QR scanning, custom relay settings UI, pause sync,
-full room-repair UX, installer packaging via Tauri bundling, and cargo/npm audit
-automation in CI.
+**Planned for release:** mobile companion app, Linux support, QR scanning,
+custom relay settings UI, pause sync, full room-repair UX, signed and notarized
+installer releases, and a cross-device installed-app smoke test.
 
 | Area | State |
 |---|---|
@@ -54,10 +57,11 @@ automation in CI.
 | Encrypted history (`store.rs`) | 6 tests |
 | OS keychain (`keychain.rs`) | OS keychain by default; file fallback only by explicit dev opt-in |
 | ntfy transport (`ntfy.rs`) | ✅ 7 tests |
-| Pairing (`pairing.rs`) | ✅ 8 tests |
+| Pairing (`pairing.rs`) | ✅ 8 tests plus scannable QR generation |
+| Sync Groups | Named groups, isolated roster files/history, legacy-room migration, active-group switching |
 | P2P file transfer (`commands.rs`) | WebRTC data channels; streamed encrypted chunks; configurable timeout |
 | Desktop shell (tray, hotkey, popup UI) | ✅ builds |
-| CI / release pipeline | Tests plus cargo/npm audit in CI; release workflow written |
+| CI / release pipeline | Tests plus cargo/npm audit in CI; installer publishing and signing remain before public release |
 
 ## Threat model (honest)
 
@@ -84,6 +88,7 @@ automation in CI.
 - Rust (stable), Node.js 20+, npm
 - Windows: a complete VS 2022/2026 C++ workload (or use CI)
 - macOS: Xcode command-line tools
+- Linux: GCC, pkg-config, and development headers for DBus/Secret Service
 
 ### Run in dev
 ```bash
@@ -144,3 +149,8 @@ src/routes/+page.svelte   the popup UI (Svelte + Tailwind)
 ## License
 
 MIT.
+
+## Legal documents
+
+- [Privacy Policy](docs/privacy-policy.md)
+- [Terms of Use](docs/terms-of-use.md)

@@ -57,6 +57,7 @@ const FILE_SIGNAL_PREFIX: &str = "fwoosh-file-signal-v1:";
 const DEFAULT_STUN_SERVER: &str = "stun:stun.cloudflare.com:3478";
 const MAX_STUN_SERVERS: usize = 4;
 const MAX_DEVICE_LABEL_CHARS: usize = 48;
+const MAX_SYNC_GROUP_NAME_CHARS: usize = 48;
 const FILE_CHUNK_SIZE: usize = 8 * 1024;
 const MAX_ACTIVE_FILE_TRANSFERS: usize = 8;
 const FILE_GRANT_TTL_SECS: u64 = 60;
@@ -94,6 +95,8 @@ pub struct AppState {
     pub pairing_secret: Mutex<Option<PendingPairingSecret>>,
     /// Path to the persisted roster file (set at startup).
     pub roster_path: Mutex<Option<std::path::PathBuf>>,
+    /// Directory containing one verified roster chain per sync group.
+    pub groups_dir: Mutex<Option<std::path::PathBuf>>,
     /// Path to app settings JSON (set at startup).
     pub settings_path: Mutex<Option<std::path::PathBuf>>,
     /// Local user settings such as display label and STUN servers.
@@ -137,6 +140,7 @@ impl AppState {
             pending_admin: Mutex::new(None),
             pairing_secret: Mutex::new(None),
             roster_path: Mutex::new(None),
+            groups_dir: Mutex::new(None),
             settings_path: Mutex::new(None),
             settings: Mutex::new(AppSettings::default()),
             file_transfers: Mutex::new(HashMap::new()),
@@ -152,6 +156,16 @@ pub struct AppSettings {
     pub stun_servers: Vec<String>,
     #[serde(default = "default_file_transfer_timeout_minutes")]
     pub transfer_timeout_minutes: u64,
+    #[serde(default)]
+    pub sync_groups: Vec<SyncGroupConfig>,
+    #[serde(default)]
+    pub active_sync_group_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SyncGroupConfig {
+    pub id: String,
+    pub name: String,
 }
 
 impl Default for AppSettings {
@@ -160,8 +174,19 @@ impl Default for AppSettings {
             device_label: None,
             stun_servers: vec![DEFAULT_STUN_SERVER.to_string()],
             transfer_timeout_minutes: DEFAULT_FILE_TRANSFER_TIMEOUT_MINUTES,
+            sync_groups: Vec::new(),
+            active_sync_group_id: None,
         }
     }
+}
+
+#[derive(Serialize)]
+pub struct SyncGroupDto {
+    pub id: String,
+    pub name: String,
+    pub active: bool,
+    pub connected: bool,
+    pub member_count: usize,
 }
 
 #[derive(Serialize)]
@@ -500,10 +525,30 @@ pub fn load_settings(path: &Path) -> AppSettings {
             if normalize_transfer_timeout_minutes(settings.transfer_timeout_minutes).is_err() {
                 settings.transfer_timeout_minutes = DEFAULT_FILE_TRANSFER_TIMEOUT_MINUTES;
             }
+            settings.sync_groups.retain(|group| {
+                is_valid_sync_group_id(&group.id) && sanitize_sync_group_name(&group.name).is_ok()
+            });
+            for group in &mut settings.sync_groups {
+                if let Ok(name) = sanitize_sync_group_name(&group.name) {
+                    group.name = name;
+                }
+            }
+            if settings
+                .active_sync_group_id
+                .as_ref()
+                .is_none_or(|active| !settings.sync_groups.iter().any(|group| &group.id == active))
+            {
+                settings.active_sync_group_id = settings.sync_groups.first().map(|group| group.id.clone());
+            }
             settings
         }
         Err(_) => AppSettings::default(),
     }
+}
+
+pub fn save_settings(path: &Path, settings: &AppSettings) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(settings).map_err(|e| e.to_string())?;
+    std::fs::write(path, bytes).map_err(|e| e.to_string())
 }
 
 async fn persist_settings(state: &Arc<AppState>) -> Result<(), String> {
@@ -511,8 +556,66 @@ async fn persist_settings(state: &Arc<AppState>) -> Result<(), String> {
         return Ok(());
     };
     let settings = state.settings.lock().await.clone();
-    let bytes = serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?;
-    std::fs::write(path, bytes).map_err(|e| e.to_string())
+    save_settings(&path, &settings)
+}
+
+fn new_sync_group_id() -> String {
+    let mut id = [0u8; 16];
+    rand::rng().fill_bytes(&mut id);
+    hex::encode(id)
+}
+
+fn is_valid_sync_group_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn sanitize_sync_group_name(name: &str) -> Result<String, String> {
+    let compact = name.split_whitespace().collect::<Vec<_>>().join(" ");
+    let name: String = compact.chars().take(MAX_SYNC_GROUP_NAME_CHARS).collect();
+    if name.is_empty() {
+        return Err("sync group name cannot be empty".to_string());
+    }
+    Ok(name)
+}
+
+fn group_roster_path(groups_dir: &Path, group_id: &str) -> Result<PathBuf, String> {
+    if !is_valid_sync_group_id(group_id) {
+        return Err("invalid sync group id".to_string());
+    }
+    Ok(groups_dir.join(format!("{group_id}.bin")))
+}
+
+pub fn prepare_sync_groups(
+    settings: &mut AppSettings,
+    groups_dir: &Path,
+    legacy_roster_path: &Path,
+) -> Result<Option<(PathBuf, Option<VerifiedRoster>)>, String> {
+    std::fs::create_dir_all(groups_dir).map_err(|e| e.to_string())?;
+
+    if settings.sync_groups.is_empty() {
+        if let Some(legacy_roster) = load_persisted_roster(legacy_roster_path) {
+            let id = new_sync_group_id();
+            let path = group_roster_path(groups_dir, &id)?;
+            std::fs::copy(legacy_roster_path, &path).map_err(|e| e.to_string())?;
+            settings.sync_groups.push(SyncGroupConfig {
+                id: id.clone(),
+                name: "My devices".to_string(),
+            });
+            settings.active_sync_group_id = Some(id);
+            return Ok(Some((path, Some(legacy_roster))));
+        }
+        return Ok(None);
+    }
+
+    let active_id = settings
+        .active_sync_group_id
+        .clone()
+        .filter(|id| settings.sync_groups.iter().any(|group| &group.id == id))
+        .unwrap_or_else(|| settings.sync_groups[0].id.clone());
+    settings.active_sync_group_id = Some(active_id.clone());
+    let path = group_roster_path(groups_dir, &active_id)?;
+    let roster = load_persisted_roster(&path);
+    Ok(Some((path, roster)))
 }
 
 fn sanitize_device_label(label: &str) -> Result<String, String> {
@@ -770,6 +873,199 @@ pub struct DeviceDto {
     pub can_revoke: bool,
 }
 
+async fn configured_groups_dir(state: &Arc<AppState>) -> Result<PathBuf, String> {
+    state
+        .groups_dir
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| "sync group storage is not initialized".to_string())
+}
+
+async fn current_sync_group_id(state: &Arc<AppState>) -> Result<String, String> {
+    state
+        .settings
+        .lock()
+        .await
+        .active_sync_group_id
+        .clone()
+        .ok_or_else(|| "no sync group is active".to_string())
+}
+
+async fn ensure_active_sync_group(
+    state: &Arc<AppState>,
+    default_name: &str,
+) -> Result<String, String> {
+    let existing = {
+        let settings = state.settings.lock().await;
+        settings.active_sync_group_id.clone().filter(|active| {
+            settings.sync_groups.iter().any(|group| &group.id == active)
+        })
+    };
+    if let Some(existing) = existing {
+        return Ok(existing);
+    }
+
+    let id = new_sync_group_id();
+    let name = sanitize_sync_group_name(default_name)?;
+    {
+        let mut settings = state.settings.lock().await;
+        settings.sync_groups.push(SyncGroupConfig {
+            id: id.clone(),
+            name,
+        });
+        settings.active_sync_group_id = Some(id.clone());
+    }
+    let groups_dir = configured_groups_dir(state).await?;
+    *state.roster_path.lock().await = Some(group_roster_path(&groups_dir, &id)?);
+    persist_settings(state).await?;
+    Ok(id)
+}
+
+async fn stop_active_group_runtime(state: &Arc<AppState>) {
+    if let Some(tx) = state.subscriber_shutdown.lock().await.take() {
+        let _ = tx.send(());
+    }
+    *state.roster.lock().await = None;
+    *state.pending_admin.lock().await = None;
+    *state.pairing_secret.lock().await = None;
+    state.pending.lock().await.clear();
+}
+
+async fn activate_sync_group(
+    state: &Arc<AppState>,
+    app: &tauri::AppHandle,
+    group_id: &str,
+) -> Result<(), String> {
+    if !state.file_transfers.lock().await.is_empty() {
+        return Err("finish or cancel active file transfers before switching groups".to_string());
+    }
+    let group_exists = state
+        .settings
+        .lock()
+        .await
+        .sync_groups
+        .iter()
+        .any(|group| group.id == group_id);
+    if !group_exists {
+        return Err("sync group not found".to_string());
+    }
+
+    stop_active_group_runtime(state).await;
+    let groups_dir = configured_groups_dir(state).await?;
+    let roster_path = group_roster_path(&groups_dir, group_id)?;
+    let roster = load_persisted_roster(&roster_path);
+    let topic = roster.as_ref().map(|verified| verified.topic().to_string());
+    *state.roster_path.lock().await = Some(roster_path);
+    *state.roster.lock().await = roster;
+    state.settings.lock().await.active_sync_group_id = Some(group_id.to_string());
+    persist_settings(state).await?;
+
+    if let Some(topic) = topic {
+        start_subscriber(state, app.clone(), &topic).await;
+    }
+    let _ = app.emit("sync-group-changed", group_id);
+    let _ = app.emit("roster-updated", ());
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn sync_groups(state: State<'_, Arc<AppState>>) -> Result<Vec<SyncGroupDto>, String> {
+    let settings = state.settings.lock().await.clone();
+    let groups_dir = configured_groups_dir(state.inner()).await?;
+    let active_id = settings.active_sync_group_id.as_deref();
+    let mut out = Vec::with_capacity(settings.sync_groups.len());
+    for group in settings.sync_groups {
+        let active = active_id == Some(group.id.as_str());
+        let roster = if active {
+            state.roster.lock().await.clone()
+        } else {
+            let path = group_roster_path(&groups_dir, &group.id)?;
+            load_persisted_roster(&path)
+        };
+        out.push(SyncGroupDto {
+            id: group.id,
+            name: group.name,
+            active,
+            connected: roster.is_some(),
+            member_count: roster
+                .as_ref()
+                .map(|verified| verified.entry.devices.len())
+                .unwrap_or(0),
+        });
+    }
+    Ok(out)
+}
+
+#[tauri::command]
+pub async fn switch_sync_group(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    group_id: String,
+) -> Result<(), String> {
+    activate_sync_group(state.inner(), &app, group_id.trim()).await
+}
+
+#[tauri::command]
+pub async fn rename_sync_group(
+    state: State<'_, Arc<AppState>>,
+    group_id: String,
+    name: String,
+) -> Result<(), String> {
+    let name = sanitize_sync_group_name(&name)?;
+    let mut settings = state.settings.lock().await;
+    let group = settings
+        .sync_groups
+        .iter_mut()
+        .find(|group| group.id == group_id)
+        .ok_or_else(|| "sync group not found".to_string())?;
+    group.name = name;
+    drop(settings);
+    persist_settings(state.inner()).await
+}
+
+async fn create_roster_for_active_group(
+    state: &Arc<AppState>,
+    app: tauri::AppHandle,
+    label: String,
+) -> Result<PairingCodeDto, String> {
+    let label = sanitize_device_label(&label).unwrap_or_else(|_| detected_device_label());
+    let topic = roster::new_topic();
+    let genesis = roster::build_genesis(&state.device, &label, &topic);
+    let signed = roster::sign_and_chain(&state.device, genesis, None).map_err(|e| e.to_string())?;
+    let verified = VerifiedRoster::verify_first(signed.clone()).map_err(|e| e.to_string())?;
+    *state.roster.lock().await = Some(verified);
+    persist_roster(state, &signed).await;
+    start_subscriber(state, app.clone(), &topic).await;
+    broadcast_roster(state, &signed, &topic).await;
+    let _ = app.emit("sync-groups-updated", ());
+    Ok(issue_pairing_code(state, &topic).await)
+}
+
+#[tauri::command]
+pub async fn create_sync_group(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    name: String,
+    label: String,
+) -> Result<PairingCodeDto, String> {
+    let name = sanitize_sync_group_name(&name)?;
+    let id = new_sync_group_id();
+    {
+        let mut settings = state.settings.lock().await;
+        if settings.sync_groups.len() >= 32 {
+            return Err("at most 32 sync groups are supported".to_string());
+        }
+        settings.sync_groups.push(SyncGroupConfig {
+            id: id.clone(),
+            name,
+        });
+    }
+    persist_settings(state.inner()).await?;
+    activate_sync_group(state.inner(), &app, &id).await?;
+    create_roster_for_active_group(state.inner(), app, label).await
+}
+
 #[tauri::command]
 pub async fn room_state(state: State<'_, Arc<AppState>>) -> Result<RoomState, String> {
     let guard = state.roster.lock().await;
@@ -818,23 +1114,8 @@ pub async fn create_room(
     app: tauri::AppHandle,
     label: String,
 ) -> Result<PairingCodeDto, String> {
-    let label = sanitize_device_label(&label).unwrap_or_else(|_| detected_device_label());
-    let topic = roster::new_topic();
-    let genesis = roster::build_genesis(&state.device, &label, &topic);
-    let signed = roster::sign_and_chain(&state.device, genesis, None).map_err(|e| e.to_string())?;
-    let verified = VerifiedRoster::verify_first(signed.clone()).map_err(|e| e.to_string())?;
-    *state.roster.lock().await = Some(verified);
-    persist_roster(&state, &signed).await;
-
-    // Spawn the subscriber so we receive clips + join requests from others.
-    start_subscriber(&state, app.clone(), &topic).await;
-
-    // Broadcast the genesis roster so joiners can adopt it.
-    eprintln!("[room] created room, broadcasting genesis roster");
-    broadcast_roster(&state, &signed, &topic).await;
-
-    // Generate the one-time pairing secret. Stored so we can verify join proofs.
-    Ok(issue_pairing_code(&state, &topic).await)
+    ensure_active_sync_group(state.inner(), "My devices").await?;
+    create_roster_for_active_group(state.inner(), app, label).await
 }
 
 #[tauri::command]
@@ -1055,33 +1336,43 @@ fn verify_persisted_roster_entries(
     Ok(verified)
 }
 
-/// Leave the current room: clear the in-memory roster, stop the subscriber,
-/// delete the persisted roster file. The frontend then shows create/join again.
+/// Remove the active sync group from this device, then activate the next group
+/// if one remains.
 #[tauri::command]
-pub async fn leave_room(state: State<'_, Arc<AppState>>) -> Result<(), String> {
-    // Stop the subscriber.
-    if let Some(tx) = state.subscriber_shutdown.lock().await.take() {
-        let _ = tx.send(());
+pub async fn leave_room(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let active_id = state.settings.lock().await.active_sync_group_id.clone();
+    let Some(active_id) = active_id else {
+        stop_active_group_runtime(state.inner()).await;
+        return Ok(());
+    };
+    let current_path = state.roster_path.lock().await.clone();
+    stop_active_group_runtime(state.inner()).await;
+    if let Some(path) = current_path {
+        let _ = std::fs::remove_file(path);
     }
-    // Clear in-memory state.
-    *state.roster.lock().await = None;
-    *state.pending_admin.lock().await = None;
-    *state.pairing_secret.lock().await = None;
-    state.last_msg_ids.lock().await.clear();
-    state.pending.lock().await.clear();
-    // Delete the persisted roster so restart doesn't rejoin.
-    if let Some(path) = state.roster_path.lock().await.clone() {
-        let _ = std::fs::remove_file(&path);
+    let next_id = {
+        let mut settings = state.settings.lock().await;
+        settings.sync_groups.retain(|group| group.id != active_id);
+        let next = settings.sync_groups.first().map(|group| group.id.clone());
+        settings.active_sync_group_id = next.clone();
+        next
+    };
+    persist_settings(state.inner()).await?;
+    if let Some(next_id) = next_id {
+        activate_sync_group(state.inner(), &app, &next_id).await?;
+    } else {
+        *state.roster_path.lock().await = None;
+        let _ = app.emit("sync-group-changed", "");
+        let _ = app.emit("sync-groups-updated", ());
     }
     Ok(())
 }
 
-/// Join an existing room from a pairing URI. Parses the URI, subscribes to the
-/// topic, and announces our identity to the admin via a JoinRequest. The admin
-/// will then add us to the roster and broadcast the updated signed epoch.
-#[tauri::command]
-pub async fn join_room(
-    state: State<'_, Arc<AppState>>,
+async fn join_active_sync_group(
+    state: &Arc<AppState>,
     app: tauri::AppHandle,
     uri: String,
     label: String,
@@ -1091,7 +1382,7 @@ pub async fn join_room(
     // Record the trusted admin identity so we can verify the genesis entry when
     // it arrives over the relay.
     *state.pending_admin.lock().await = Some((invite.topic.clone(), invite.admin_pub.clone()));
-    start_subscriber(&state, app.clone(), &invite.topic).await;
+    start_subscriber(state, app.clone(), &invite.topic).await;
 
     eprintln!("[room] joined topic, publishing JoinRequest");
     // Announce our identity to the admin. The admin adds us to a new roster
@@ -1107,6 +1398,44 @@ pub async fn join_room(
         .map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+/// Join an existing room from a pairing URI. Legacy command used by the first
+/// group onboarding flow.
+#[tauri::command]
+pub async fn join_room(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    uri: String,
+    label: String,
+) -> Result<(), String> {
+    ensure_active_sync_group(state.inner(), "My devices").await?;
+    join_active_sync_group(state.inner(), app, uri, label).await
+}
+
+#[tauri::command]
+pub async fn join_sync_group(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    name: String,
+    uri: String,
+    label: String,
+) -> Result<(), String> {
+    let name = sanitize_sync_group_name(&name)?;
+    let id = new_sync_group_id();
+    {
+        let mut settings = state.settings.lock().await;
+        if settings.sync_groups.len() >= 32 {
+            return Err("at most 32 sync groups are supported".to_string());
+        }
+        settings.sync_groups.push(SyncGroupConfig {
+            id: id.clone(),
+            name,
+        });
+    }
+    persist_settings(state.inner()).await?;
+    activate_sync_group(state.inner(), &app, &id).await?;
+    join_active_sync_group(state.inner(), app, uri, label).await
 }
 
 async fn publish_wire(
@@ -1206,9 +1535,16 @@ pub async fn send_clip(
 
     // Also store locally (history) unless private.
     if !private {
+        let group_id = current_sync_group_id(state.inner()).await?;
         state
             .store
-            .insert_with_msg_id(&state.device.signing_pub, now, &text, Some(&msg_id))
+            .insert_with_msg_id_in_group(
+                &group_id,
+                &state.device.signing_pub,
+                now,
+                &text,
+                Some(&msg_id),
+            )
             .map_err(|e| e.to_string())?;
         let _ = app.emit("clip-stored", ());
     }
@@ -1727,26 +2063,28 @@ pub async fn revoke_device(
 
 /// Get the most recent N clips from local history.
 #[tauri::command]
-pub fn recent_clips(
+pub async fn recent_clips(
     state: State<'_, Arc<AppState>>,
     limit: Option<i64>,
 ) -> Result<Vec<ClipDto>, String> {
+    let group_id = current_sync_group_id(state.inner()).await?;
     let clips = state
         .store
-        .recent(limit.unwrap_or(50))
+        .recent_for_group(&group_id, limit.unwrap_or(50))
         .map_err(|e| e.to_string())?;
     Ok(clips.into_iter().map(ClipDto::from).collect())
 }
 
 /// Search local history.
 #[tauri::command]
-pub fn search_clips(
+pub async fn search_clips(
     state: State<'_, Arc<AppState>>,
     query: String,
 ) -> Result<Vec<ClipDto>, String> {
+    let group_id = current_sync_group_id(state.inner()).await?;
     let clips = state
         .store
-        .search(&query, 50_i64)
+        .search_for_group(&group_id, &query, 50_i64)
         .map_err(|e| e.to_string())?;
     Ok(clips.into_iter().map(ClipDto::from).collect())
 }
@@ -1755,6 +2093,15 @@ pub fn search_clips(
 /// their matching history row when this row is tied to a relay message id.
 #[tauri::command]
 pub async fn delete_clip(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
+    let active_group_id = current_sync_group_id(state.inner()).await?;
+    let clip_group_id = state
+        .store
+        .group_id_for_clip(id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "clip not found".to_string())?;
+    if clip_group_id != active_group_id {
+        return Err("clip does not belong to the active sync group".to_string());
+    }
     let msg_id = state.store.msg_id_for_clip(id).map_err(|e| e.to_string())?;
 
     if let Some(msg_id) = msg_id {
@@ -1782,7 +2129,11 @@ pub async fn delete_all_clips(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
-    let msg_ids = state.store.all_msg_ids().map_err(|e| e.to_string())?;
+    let group_id = current_sync_group_id(state.inner()).await?;
+    let msg_ids = state
+        .store
+        .all_msg_ids_for_group(&group_id)
+        .map_err(|e| e.to_string())?;
     let room = {
         let guard = state.roster.lock().await;
         guard
@@ -1799,7 +2150,10 @@ pub async fn delete_all_clips(
         }
     }
 
-    state.store.delete_all().map_err(|e| e.to_string())?;
+    state
+        .store
+        .delete_all_for_group(&group_id)
+        .map_err(|e| e.to_string())?;
     let _ = app.emit("clip-stored", ());
     Ok(())
 }
@@ -2259,12 +2613,15 @@ async fn try_open_clip(
             );
             // Persist to history unless the sender marked it Private.
             if o.store_policy == StorePolicy::History {
-                let _ = state.store.insert_with_msg_id(
-                    &o.sender_id,
-                    o.ts,
-                    &o.plaintext,
-                    Some(&manifest.msg_id),
-                );
+                if let Ok(group_id) = current_sync_group_id(state).await {
+                    let _ = state.store.insert_with_msg_id_in_group(
+                        &group_id,
+                        &o.sender_id,
+                        o.ts,
+                        &o.plaintext,
+                        Some(&manifest.msg_id),
+                    );
+                }
                 let _ = app.emit("clip-stored", ());
             }
         }
@@ -3468,6 +3825,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(loaded.epoch(), 0);
+    }
+
+    #[test]
+    fn legacy_roster_migrates_into_default_sync_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("roster.bin");
+        let groups_dir = dir.path().join("groups");
+        let admin = DeviceKeypairs::generate();
+        let genesis = roster::build_genesis(&admin, "admin", "legacy-topic");
+        let signed = roster::sign_and_chain(&admin, genesis, None).unwrap();
+        std::fs::write(&legacy_path, postcard::to_allocvec(&signed).unwrap()).unwrap();
+
+        let mut settings = AppSettings::default();
+        let (path, roster) = prepare_sync_groups(&mut settings, &groups_dir, &legacy_path)
+            .unwrap()
+            .expect("legacy roster creates a group");
+
+        assert_eq!(settings.sync_groups.len(), 1);
+        assert_eq!(settings.sync_groups[0].name, "My devices");
+        assert_eq!(
+            settings.active_sync_group_id.as_deref(),
+            Some(settings.sync_groups[0].id.as_str())
+        );
+        assert!(path.starts_with(&groups_dir));
+        assert_eq!(roster.unwrap().topic(), "legacy-topic");
+        assert!(load_persisted_roster(&path).is_some());
     }
 
     #[test]

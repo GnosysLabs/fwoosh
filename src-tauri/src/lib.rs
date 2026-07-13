@@ -102,24 +102,47 @@ pub fn run() {
 
             let state = Arc::new(AppState::new(device, store));
 
-            // Set the roster persistence path + load any saved room.
-            let roster_path = app_data.join("roster.bin");
+            // Load settings and migrate the legacy single-room roster into the
+            // named sync-group catalog. Each group keeps an independent,
+            // verified roster chain under `groups/`.
+            let legacy_roster_path = app_data.join("roster.bin");
+            let groups_dir = app_data.join("groups");
             let settings_path = app_data.join("settings.json");
-            if let Ok(mut rp) = state.roster_path.try_lock() {
-                *rp = Some(roster_path.clone());
+            if let Ok(mut gd) = state.groups_dir.try_lock() {
+                *gd = Some(groups_dir.clone());
             }
             if let Ok(mut sp) = state.settings_path.try_lock() {
                 *sp = Some(settings_path.clone());
             }
-            if let Ok(mut settings) = state.settings.try_lock() {
-                *settings = commands::load_settings(&settings_path);
-            }
+            let mut loaded_settings = commands::load_settings(&settings_path);
             let mut startup_topic = None;
-            if let Some(verified) = commands::load_persisted_roster(&roster_path) {
-                startup_topic = Some(verified.topic().to_string());
-                if let Ok(mut r) = state.roster.try_lock() {
-                    *r = Some(verified);
+            if let Some((roster_path, verified)) = commands::prepare_sync_groups(
+                &mut loaded_settings,
+                &groups_dir,
+                &legacy_roster_path,
+            )
+            .expect("failed to prepare sync groups")
+            {
+                if let Ok(mut rp) = state.roster_path.try_lock() {
+                    *rp = Some(roster_path);
                 }
+                if let Some(verified) = verified {
+                    startup_topic = Some(verified.topic().to_string());
+                    if let Ok(mut r) = state.roster.try_lock() {
+                        *r = Some(verified);
+                    }
+                }
+            }
+            commands::save_settings(&settings_path, &loaded_settings)
+                .expect("failed to persist sync group settings");
+            if let Some(active_group_id) = loaded_settings.active_sync_group_id.as_deref() {
+                state
+                    .store
+                    .assign_legacy_group(active_group_id)
+                    .expect("failed to migrate legacy clip history");
+            }
+            if let Ok(mut settings) = state.settings.try_lock() {
+                *settings = loaded_settings;
             }
 
             app.manage(state.clone());
@@ -186,9 +209,14 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::create_room,
+            commands::create_sync_group,
             commands::new_pairing_code,
             commands::join_room,
+            commands::join_sync_group,
             commands::leave_room,
+            commands::sync_groups,
+            commands::switch_sync_group,
+            commands::rename_sync_group,
             commands::suggest_device_label,
             commands::rename_device,
             commands::network_settings,

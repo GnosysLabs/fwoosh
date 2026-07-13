@@ -53,6 +53,7 @@ impl From<rusqlite::Error> for StoreError {
 pub struct HistoryClip {
     pub id: i64,
     pub msg_id: Option<[u8; 16]>,
+    pub group_id: String,
     pub sender_id: Ed25519PubKey,
     pub ts: u64,
     pub text: String,
@@ -74,6 +75,7 @@ impl HistoryStore {
             "CREATE TABLE IF NOT EXISTS clips (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 msg_id      BLOB UNIQUE,
+                group_id    TEXT NOT NULL DEFAULT '',
                 sender_id   BLOB NOT NULL,
                 ts          INTEGER NOT NULL,
                 nonce       BLOB NOT NULL,
@@ -89,6 +91,7 @@ impl HistoryStore {
                 ON seen_messages(ts DESC);",
         )?;
         Self::ensure_clip_msg_id_column(&conn)?;
+        Self::ensure_clip_group_id_column(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             cipher: XChaCha20Poly1305::new(db_key.into()),
@@ -115,6 +118,38 @@ impl HistoryStore {
         Ok(())
     }
 
+    fn ensure_clip_group_id_column(conn: &Connection) -> Result<(), StoreError> {
+        let mut stmt = conn.prepare("PRAGMA table_info(clips)")?;
+        let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut has_group_id = false;
+        for col in cols {
+            if col? == "group_id" {
+                has_group_id = true;
+                break;
+            }
+        }
+        if !has_group_id {
+            conn.execute(
+                "ALTER TABLE clips ADD COLUMN group_id TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_clips_group_ts ON clips(group_id, ts DESC)",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Assign rows from the legacy single-group schema to the migrated group.
+    pub fn assign_legacy_group(&self, group_id: &str) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "UPDATE clips SET group_id = ?1 WHERE group_id = ''",
+            params![group_id],
+        )?)
+    }
+
     /// Encrypt + insert a clip. Returns its row id.
     pub fn insert(
         &self,
@@ -133,6 +168,17 @@ impl HistoryStore {
         text: &str,
         msg_id: Option<&[u8; 16]>,
     ) -> Result<i64, StoreError> {
+        self.insert_with_msg_id_in_group("", sender_id, ts, text, msg_id)
+    }
+
+    pub fn insert_with_msg_id_in_group(
+        &self,
+        group_id: &str,
+        sender_id: &Ed25519PubKey,
+        ts: u64,
+        text: &str,
+        msg_id: Option<&[u8; 16]>,
+    ) -> Result<i64, StoreError> {
         let mut nonce = [0u8; 24];
         rand::RngCore::fill_bytes(&mut rand::rng(), &mut nonce);
         let ct = self
@@ -143,10 +189,11 @@ impl HistoryStore {
         let conn = self.conn.lock().unwrap();
         let msg_id_blob = msg_id.map(|m| m.to_vec());
         conn.execute(
-            "INSERT INTO clips (msg_id, sender_id, ts, nonce, ciphertext)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO clips (msg_id, group_id, sender_id, ts, nonce, ciphertext)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 msg_id_blob,
+                group_id,
                 &sender_id.0[..],
                 ts as i64,
                 &nonce[..],
@@ -167,24 +214,42 @@ impl HistoryStore {
 
     /// Return the most recent `limit` clips, decrypted.
     pub fn recent(&self, limit: i64) -> Result<Vec<HistoryClip>, StoreError> {
+        self.recent_scoped(None, limit)
+    }
+
+    pub fn recent_for_group(
+        &self,
+        group_id: &str,
+        limit: i64,
+    ) -> Result<Vec<HistoryClip>, StoreError> {
+        self.recent_scoped(Some(group_id), limit)
+    }
+
+    fn recent_scoped(
+        &self,
+        group_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<HistoryClip>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, msg_id, sender_id, ts, nonce, ciphertext FROM clips
-             ORDER BY ts DESC, id DESC LIMIT ?1",
+            "SELECT id, msg_id, group_id, sender_id, ts, nonce, ciphertext FROM clips
+             WHERE (?1 IS NULL OR group_id = ?1)
+             ORDER BY ts DESC, id DESC LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![limit], |row| {
+        let rows = stmt.query_map(params![group_id, limit], |row| {
             let id: i64 = row.get(0)?;
             let msg_id: Option<Vec<u8>> = row.get(1)?;
-            let sender: Vec<u8> = row.get(2)?;
-            let ts: i64 = row.get(3)?;
-            let nonce: Vec<u8> = row.get(4)?;
-            let ct: Vec<u8> = row.get(5)?;
-            Ok((id, msg_id, sender, ts, nonce, ct))
+            let group_id: String = row.get(2)?;
+            let sender: Vec<u8> = row.get(3)?;
+            let ts: i64 = row.get(4)?;
+            let nonce: Vec<u8> = row.get(5)?;
+            let ct: Vec<u8> = row.get(6)?;
+            Ok((id, msg_id, group_id, sender, ts, nonce, ct))
         })?;
 
         let mut out = Vec::new();
         for r in rows {
-            let (id, msg_id, sender, ts, nonce, ct) = r?;
+            let (id, msg_id, group_id, sender, ts, nonce, ct) = r?;
             if sender.len() != 32 || nonce.len() != 24 {
                 return Err(StoreError::BadRow("sender/nonce length"));
             }
@@ -210,6 +275,7 @@ impl HistoryStore {
             out.push(HistoryClip {
                 id,
                 msg_id,
+                group_id,
                 sender_id: Ed25519PubKey(sn),
                 ts: ts as u64,
                 text,
@@ -227,9 +293,23 @@ impl HistoryStore {
 
     /// Return all relay message ids currently bound to local history rows.
     pub fn all_msg_ids(&self) -> Result<Vec<[u8; 16]>, StoreError> {
+        self.all_msg_ids_scoped(None)
+    }
+
+    pub fn all_msg_ids_for_group(&self, group_id: &str) -> Result<Vec<[u8; 16]>, StoreError> {
+        self.all_msg_ids_scoped(Some(group_id))
+    }
+
+    fn all_msg_ids_scoped(
+        &self,
+        group_id: Option<&str>,
+    ) -> Result<Vec<[u8; 16]>, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT msg_id FROM clips WHERE msg_id IS NOT NULL")?;
-        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut stmt = conn.prepare(
+            "SELECT msg_id FROM clips
+             WHERE msg_id IS NOT NULL AND (?1 IS NULL OR group_id = ?1)",
+        )?;
+        let rows = stmt.query_map(params![group_id], |row| row.get::<_, Vec<u8>>(0))?;
         let mut out = Vec::new();
         for row in rows {
             let blob = row?;
@@ -248,6 +328,11 @@ impl HistoryStore {
         let conn = self.conn.lock().unwrap();
         let changed = conn.execute("DELETE FROM clips", [])?;
         Ok(changed)
+    }
+
+    pub fn delete_all_for_group(&self, group_id: &str) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM clips WHERE group_id = ?1", params![group_id])?)
     }
 
     /// Return the relay message id for a local history row, if it has one.
@@ -271,6 +356,17 @@ impl HistoryStore {
         Ok(Some(msg_id))
     }
 
+    pub fn group_id_for_clip(&self, id: i64) -> Result<Option<String>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT group_id FROM clips WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     /// Delete a clip by relay message id. Returns how many local rows changed.
     pub fn delete_by_msg_id(&self, msg_id: &[u8; 16]) -> Result<usize, StoreError> {
         let conn = self.conn.lock().unwrap();
@@ -282,7 +378,25 @@ impl HistoryStore {
     /// the small caps we keep). A future version can use SQLite FTS5 on an
     /// encrypted index, but correctness-first here.
     pub fn search(&self, needle: &str, limit: i64) -> Result<Vec<HistoryClip>, StoreError> {
-        let all = self.recent(MAX_HISTORY)?;
+        self.search_scoped(None, needle, limit)
+    }
+
+    pub fn search_for_group(
+        &self,
+        group_id: &str,
+        needle: &str,
+        limit: i64,
+    ) -> Result<Vec<HistoryClip>, StoreError> {
+        self.search_scoped(Some(group_id), needle, limit)
+    }
+
+    fn search_scoped(
+        &self,
+        group_id: Option<&str>,
+        needle: &str,
+        limit: i64,
+    ) -> Result<Vec<HistoryClip>, StoreError> {
+        let all = self.recent_scoped(group_id, MAX_HISTORY)?;
         let n = needle.to_lowercase();
         Ok(all
             .into_iter()
@@ -447,6 +561,46 @@ mod tests {
         let hits = store.search("clip", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].text, "another CLIP here");
+    }
+
+    #[test]
+    fn sync_group_history_is_isolated() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::open(&dir.path().join("h.db"), &test_key()).unwrap();
+        let sender = Ed25519PubKey([0x22; 32]);
+        let work_msg = [0x31; 16];
+        let friends_msg = [0x32; 16];
+        store
+            .insert_with_msg_id_in_group(
+                "work",
+                &sender,
+                1,
+                "quarterly plan",
+                Some(&work_msg),
+            )
+            .unwrap();
+        store
+            .insert_with_msg_id_in_group(
+                "friends",
+                &sender,
+                2,
+                "weekend plan",
+                Some(&friends_msg),
+            )
+            .unwrap();
+
+        let work = store.recent_for_group("work", 10).unwrap();
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].group_id, "work");
+        assert_eq!(work[0].text, "quarterly plan");
+        assert_eq!(store.all_msg_ids_for_group("work").unwrap(), vec![work_msg]);
+
+        let friends = store.search_for_group("friends", "weekend", 10).unwrap();
+        assert_eq!(friends.len(), 1);
+        assert_eq!(friends[0].group_id, "friends");
+        assert_eq!(store.delete_all_for_group("work").unwrap(), 1);
+        assert!(store.recent_for_group("work", 10).unwrap().is_empty());
+        assert_eq!(store.recent_for_group("friends", 10).unwrap().len(), 1);
     }
 
     #[test]

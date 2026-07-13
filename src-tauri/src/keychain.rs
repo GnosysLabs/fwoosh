@@ -89,7 +89,7 @@ fn fallback_path(name: &str) -> PathBuf {
     FALLBACK_DIR
         .get()
         .cloned()
-        .unwrap_or_else(|| std::env::temp_dir())
+        .unwrap_or_else(std::env::temp_dir)
         .join(format!("{name}.bin"))
 }
 
