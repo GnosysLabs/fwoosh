@@ -1,18 +1,21 @@
 # Fwoosh
 
 A free, open-source, **end-to-end-encrypted clipboard sync and P2P file
-sharing** app for Windows & macOS. Pop a small text box out of the tray/dock
-with `Ctrl/Cmd+Shift+V`, paste, and it becomes available on all your paired
-devices — instantly, with **zero servers to run**.
+sharing** app for Windows, macOS, and Linux (planned). Pop a small text box
+out of the tray/dock with `Ctrl/Cmd+Shift+V`, paste, and it becomes available
+on all your paired devices, instantly, using the free public
+[ntfy.sh](https://ntfy.sh) relay. **No servers to set up.**
 
 - **Transport:** the public [ntfy.sh](https://ntfy.sh) relay by default
-  (self-hostable) for encrypted clips and file-transfer signaling; P2P file
-  transfers use WebRTC data channels.
+  (self-hostable) for compressed encrypted clips and file-transfer signaling.
+  Larger clips use encrypted ntfy attachments; P2P file transfers use WebRTC
+  data channels.
 - **Crypto:** signed envelope encryption — XChaCha20-Poly1305 + HPKE recipient
   wrapping (RFC 9180) + Ed25519 signatures + an append-only, signed roster log
   with epochs and revocation. File transfers use their own encrypted chunk
   stream plus checksum verification.
-- **Cost:** $0 to run. No accounts, no central database or file storage.
+- **Cost:** $0 to run. Uses the free public [ntfy.sh](https://ntfy.sh) relay by
+  default. No accounts, no central database or file storage.
 
 ## How it works
 
@@ -24,9 +27,11 @@ devices — instantly, with **zero servers to run**.
        └────────────── paired via QR (proof-of-knowledge) ───────────────┘
 ```
 
-1. **Pair** — the first device creates a room and shows a single-use pairing
-   code. Other devices paste it; the join is authenticated with an HMAC
-   proof-of-knowledge so eavesdroppers can't inject bogus devices.
+1. **Pair** — the first device creates a Sync Group and becomes its admin. Its
+   reusable invitation survives restarts and remains valid until revoked;
+   optional temporary invitations expire at a chosen time. QR and copyable URI
+   carry the same invitation. Every join uses an encrypted proof-of-knowledge
+   request and requires explicit admin approval.
 2. **Send** — press `Ctrl/Cmd+Shift+V`, paste into the popup, hit Enter. The
    clip is encrypted (one fresh content key per clip, wrapped per recipient
    via HPKE) and published to the relay.
@@ -38,31 +43,35 @@ devices — instantly, with **zero servers to run**.
 
 ## Status
 
-**Working:** crypto core, roster epochs, HMAC-authenticated pairing, encrypted
-history, keychain storage, ntfy transport, replay cache, tray/hotkey, manual
-send UI, P2P file transfers, and admin revocation with encrypted topic-rotation
-notice.
+**Working:** crypto core, roster epochs, durable admin-approved pairing,
+encrypted history, keychain storage, ntfy transport, replay cache, tray/hotkey,
+manual send UI, explicit-recipient P2P file transfers, and admin revocation
+with encrypted topic-rotation notice. Multiple named Sync Groups keep
+membership, relay topics, and history separate, with an active-group switcher
+for deliberate sends.
 
-**Still before public MVP:** QR scanning, custom relay settings UI, pause sync,
-full room-repair UX, installer packaging via Tauri bundling, and cargo/npm audit
-automation in CI.
+**Planned for release:** mobile companion app, Linux support, QR scanning,
+custom relay settings UI, pause sync, full room-repair UX, signed and notarized
+installer releases, and a cross-device installed-app smoke test.
 
 | Area | State |
 |---|---|
-| Signed envelope crypto (`crypto.rs`) | 12 tests |
-| Roster log (`roster.rs`) | ✅ 9 tests |
-| Encrypted history (`store.rs`) | 6 tests |
+| Signed envelope crypto (`crypto.rs`) | 15 tests |
+| Roster log (`roster.rs`) | ✅ 10 tests |
+| Encrypted history (`store.rs`) | 11 tests |
 | OS keychain (`keychain.rs`) | OS keychain by default; file fallback only by explicit dev opt-in |
-| ntfy transport (`ntfy.rs`) | ✅ 7 tests |
-| Pairing (`pairing.rs`) | ✅ 8 tests |
-| P2P file transfer (`commands.rs`) | WebRTC data channels; streamed encrypted chunks; configurable timeout |
+| ntfy transport (`ntfy.rs`) | ✅ 12 tests |
+| Pairing (`pairing.rs`) | ✅ 6 tests plus scannable QR generation |
+| Sync Groups | Named groups, isolated roster files/history, legacy-room migration, active-group switching |
+| P2P file transfer (`commands/transfer/`) | WebRTC data channels; streamed encrypted chunks; configurable timeout |
 | Desktop shell (tray, hotkey, popup UI) | ✅ builds |
-| CI / release pipeline | Tests plus cargo/npm audit in CI; release workflow written |
+| CI / release pipeline | Tests plus cargo/npm audit in CI; installer publishing and signing remain before public release |
 
 ## Threat model (honest)
 
-- ✅ **Content is E2E encrypted.** The relay sees ciphertext for clips and file
-  signaling; file bytes stream over WebRTC and are encrypted in chunks.
+- ✅ **Content is E2E encrypted.** The relay sees ciphertext for clips,
+  encrypted large-clip attachments, and file signaling; file bytes stream over
+  WebRTC and are encrypted in chunks.
 - ✅ **Sender authenticity** (Ed25519 signatures over canonical bytes).
 - ✅ **Replay/roster-tamper resistance** (signed epochs, strict current-epoch
   checks, and a local seen-message cache).
@@ -70,8 +79,10 @@ automation in CI.
   new roster to remaining devices through an encrypted move message).
 - **Known limit: relay metadata.** The relay can observe topic URLs, timing,
   message sizes, and IPs. The default public relay keeps ordinary encrypted
-  messages briefly for offline catch-up; Private sends request no relay cache.
-- **Known limit: no forward secrecy.** Fwoosh uses stable device keys for v1
+  messages briefly for offline catch-up and large encrypted clip attachments
+  for its attachment lifetime; Private sends request no relay caching and never
+  use attachments.
+- **Known limit: no forward secrecy.** Fwoosh uses stable device keys
   because lossy networks, offline catch-up, and portable devices make ratcheting
   hard to do reliably.
 - **Known limit: endpoint compromise.** Malware running as the same logged-in
@@ -84,6 +95,7 @@ automation in CI.
 - Rust (stable), Node.js 20+, npm
 - Windows: a complete VS 2022/2026 C++ workload (or use CI)
 - macOS: Xcode command-line tools
+- Linux: GCC, pkg-config, and development headers for DBus/Secret Service
 
 ### Run in dev
 ```bash
@@ -134,8 +146,19 @@ src-tauri/src/
   store.rs     encrypted local history (SQLite, separate DB key)
   keychain.rs  OS credential storage (device keys + history key)
   ntfy.rs      TLS-enforced publish + WSS subscribe + reconnect
-  pairing.rs   URI/QR encode + HMAC proof-of-knowledge
-  commands.rs  Tauri IPC: send_clip, recent_clips, create/join_room, ...
+  pairing.rs   durable invitation URI + reusable HMAC proof-of-knowledge
+  network.rs   Network, invitation, People/contact, and recipient domain types
+  commands.rs  thin shared command facade and clipboard-send orchestration
+  commands/
+    state.rs             shared AppState, settings, wire types, and IPC DTOs
+    sync_groups.rs       Sync Group lifecycle, roster persistence, membership
+    pairing_commands.rs  durable invitations and admin-approved pairing
+    relay.rs             relay subscriptions, publishing, and wire dispatch
+    history_commands.rs  clipboard-history IPC commands and DTOs
+    transfer/
+      mod.rs             file-transfer commands and signaling state machine
+      webrtc.rs          WebRTC channels, framing, finalization, and cleanup
+    tests.rs             cross-module command regression tests
   lib.rs       tray icon, global hotkey, popup window, plugin setup
 src/routes/+page.svelte   the popup UI (Svelte + Tailwind)
 .github/workflows/        Release build/checksum workflow
@@ -144,3 +167,8 @@ src/routes/+page.svelte   the popup UI (Svelte + Tailwind)
 ## License
 
 MIT.
+
+## Legal documents
+
+- [Privacy Policy](docs/privacy-policy.md)
+- [Terms of Use](docs/terms-of-use.md)

@@ -74,6 +74,7 @@ impl HistoryStore {
             "CREATE TABLE IF NOT EXISTS clips (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 msg_id      BLOB UNIQUE,
+                group_id    TEXT NOT NULL DEFAULT '',
                 sender_id   BLOB NOT NULL,
                 ts          INTEGER NOT NULL,
                 nonce       BLOB NOT NULL,
@@ -89,6 +90,7 @@ impl HistoryStore {
                 ON seen_messages(ts DESC);",
         )?;
         Self::ensure_clip_msg_id_column(&conn)?;
+        Self::ensure_clip_group_id_column(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             cipher: XChaCha20Poly1305::new(db_key.into()),
@@ -115,19 +117,41 @@ impl HistoryStore {
         Ok(())
     }
 
-    /// Encrypt + insert a clip. Returns its row id.
-    pub fn insert(
-        &self,
-        sender_id: &Ed25519PubKey,
-        ts: u64,
-        text: &str,
-    ) -> Result<i64, StoreError> {
-        self.insert_with_msg_id(sender_id, ts, text, None)
+    fn ensure_clip_group_id_column(conn: &Connection) -> Result<(), StoreError> {
+        let mut stmt = conn.prepare("PRAGMA table_info(clips)")?;
+        let cols = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut has_group_id = false;
+        for col in cols {
+            if col? == "group_id" {
+                has_group_id = true;
+                break;
+            }
+        }
+        if !has_group_id {
+            conn.execute(
+                "ALTER TABLE clips ADD COLUMN group_id TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_clips_group_ts ON clips(group_id, ts DESC)",
+            [],
+        )?;
+        Ok(())
     }
 
-    /// Encrypt + insert a clip, optionally binding it to the relay message id.
-    pub fn insert_with_msg_id(
+    /// Assign rows from the legacy single-group schema to the migrated group.
+    pub fn assign_legacy_group(&self, group_id: &str) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "UPDATE clips SET group_id = ?1 WHERE group_id = ''",
+            params![group_id],
+        )?)
+    }
+
+    pub fn insert_with_msg_id_in_group(
         &self,
+        group_id: &str,
         sender_id: &Ed25519PubKey,
         ts: u64,
         text: &str,
@@ -143,10 +167,11 @@ impl HistoryStore {
         let conn = self.conn.lock().unwrap();
         let msg_id_blob = msg_id.map(|m| m.to_vec());
         conn.execute(
-            "INSERT INTO clips (msg_id, sender_id, ts, nonce, ciphertext)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO clips (msg_id, group_id, sender_id, ts, nonce, ciphertext)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 msg_id_blob,
+                group_id,
                 &sender_id.0[..],
                 ts as i64,
                 &nonce[..],
@@ -165,14 +190,22 @@ impl HistoryStore {
         Ok(id)
     }
 
-    /// Return the most recent `limit` clips, decrypted.
-    pub fn recent(&self, limit: i64) -> Result<Vec<HistoryClip>, StoreError> {
+    pub fn recent_for_group(
+        &self,
+        group_id: &str,
+        limit: i64,
+    ) -> Result<Vec<HistoryClip>, StoreError> {
+        self.recent_scoped(group_id, limit)
+    }
+
+    fn recent_scoped(&self, group_id: &str, limit: i64) -> Result<Vec<HistoryClip>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, msg_id, sender_id, ts, nonce, ciphertext FROM clips
-             ORDER BY ts DESC, id DESC LIMIT ?1",
+             WHERE group_id = ?1
+             ORDER BY ts DESC, id DESC LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![limit], |row| {
+        let rows = stmt.query_map(params![group_id, limit], |row| {
             let id: i64 = row.get(0)?;
             let msg_id: Option<Vec<u8>> = row.get(1)?;
             let sender: Vec<u8> = row.get(2)?;
@@ -225,11 +258,17 @@ impl HistoryStore {
         Ok(())
     }
 
-    /// Return all relay message ids currently bound to local history rows.
-    pub fn all_msg_ids(&self) -> Result<Vec<[u8; 16]>, StoreError> {
+    pub fn all_msg_ids_for_group(&self, group_id: &str) -> Result<Vec<[u8; 16]>, StoreError> {
+        self.all_msg_ids_scoped(group_id)
+    }
+
+    fn all_msg_ids_scoped(&self, group_id: &str) -> Result<Vec<[u8; 16]>, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT msg_id FROM clips WHERE msg_id IS NOT NULL")?;
-        let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+        let mut stmt = conn.prepare(
+            "SELECT msg_id FROM clips
+             WHERE msg_id IS NOT NULL AND group_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![group_id], |row| row.get::<_, Vec<u8>>(0))?;
         let mut out = Vec::new();
         for row in rows {
             let blob = row?;
@@ -243,11 +282,9 @@ impl HistoryStore {
         Ok(out)
     }
 
-    /// Delete every local history clip. Returns how many rows changed.
-    pub fn delete_all(&self) -> Result<usize, StoreError> {
+    pub fn delete_all_for_group(&self, group_id: &str) -> Result<usize, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let changed = conn.execute("DELETE FROM clips", [])?;
-        Ok(changed)
+        Ok(conn.execute("DELETE FROM clips WHERE group_id = ?1", params![group_id])?)
     }
 
     /// Return the relay message id for a local history row, if it has one.
@@ -271,6 +308,17 @@ impl HistoryStore {
         Ok(Some(msg_id))
     }
 
+    pub fn group_id_for_clip(&self, id: i64) -> Result<Option<String>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn
+            .query_row(
+                "SELECT group_id FROM clips WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     /// Delete a clip by relay message id. Returns how many local rows changed.
     pub fn delete_by_msg_id(&self, msg_id: &[u8; 16]) -> Result<usize, StoreError> {
         let conn = self.conn.lock().unwrap();
@@ -281,8 +329,22 @@ impl HistoryStore {
     /// Full-text search over decrypted clips (decrypts then filters; fine for
     /// the small caps we keep). A future version can use SQLite FTS5 on an
     /// encrypted index, but correctness-first here.
-    pub fn search(&self, needle: &str, limit: i64) -> Result<Vec<HistoryClip>, StoreError> {
-        let all = self.recent(MAX_HISTORY)?;
+    pub fn search_for_group(
+        &self,
+        group_id: &str,
+        needle: &str,
+        limit: i64,
+    ) -> Result<Vec<HistoryClip>, StoreError> {
+        self.search_scoped(group_id, needle, limit)
+    }
+
+    fn search_scoped(
+        &self,
+        group_id: &str,
+        needle: &str,
+        limit: i64,
+    ) -> Result<Vec<HistoryClip>, StoreError> {
+        let all = self.recent_scoped(group_id, MAX_HISTORY)?;
         let n = needle.to_lowercase();
         Ok(all
             .into_iter()
@@ -333,6 +395,8 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    const TEST_GROUP: &str = "test";
+
     fn test_key() -> [u8; 32] {
         let mut k = [0u8; 32];
         for (i, b) in k.iter_mut().enumerate() {
@@ -346,9 +410,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = HistoryStore::open(&dir.path().join("h.db"), &test_key()).unwrap();
         let sender = Ed25519PubKey([0xAB; 32]);
-        store.insert(&sender, 100, "first clip").unwrap();
-        store.insert(&sender, 200, "second clip").unwrap();
-        let clips = store.recent(10).unwrap();
+        store
+            .insert_with_msg_id_in_group(TEST_GROUP, &sender, 100, "first clip", None)
+            .unwrap();
+        store
+            .insert_with_msg_id_in_group(TEST_GROUP, &sender, 200, "second clip", None)
+            .unwrap();
+        let clips = store.recent_for_group(TEST_GROUP, 10).unwrap();
         assert_eq!(clips.len(), 2);
         assert_eq!(clips[0].text, "second clip");
         assert_eq!(clips[1].text, "first clip");
@@ -359,7 +427,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = HistoryStore::open(&dir.path().join("h.db"), &test_key()).unwrap();
         let sender = Ed25519PubKey([0xCD; 32]);
-        let id = store.insert(&sender, 50, "bye").unwrap();
+        let id = store
+            .insert_with_msg_id_in_group(TEST_GROUP, &sender, 50, "bye", None)
+            .unwrap();
         assert_eq!(store.count().unwrap(), 1);
         store.delete(id).unwrap();
         assert_eq!(store.count().unwrap(), 0);
@@ -372,11 +442,11 @@ mod tests {
         let sender = Ed25519PubKey([0xEF; 32]);
         let msg_id = [0x42; 16];
         let id = store
-            .insert_with_msg_id(&sender, 70, "shared delete", Some(&msg_id))
+            .insert_with_msg_id_in_group(TEST_GROUP, &sender, 70, "shared delete", Some(&msg_id))
             .unwrap();
 
         assert_eq!(store.msg_id_for_clip(id).unwrap(), Some(msg_id));
-        let clips = store.recent(10).unwrap();
+        let clips = store.recent_for_group(TEST_GROUP, 10).unwrap();
         assert_eq!(clips[0].msg_id, Some(msg_id));
         assert_eq!(store.delete_by_msg_id(&msg_id).unwrap(), 1);
         assert_eq!(store.count().unwrap(), 0);
@@ -390,18 +460,20 @@ mod tests {
         let msg_a = [0x01; 16];
         let msg_b = [0x02; 16];
         store
-            .insert_with_msg_id(&sender, 1, "one", Some(&msg_a))
+            .insert_with_msg_id_in_group(TEST_GROUP, &sender, 1, "one", Some(&msg_a))
             .unwrap();
-        store.insert(&sender, 2, "legacy").unwrap();
         store
-            .insert_with_msg_id(&sender, 3, "two", Some(&msg_b))
+            .insert_with_msg_id_in_group(TEST_GROUP, &sender, 2, "local", None)
+            .unwrap();
+        store
+            .insert_with_msg_id_in_group(TEST_GROUP, &sender, 3, "two", Some(&msg_b))
             .unwrap();
 
-        let ids = store.all_msg_ids().unwrap();
+        let ids = store.all_msg_ids_for_group(TEST_GROUP).unwrap();
         assert_eq!(ids.len(), 2);
         assert!(ids.contains(&msg_a));
         assert!(ids.contains(&msg_b));
-        assert_eq!(store.delete_all().unwrap(), 3);
+        assert_eq!(store.delete_all_for_group(TEST_GROUP).unwrap(), 3);
         assert_eq!(store.count().unwrap(), 0);
     }
 
@@ -431,7 +503,7 @@ mod tests {
         let sender = Ed25519PubKey([0xAA; 32]);
         let msg_id = [0x99; 16];
         let id = store
-            .insert_with_msg_id(&sender, 1, "after migration", Some(&msg_id))
+            .insert_with_msg_id_in_group(TEST_GROUP, &sender, 1, "after migration", Some(&msg_id))
             .unwrap();
         assert_eq!(store.msg_id_for_clip(id).unwrap(), Some(msg_id));
     }
@@ -441,12 +513,44 @@ mod tests {
         let dir = tempdir().unwrap();
         let store = HistoryStore::open(&dir.path().join("h.db"), &test_key()).unwrap();
         let sender = Ed25519PubKey([0x11; 32]);
-        store.insert(&sender, 1, "hello world").unwrap();
-        store.insert(&sender, 2, "another CLIP here").unwrap();
-        store.insert(&sender, 3, "unrelated").unwrap();
-        let hits = store.search("clip", 10).unwrap();
+        store
+            .insert_with_msg_id_in_group(TEST_GROUP, &sender, 1, "hello world", None)
+            .unwrap();
+        store
+            .insert_with_msg_id_in_group(TEST_GROUP, &sender, 2, "another CLIP here", None)
+            .unwrap();
+        store
+            .insert_with_msg_id_in_group(TEST_GROUP, &sender, 3, "unrelated", None)
+            .unwrap();
+        let hits = store.search_for_group(TEST_GROUP, "clip", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].text, "another CLIP here");
+    }
+
+    #[test]
+    fn sync_group_history_is_isolated() {
+        let dir = tempdir().unwrap();
+        let store = HistoryStore::open(&dir.path().join("h.db"), &test_key()).unwrap();
+        let sender = Ed25519PubKey([0x22; 32]);
+        let work_msg = [0x31; 16];
+        let friends_msg = [0x32; 16];
+        store
+            .insert_with_msg_id_in_group("work", &sender, 1, "quarterly plan", Some(&work_msg))
+            .unwrap();
+        store
+            .insert_with_msg_id_in_group("friends", &sender, 2, "weekend plan", Some(&friends_msg))
+            .unwrap();
+
+        let work = store.recent_for_group("work", 10).unwrap();
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].text, "quarterly plan");
+        assert_eq!(store.all_msg_ids_for_group("work").unwrap(), vec![work_msg]);
+
+        let friends = store.search_for_group("friends", "weekend", 10).unwrap();
+        assert_eq!(friends.len(), 1);
+        assert_eq!(store.delete_all_for_group("work").unwrap(), 1);
+        assert!(store.recent_for_group("work", 10).unwrap().is_empty());
+        assert_eq!(store.recent_for_group("friends", 10).unwrap().len(), 1);
     }
 
     #[test]
@@ -455,8 +559,10 @@ mod tests {
         let store = HistoryStore::open(&dir.path().join("h.db"), &test_key()).unwrap();
         let sender = Ed25519PubKey([0x22; 32]);
         let big = "Z".repeat(50_000);
-        store.insert(&sender, 1, &big).unwrap();
-        let clips = store.recent(1).unwrap();
+        store
+            .insert_with_msg_id_in_group(TEST_GROUP, &sender, 1, &big, None)
+            .unwrap();
+        let clips = store.recent_for_group(TEST_GROUP, 1).unwrap();
         assert_eq!(clips[0].text.len(), 50_000);
         assert_eq!(clips[0].text, big);
     }
@@ -468,10 +574,12 @@ mod tests {
         let sender = Ed25519PubKey([0x44; 32]);
         {
             let store = HistoryStore::open(&path, &test_key()).unwrap();
-            store.insert(&sender, 7, "persistent").unwrap();
+            store
+                .insert_with_msg_id_in_group(TEST_GROUP, &sender, 7, "persistent", None)
+                .unwrap();
         }
         let store = HistoryStore::open(&path, &test_key()).unwrap();
-        let clips = store.recent(10).unwrap();
+        let clips = store.recent_for_group(TEST_GROUP, 10).unwrap();
         assert_eq!(clips.len(), 1);
         assert_eq!(clips[0].text, "persistent");
     }
@@ -483,11 +591,17 @@ mod tests {
         let sender = Ed25519PubKey([0x33; 32]);
         for i in 0..(MAX_HISTORY + 50) {
             store
-                .insert(&sender, i as u64, &format!("clip {i}"))
+                .insert_with_msg_id_in_group(
+                    TEST_GROUP,
+                    &sender,
+                    i as u64,
+                    &format!("clip {i}"),
+                    None,
+                )
                 .unwrap();
         }
         assert_eq!(store.count().unwrap(), MAX_HISTORY);
-        let top = store.recent(1).unwrap();
+        let top = store.recent_for_group(TEST_GROUP, 1).unwrap();
         assert_eq!(top[0].text, format!("clip {}", MAX_HISTORY + 49));
     }
 

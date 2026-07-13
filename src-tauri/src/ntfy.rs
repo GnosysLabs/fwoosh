@@ -24,6 +24,9 @@ pub const DEFAULT_BASE: &str = "https://ntfy.sh";
 /// Cap a single message body well under ntfy's 4096-byte attachment threshold
 /// (after base64 expansion). See crypto::CHUNK_SIZE for the plaintext cap.
 pub const MAX_BODY_BYTES: usize = 3500;
+/// Fwoosh's encrypted attachment ceiling. This leaves ample room below the
+/// public ntfy.sh 2 MB limit for a 1 MiB text clip plus framing overhead.
+pub const MAX_ATTACHMENT_BYTES: usize = 1_500_000;
 
 /// Relay-side caching behavior for a published message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +76,10 @@ pub enum NtfyError {
     BadMessage(String),
     /// Message body exceeds the relay limit.
     TooLarge,
+    /// An attachment URL did not resolve to the configured TLS relay.
+    UnsafeAttachmentUrl,
+    /// Downloaded attachment bytes did not match the relay event metadata.
+    AttachmentSizeMismatch,
     /// The publish/subscribe task was cancelled or the channel closed.
     Cancelled,
 }
@@ -88,6 +95,10 @@ impl std::fmt::Display for NtfyError {
             Self::BadStatus(code, body) => write!(f, "relay returned {code}: {body}"),
             Self::BadMessage(m) => write!(f, "bad message: {m}"),
             Self::TooLarge => write!(f, "message exceeds relay body limit"),
+            Self::UnsafeAttachmentUrl => {
+                write!(f, "attachment URL does not belong to the configured relay")
+            }
+            Self::AttachmentSizeMismatch => write!(f, "attachment size does not match metadata"),
             Self::Cancelled => write!(f, "transport cancelled"),
         }
     }
@@ -140,6 +151,14 @@ pub struct RelayMessage {
     pub payload: Vec<u8>,
     /// The event time (unix ms from ntfy).
     pub time_ms: u64,
+    /// Uploaded attachment metadata supplied by the relay, when present.
+    pub attachment: Option<RelayAttachment>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RelayAttachment {
+    pub url: String,
+    pub size: u64,
 }
 
 // ntfy JSON message shape (subset we care about).
@@ -149,6 +168,13 @@ struct NtfyJson {
     message: Option<String>,
     time: Option<u64>,
     event: Option<String>,
+    attachment: Option<NtfyAttachment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NtfyAttachment {
+    url: String,
+    size: Option<u64>,
 }
 
 /// Publish a single encrypted payload (manifest or one chunk) to the relay.
@@ -208,6 +234,113 @@ pub async fn publish_with_options(
     Ok(String::from("ok"))
 }
 
+/// Publish encrypted clip chunks as one ntfy attachment while keeping the
+/// signed manifest in the normal, small message field.
+pub async fn publish_attachment_with_options(
+    base: &str,
+    topic: &str,
+    notice: &[u8],
+    attachment: Vec<u8>,
+    options: PublishOptions,
+) -> Result<(), NtfyError> {
+    ensure_rustls_crypto_provider();
+    let https_base = require_tls_base(base)?;
+    let notice = base64::engine::general_purpose::STANDARD.encode(notice);
+    if notice.len() > MAX_BODY_BYTES || attachment.len() > MAX_ATTACHMENT_BYTES {
+        return Err(NtfyError::TooLarge);
+    }
+    let url = format!("{https_base}/{topic}");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()?;
+    let response = client
+        .execute(build_attachment_request(
+            &client, &url, notice, attachment, options,
+        )?)
+        .await?;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return Err(NtfyError::BadStatus(status.as_u16(), text));
+    }
+    Ok(())
+}
+
+fn build_attachment_request(
+    client: &reqwest::Client,
+    url: &str,
+    notice: String,
+    attachment: Vec<u8>,
+    options: PublishOptions,
+) -> Result<reqwest::Request, reqwest::Error> {
+    let mut request = client
+        .post(url)
+        .header("Content-Type", "application/octet-stream")
+        .header("X-Filename", "fwoosh.clip")
+        .header("X-Message", notice);
+    if options.cache == RelayCache::NoStore {
+        request = request.header("Cache", "no");
+    }
+    request.body(attachment).build()
+}
+
+/// Download one uploaded attachment without allowing the relay event to turn
+/// into an arbitrary URL fetch. Size is checked before and during streaming.
+pub async fn download_attachment(
+    base: &str,
+    attachment: &RelayAttachment,
+) -> Result<Vec<u8>, NtfyError> {
+    if attachment.size == 0 || attachment.size > MAX_ATTACHMENT_BYTES as u64 {
+        return Err(NtfyError::TooLarge);
+    }
+    let https_base = require_tls_base(base)?;
+    validate_attachment_url(&https_base, &attachment.url)?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        // The event URL is validated as same-origin. Do not let a relay-side
+        // redirect silently turn the subsequent request into a cross-origin
+        // fetch.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let mut response = client.get(&attachment.url).send().await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(NtfyError::BadStatus(status.as_u16(), text));
+    }
+    if response
+        .content_length()
+        .is_some_and(|size| size != attachment.size || size > MAX_ATTACHMENT_BYTES as u64)
+    {
+        return Err(NtfyError::AttachmentSizeMismatch);
+    }
+    let mut bytes = Vec::with_capacity(attachment.size as usize);
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_ATTACHMENT_BYTES {
+            return Err(NtfyError::TooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if bytes.len() as u64 != attachment.size {
+        return Err(NtfyError::AttachmentSizeMismatch);
+    }
+    Ok(bytes)
+}
+
+fn validate_attachment_url(base: &str, attachment: &str) -> Result<(), NtfyError> {
+    let base = reqwest::Url::parse(base).map_err(|_| NtfyError::UnsafeAttachmentUrl)?;
+    let attachment = reqwest::Url::parse(attachment).map_err(|_| NtfyError::UnsafeAttachmentUrl)?;
+    let same_origin = attachment.scheme() == "https"
+        && attachment.host_str() == base.host_str()
+        && attachment.port_or_known_default() == base.port_or_known_default()
+        && attachment.username().is_empty()
+        && attachment.password().is_none();
+    if !same_origin || !attachment.path().starts_with("/file/") {
+        return Err(NtfyError::UnsafeAttachmentUrl);
+    }
+    Ok(())
+}
+
 fn build_publish_request(
     client: &reqwest::Client,
     url: &str,
@@ -251,6 +384,7 @@ pub fn spawn_subscriber(
                         id: String::new(),
                         payload: Vec::new(),
                         time_ms: 0,
+                        attachment: None,
                     })
                     .await; // sentinel: empty payload signals fatal error
                 return;
@@ -282,7 +416,7 @@ pub fn spawn_subscriber(
                                 break;
                             }
                         };
-                        if let Some(text) = msg.into_text().ok() {
+                        if let Ok(text) = msg.into_text() {
                             let is_idle_event = text.contains(r#""event":"open""#)
                                 || text.contains(r#""event":"keepalive""#);
                             if !is_idle_event {
@@ -354,10 +488,17 @@ fn decode_ntfy_json(line: &str) -> Option<RelayMessage> {
     if payload.is_empty() {
         return None;
     }
+    let attachment = parsed.attachment.and_then(|attachment| {
+        attachment.size.map(|size| RelayAttachment {
+            url: attachment.url,
+            size,
+        })
+    });
     Some(RelayMessage {
         id,
         payload,
         time_ms: parsed.time.unwrap_or(0),
+        attachment,
     })
 }
 
@@ -421,6 +562,21 @@ mod tests {
         assert_eq!(rm.id, "msg1");
         assert_eq!(rm.payload, b"hello");
         assert_eq!(rm.time_ms, 12345);
+        assert!(rm.attachment.is_none());
+    }
+
+    #[test]
+    fn decode_extracts_uploaded_attachment_metadata() {
+        let line = r#"{
+            "id":"msg2",
+            "message":"aGVsbG8=",
+            "attachment":{"url":"https://ntfy.sh/file/msg2.clip","size":1234}
+        }"#;
+        let rm = decode_ntfy_json(line).unwrap();
+        let attachment = rm.attachment.unwrap();
+
+        assert_eq!(attachment.url, "https://ntfy.sh/file/msg2.clip");
+        assert_eq!(attachment.size, 1234);
     }
 
     #[test]
@@ -455,5 +611,38 @@ mod tests {
         .unwrap();
 
         assert_eq!(request.headers().get("Cache").unwrap(), "no");
+    }
+
+    #[test]
+    fn attachment_request_carries_notice_and_binary_body() {
+        let client = reqwest::Client::new();
+        let request = build_attachment_request(
+            &client,
+            "https://ntfy.sh/topic",
+            "bm90aWNl".to_string(),
+            vec![1, 2, 3],
+            PublishOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(request.headers().get("X-Message").unwrap(), "bm90aWNl");
+        assert_eq!(request.headers().get("X-Filename").unwrap(), "fwoosh.clip");
+        assert_eq!(
+            request.body().and_then(reqwest::Body::as_bytes),
+            Some(&[1, 2, 3][..])
+        );
+    }
+
+    #[test]
+    fn attachment_url_must_be_on_the_configured_relay() {
+        assert!(
+            validate_attachment_url("https://ntfy.sh", "https://ntfy.sh/file/message.clip").is_ok()
+        );
+        assert!(validate_attachment_url(
+            "https://ntfy.sh",
+            "https://example.com/file/message.clip"
+        )
+        .is_err());
+        assert!(validate_attachment_url("https://ntfy.sh", "https://ntfy.sh/admin").is_err());
     }
 }
