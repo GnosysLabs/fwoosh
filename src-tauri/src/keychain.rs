@@ -21,6 +21,7 @@ const SERVICE: &str = "fwoosh";
 const ENTRY_CORE_SECRETS: &str = "core-secrets-v1";
 const ENTRY_DEVICE_KEYS: &str = "device-keypairs";
 const ENTRY_DB_KEY: &str = "history-db-key";
+const ENTRY_INVITATIONS: &str = "network-invitations-v2";
 const CORE_SECRETS_MAGIC: &[u8] = b"fwoosh-core-v1\0";
 
 #[derive(Debug)]
@@ -350,9 +351,38 @@ pub fn load_db_key() -> Result<[u8; 32], KeychainError> {
     decode_db_key(&blob)
 }
 
+// ---------------------------------------------------------------------------
+// Durable invitation store (serialized by commands.rs)
+// ---------------------------------------------------------------------------
+
+pub fn save_invitation_blob(blob: &[u8]) -> Result<(), KeychainError> {
+    set_secret(ENTRY_INVITATIONS, blob)
+}
+
+pub fn load_invitation_blob() -> Result<Option<Vec<u8>>, KeychainError> {
+    match get_secret(ENTRY_INVITATIONS) {
+        Ok(blob) => Ok(Some(blob)),
+        Err(KeychainError::NotFound) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+pub fn delete_invitation_blob() -> Result<(), KeychainError> {
+    if let Ok(entry) = Entry::new(SERVICE, ENTRY_INVITATIONS) {
+        let _ = entry.delete_credential();
+    }
+    let _ = std::fs::remove_file(fallback_path(ENTRY_INVITATIONS));
+    Ok(())
+}
+
 /// Delete all Fwoosh secrets (used by "leave room" / factory reset).
 pub fn delete_all() -> Result<(), KeychainError> {
-    for user in [ENTRY_CORE_SECRETS, ENTRY_DEVICE_KEYS, ENTRY_DB_KEY] {
+    for user in [
+        ENTRY_CORE_SECRETS,
+        ENTRY_DEVICE_KEYS,
+        ENTRY_DB_KEY,
+        ENTRY_INVITATIONS,
+    ] {
         if let Ok(entry) = Entry::new(SERVICE, user) {
             let _ = entry.delete_credential();
         }

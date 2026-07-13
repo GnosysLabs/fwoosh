@@ -36,6 +36,7 @@ use rand::RngCore as _;
 use hpke::rand_core;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::io::{Read, Write};
 // hpke wraps x25519-dalek types in internal PublicKey/PrivateKey wrappers.
 // We reach them only via the KEM's associated types to avoid the private
 // `dhkex` module.
@@ -43,9 +44,12 @@ type HpkePriv = <KemImpl as Kem>::PrivateKey;
 type HpkePub = <KemImpl as Kem>::PublicKey;
 
 /// Max plaintext bytes per encrypted chunk. Stays under ntfy's 4096-byte body
-/// threshold after base64 + envelope overhead. Public ntfy treats larger bodies
-/// as attachments, which we avoid in v1.
+/// threshold after base64 + envelope overhead. Larger history clips use the
+/// explicitly bounded encrypted-attachment path instead.
 pub const CHUNK_SIZE: usize = 2048;
+/// Hard safety limit for text after decompression. Larger clipboard payloads
+/// belong in the file-transfer path.
+pub const MAX_TEXT_BYTES: usize = 1024 * 1024;
 /// Nonce = 128-bit random clip prefix + 64-bit big-endian chunk index.
 const CLIP_NONCE_PREFIX_LEN: usize = 16;
 const CLIP_NONCE_LEN: usize = 24; // XChaCha20-Poly1305 nonce length (XNonce)
@@ -186,10 +190,11 @@ pub struct Manifest {
     pub signature: Vec<u8>,
 }
 
-/// Payload type tag. v1 = text only.
+/// Payload encoding covered by the signed manifest.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Debug)]
 pub enum PayloadType {
     Text,
+    DeflateText { original_size: u64 },
 }
 
 /// A single encrypted chunk published to the relay.
@@ -198,6 +203,16 @@ pub struct Chunk {
     pub msg_id: [u8; 16],
     pub index: u32,
     pub nonce: [u8; CLIP_NONCE_LEN],
+    pub ct: Vec<u8>,
+}
+
+/// Small HPKE envelope used before roster membership exists (pairing and
+/// direct-contact bootstrap). Authenticity is supplied by the invitation
+/// proof or a signature inside the plaintext; HPKE provides confidentiality
+/// to the named device key.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct BootstrapCiphertext {
+    pub encapped: [u8; 32],
     pub ct: Vec<u8>,
 }
 
@@ -255,6 +270,57 @@ impl From<HpkeError> for CryptoError {
     }
 }
 
+/// Encrypt a bootstrap payload to a device without requiring roster context.
+pub fn seal_bootstrap(
+    recipient: &X25519PubKey,
+    info: &[u8],
+    plaintext: &[u8],
+) -> Result<BootstrapCiphertext, CryptoError> {
+    let pk_r = HpkePub::from_bytes(&recipient.0)
+        .map_err(|_| CryptoError::BadInput("bad bootstrap recipient key"))?;
+    let mode = OpModeS::<KemImpl>::Base;
+    let (encapped, ct) = single_shot_seal::<HpkeAead, HkdfSha256, KemImpl, _>(
+        &mode,
+        &pk_r,
+        info,
+        plaintext,
+        b"",
+        &mut rand::rng(),
+    )?;
+    let enc_bytes = encapped.to_bytes();
+    if enc_bytes.len() != 32 {
+        return Err(CryptoError::BadInput(
+            "unexpected bootstrap encapped key length",
+        ));
+    }
+    let mut encapped_bytes = [0u8; 32];
+    encapped_bytes.copy_from_slice(&enc_bytes);
+    Ok(BootstrapCiphertext {
+        encapped: encapped_bytes,
+        ct,
+    })
+}
+
+/// Open a bootstrap payload addressed to this device.
+pub fn open_bootstrap(
+    me: &DeviceKeypairs,
+    info: &[u8],
+    sealed: &BootstrapCiphertext,
+) -> Result<Vec<u8>, CryptoError> {
+    let encapped = <KemImpl as Kem>::EncappedKey::from_bytes(&sealed.encapped)
+        .map_err(|_| CryptoError::BadInput("bad bootstrap encapped key"))?;
+    let mode = OpModeR::<KemImpl>::Base;
+    single_shot_open::<HpkeAead, HkdfSha256, KemImpl>(
+        &mode,
+        &me.x25519_secret,
+        &encapped,
+        info,
+        &sealed.ct,
+        b"",
+    )
+    .map_err(Into::into)
+}
+
 // ============================================================================
 //  Signing — sign canonical bytes, not a fuzzy hash expression.
 // ============================================================================
@@ -297,7 +363,7 @@ fn to_signing_bytes(m: &Manifest) -> Vec<u8> {
     buf
 }
 
-fn verify_manifest_sig(m: &Manifest) -> Result<(), CryptoError> {
+pub(crate) fn verify_manifest_sig(m: &Manifest) -> Result<(), CryptoError> {
     let vk = VerifyingKey::from_bytes(&m.sender_id.0)
         .map_err(|_| CryptoError::BadInput("bad sender ed25519 pubkey"))?;
     let sig = Signature::from_slice(&m.signature)
@@ -503,8 +569,99 @@ pub fn seal_clip(
     store_policy: StorePolicy,
     now_unix: u64,
 ) -> Result<SealedClip, CryptoError> {
+    seal_payload(
+        SealContext {
+            sender,
+            recipients,
+            room,
+            epoch,
+            store_policy,
+            now_unix,
+        },
+        plaintext.as_bytes(),
+        PayloadType::Text,
+    )
+}
+
+/// Compress text when that reduces the encrypted payload, then seal it using
+/// the same authenticated envelope as ordinary clips.
+pub fn seal_compressed_clip(
+    sender: &DeviceKeypairs,
+    recipients: &[Recipient],
+    plaintext: &str,
+    room: &str,
+    epoch: u64,
+    store_policy: StorePolicy,
+    now_unix: u64,
+) -> Result<SealedClip, CryptoError> {
+    let raw = plaintext.as_bytes();
+    if raw.len() > MAX_TEXT_BYTES {
+        return Err(CryptoError::BadInput(
+            "text exceeds the clipboard size limit",
+        ));
+    }
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder
+        .write_all(raw)
+        .map_err(|_| CryptoError::BadInput("text compression failed"))?;
+    let compressed = encoder
+        .finish()
+        .map_err(|_| CryptoError::BadInput("text compression failed"))?;
+    let (payload, payload_type) = if compressed.len() < raw.len() {
+        (
+            compressed.as_slice(),
+            PayloadType::DeflateText {
+                original_size: raw.len() as u64,
+            },
+        )
+    } else {
+        (raw, PayloadType::Text)
+    };
+
+    seal_payload(
+        SealContext {
+            sender,
+            recipients,
+            room,
+            epoch,
+            store_policy,
+            now_unix,
+        },
+        payload,
+        payload_type,
+    )
+}
+
+struct SealContext<'a> {
+    sender: &'a DeviceKeypairs,
+    recipients: &'a [Recipient],
+    room: &'a str,
+    epoch: u64,
+    store_policy: StorePolicy,
+    now_unix: u64,
+}
+
+fn seal_payload(
+    context: SealContext<'_>,
+    plaintext: &[u8],
+    payload_type: PayloadType,
+) -> Result<SealedClip, CryptoError> {
+    let SealContext {
+        sender,
+        recipients,
+        room,
+        epoch,
+        store_policy,
+        now_unix,
+    } = context;
+
     if recipients.is_empty() {
         return Err(CryptoError::BadInput("no recipients"));
+    }
+    if plaintext.len() > MAX_TEXT_BYTES {
+        return Err(CryptoError::BadInput(
+            "text exceeds the clipboard size limit",
+        ));
     }
     let mut rng = rand::rng();
 
@@ -517,7 +674,7 @@ pub fn seal_clip(
     let cipher = XChaCha20Poly1305::new(&content_key.into());
 
     // 2. Chunk + encrypt.
-    let pt_bytes = plaintext.as_bytes();
+    let pt_bytes = plaintext;
     let chunks_iter: Vec<&[u8]> = if pt_bytes.is_empty() {
         vec![&[][..]]
     } else {
@@ -587,7 +744,7 @@ pub fn seal_clip(
         sender_id: sender.signing_pub.clone(),
         sender_x25519: sender.x25519_pub.clone(),
         ts: now_unix,
-        payload_type: PayloadType::Text,
+        payload_type,
         declared_size: pt_bytes.len() as u64,
         chunk_count,
         merkle_root,
@@ -693,6 +850,11 @@ pub fn open_clip(
     }
 
     // 6. Decrypt chunks in order.
+    if manifest.declared_size > MAX_TEXT_BYTES as u64 {
+        return Err(CryptoError::BadInput(
+            "encrypted text exceeds the size limit",
+        ));
+    }
     let cipher = XChaCha20Poly1305::new(&content_key.into());
     let mut plaintext = Vec::with_capacity(manifest.declared_size as usize);
     for c in chunks {
@@ -718,6 +880,26 @@ pub fn open_clip(
         return Err(CryptoError::MerkleMismatch);
     }
 
+    let plaintext = match manifest.payload_type {
+        PayloadType::Text => plaintext,
+        PayloadType::DeflateText { original_size } => {
+            if original_size > MAX_TEXT_BYTES as u64 {
+                return Err(CryptoError::BadInput(
+                    "decompressed text exceeds the size limit",
+                ));
+            }
+            let decoder = flate2::read::ZlibDecoder::new(plaintext.as_slice());
+            let mut decoded = Vec::with_capacity(original_size as usize);
+            decoder
+                .take(original_size.saturating_add(1))
+                .read_to_end(&mut decoded)
+                .map_err(|_| CryptoError::BadInput("text decompression failed"))?;
+            if decoded.len() as u64 != original_size {
+                return Err(CryptoError::BadInput("decompressed text size mismatch"));
+            }
+            decoded
+        }
+    };
     let plaintext = String::from_utf8(plaintext)
         .map_err(|_| CryptoError::BadInput("plaintext is not valid UTF-8"))?;
 
@@ -750,6 +932,22 @@ mod tests {
                 x25519: d.x25519_pub.clone(),
             })
             .collect()
+    }
+
+    #[test]
+    fn bootstrap_hpke_roundtrips_and_is_bound_to_info() {
+        let recipient = DeviceKeypairs::generate();
+        let sealed = seal_bootstrap(
+            &recipient.x25519_pub,
+            b"Fwoosh pairing v2\0invite-1",
+            b"pending join",
+        )
+        .unwrap();
+        assert_eq!(
+            open_bootstrap(&recipient, b"Fwoosh pairing v2\0invite-1", &sealed).unwrap(),
+            b"pending join"
+        );
+        assert!(open_bootstrap(&recipient, b"wrong context", &sealed).is_err());
     }
 
     fn always_alice(alice: &DeviceKeypairs) -> impl Fn(&Ed25519PubKey, u64) -> bool + Copy {
@@ -831,6 +1029,60 @@ mod tests {
         .expect("open");
         assert_eq!(opened.plaintext.len(), big.len());
         assert_eq!(opened.plaintext, big);
+    }
+
+    #[test]
+    fn compressible_text_is_deflated_before_encryption() {
+        let alice = DeviceKeypairs::generate();
+        let bob = DeviceKeypairs::generate();
+        let text = "repeated clipboard text\n".repeat(4_000);
+        let sealed = seal_compressed_clip(
+            &alice,
+            &recipients_of(&[&bob]),
+            &text,
+            "room-compressed",
+            1,
+            StorePolicy::History,
+            now(),
+        )
+        .expect("seal compressed text");
+
+        assert!(matches!(
+            sealed.manifest.payload_type,
+            PayloadType::DeflateText { original_size } if original_size == text.len() as u64
+        ));
+        assert!(sealed.manifest.declared_size < text.len() as u64);
+        let opened = open_clip(
+            &sealed.manifest,
+            &sealed.chunks,
+            &bob,
+            1,
+            always_alice(&alice),
+        )
+        .expect("open compressed text");
+        assert_eq!(opened.plaintext, text);
+    }
+
+    #[test]
+    fn clipboard_text_over_one_mib_is_rejected() {
+        let alice = DeviceKeypairs::generate();
+        let bob = DeviceKeypairs::generate();
+        let text = "x".repeat(MAX_TEXT_BYTES + 1);
+
+        assert!(matches!(
+            seal_compressed_clip(
+                &alice,
+                &recipients_of(&[&bob]),
+                &text,
+                "room-too-large",
+                1,
+                StorePolicy::History,
+                now(),
+            ),
+            Err(CryptoError::BadInput(
+                "text exceeds the clipboard size limit"
+            ))
+        ));
     }
 
     #[test]

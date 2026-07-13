@@ -1,6 +1,7 @@
 pub mod commands;
 pub mod crypto;
 pub mod keychain;
+pub mod network;
 pub mod ntfy;
 pub mod pairing;
 pub mod roster;
@@ -115,6 +116,9 @@ pub fn run() {
                 *sp = Some(settings_path.clone());
             }
             let mut loaded_settings = commands::load_settings(&settings_path);
+            if let Ok(mut invitations) = state.invitations.try_lock() {
+                *invitations = commands::load_invitations_from_keychain();
+            }
             let mut startup_topic = None;
             if let Some((roster_path, verified)) = commands::prepare_sync_groups(
                 &mut loaded_settings,
@@ -151,7 +155,8 @@ pub fn run() {
                 let state_clone = state.clone();
                 let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
-                    commands::start_subscriber(&state_clone, app_handle, &topic).await;
+                    commands::start_subscriber(&state_clone, app_handle.clone(), &topic).await;
+                    commands::start_invitation_subscribers(&state_clone, app_handle).await;
                 });
             }
 
@@ -208,34 +213,40 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
-            commands::create_room,
-            commands::create_sync_group,
-            commands::new_pairing_code,
-            commands::join_room,
-            commands::join_sync_group,
-            commands::leave_room,
-            commands::sync_groups,
-            commands::switch_sync_group,
-            commands::rename_sync_group,
-            commands::suggest_device_label,
-            commands::rename_device,
-            commands::network_settings,
-            commands::set_network_settings,
-            commands::set_stun_servers,
-            commands::room_state,
-            commands::roster_devices,
-            commands::revoke_device,
+            commands::sync_groups::create_room,
+            commands::sync_groups::create_sync_group,
+            commands::pairing_commands::new_pairing_code,
+            commands::pairing_commands::create_temporary_pairing_code,
+            commands::pairing_commands::rotate_pairing_code,
+            commands::pairing_commands::revoke_pairing_code,
+            commands::pairing_commands::revoke_permanent_pairing_code,
+            commands::pairing_commands::pending_join_requests,
+            commands::pairing_commands::approve_join_request,
+            commands::pairing_commands::reject_join_request,
+            commands::pairing_commands::join_room,
+            commands::pairing_commands::join_sync_group,
+            commands::sync_groups::leave_room,
+            commands::sync_groups::sync_groups,
+            commands::sync_groups::switch_sync_group,
+            commands::sync_groups::rename_sync_group,
+            commands::sync_groups::suggest_device_label,
+            commands::sync_groups::rename_device,
+            commands::sync_groups::network_settings,
+            commands::sync_groups::set_network_settings,
+            commands::sync_groups::room_state,
+            commands::sync_groups::roster_devices,
+            commands::sync_groups::revoke_device,
             commands::send_clip,
-            commands::start_file_send,
-            commands::accept_file_transfer,
-            commands::reject_file_transfer,
-            commands::cancel_file_transfer,
-            commands::reveal_received_file,
-            commands::recent_clips,
-            commands::search_clips,
-            commands::delete_clip,
-            commands::delete_all_clips,
-            commands::copy_to_clipboard,
+            commands::transfer::start_file_send,
+            commands::transfer::accept_file_transfer,
+            commands::transfer::reject_file_transfer,
+            commands::transfer::cancel_file_transfer,
+            commands::transfer::reveal_received_file,
+            commands::history_commands::recent_clips,
+            commands::history_commands::search_clips,
+            commands::history_commands::delete_clip,
+            commands::history_commands::delete_all_clips,
+            commands::history_commands::copy_to_clipboard,
             commands::show_main_window,
             commands::notify_incoming_clip,
         ])
