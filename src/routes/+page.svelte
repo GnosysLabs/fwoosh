@@ -16,12 +16,15 @@
   let clips = $state<ClipDto[]>([]);
   let query = $state("");
   let pairingUri = $state("");
+  let pairingInviteId = $state("");
+  let pairingNetworkId = $state("");
   let pairingQrDataUrl = $state("");
   let pairingExpiresAt = $state(0);
   let pairingIsPermanent = $state(true);
   let pairingTemporary = $state(false);
   let pairingDurationSeconds = $state(600);
   let pairingError = $state("");
+  let pairingApprovalMessage = $state("");
   let pairingRefreshing = $state(false);
   let nowSeconds = $state(Math.floor(Date.now() / 1000));
   let joinUri = $state("");
@@ -30,7 +33,7 @@
   let networkName = $state("Personal");
   let toast = $state<ToastInfo | null>(null);
   let privateSend = $state(false);
-  let activeView = $state<"compose" | "history" | "files">("compose");
+  let activeView = $state<"compose" | "history" | "files" | "devices">("compose");
   let devices = $state<DeviceDto[]>([]);
   let theme = $state<Theme>("hacker");
   let settingsOpen = $state(false);
@@ -42,9 +45,9 @@
   let newSyncGroupName = $state("");
   let newSyncGroupCode = $state("");
   let creatingSyncGroup = $state(false);
-  let devicesExpanded = $state(false);
   let confirmDeleteAllOpen = $state(false);
   let deletingAll = $state(false);
+  let deletingClipId = $state<number | null>(null);
   let confirmDeleteAllFilesOpen = $state(false);
   let deletingAllFiles = $state(false);
   let deviceLabel = $state("");
@@ -59,13 +62,38 @@
   let incomingFileOffer = $state<FileOfferDto | null>(null);
   let acceptingFile = $state(false);
   let transfers = $state<Record<string, TransferView>>({});
+  let expandedTransferIds = $state<Set<string>>(new Set());
   let dismissedTransferIds = $state<Set<string>>(new Set());
   let confettiPieces = $state<ConfettiPiece[]>([]);
   let settingsMenu = $state<HTMLDivElement | null>(null);
   let settingsButton = $state<HTMLButtonElement | null>(null);
+  let devicesButton = $state<HTMLButtonElement | null>(null);
+  let devicesBackButton = $state<HTMLButtonElement | null>(null);
   let pendingJoins = $state<PendingJoinDto[]>([]);
   let resolvingJoinId = $state("");
+  let resolvingJoinAction = $state<"approve" | "reject" | "">("");
+  let removingDeviceId = $state("");
   let revokingReusableInvitation = $state(false);
+  let settingDefaultGroup = $state(false);
+  let removingSyncGroup = $state(false);
+  let groupTransitionBusy = $derived(
+    switchingGroup ||
+      sending ||
+      sendingFile ||
+      acceptingFile ||
+      removingSyncGroup ||
+      Boolean(removingDeviceId) ||
+      deletingAll ||
+      deletingClipId !== null ||
+      savingSyncGroupName ||
+      settingDefaultGroup ||
+      revokingReusableInvitation ||
+      Boolean(resolvingJoinId) ||
+      pairingRefreshing ||
+      savingDeviceLabel ||
+      savingNetwork ||
+      creatingSyncGroup
+  );
   let logoSrc = $derived(
     theme === "light"
       ? "/fwoosh_dark.webp"
@@ -77,12 +105,34 @@
   let peerDevices = $derived(devices.filter((d) => !d.is_self));
   let isGroupAdmin = $derived(devices.some((device) => device.is_self && device.is_admin));
   let activeSyncGroup = $derived(syncGroups.find((group) => group.active) ?? null);
-  let transferList = $derived(Object.values(transfers));
+  let otherGroupDeviceCount = $derived(
+    Math.max(peerDevices.length, Math.max(0, (activeSyncGroup?.member_count ?? 0) - 1))
+  );
+  let transferList = $derived(
+    Object.values(transfers).sort((a, b) => (b.started_at ?? 0) - (a.started_at ?? 0))
+  );
+  let visiblePairingPendingJoins = $derived(
+    pairingInviteId && pairingNetworkId
+      ? pendingJoins.filter(
+          (request) =>
+            request.invite_id === pairingInviteId && request.network_id === pairingNetworkId
+        )
+      : []
+  );
+  let activeGroupPendingJoins = $derived(
+    activeSyncGroup
+      ? pendingJoins.filter((request) => request.network_id === activeSyncGroup.id)
+      : []
+  );
+  function pendingJoinCount(groupId: string) {
+    return pendingJoins.filter((request) => request.network_id === groupId).length;
+  }
   let pairingSecondsLeft = $derived(Math.max(0, pairingExpiresAt - nowSeconds));
   let pairingExpiryLabel = $derived(formatPairingExpiry(pairingSecondsLeft));
   let toastTimer: ReturnType<typeof setTimeout> | null = null;
   let statusTimer: ReturnType<typeof setTimeout> | null = null;
   let pairingTickTimer: ReturnType<typeof setInterval> | null = null;
+  let pendingJoinPollTimer: ReturnType<typeof setInterval> | null = null;
   let confettiTimer: ReturnType<typeof setTimeout> | null = null;
 
   interface PairingCodeDto {
@@ -125,6 +175,7 @@
     active: boolean;
     connected: boolean;
     member_count: number;
+    is_default: boolean;
   }
   interface DroppedFile {
     grant_id: string | null;
@@ -146,6 +197,7 @@
   }
   interface FileOfferDto {
     session_id: string;
+    network_id: string;
     sender_id: string;
     sender_label: string;
     file_name: string;
@@ -168,6 +220,8 @@
     status: string;
     message: string;
     path?: string;
+    started_at: number;
+    completed_at?: number;
   }
   interface ConfettiPiece {
     id: number;
@@ -221,15 +275,10 @@
         stunServersText = "stun:stun.cloudflare.com:3478";
         transferTimeoutMinutes = 60;
       }
-      try {
-        clips = await invoke<ClipDto[]>("recent_clips", { limit: 50 });
-      } catch {
-        /* store empty */
-      }
-
       // Check if we're already in a room (e.g. after restart).
       await refreshSyncGroups();
       await refreshRoom();
+      await refreshRecentClips();
       await refreshPendingJoins();
 
       unlisteners.push(
@@ -264,17 +313,22 @@
       );
       unlisteners.push(
         await listen("clip-stored", async () => {
-          clips = await invoke<ClipDto[]>("recent_clips", { limit: 50 });
+          await refreshRecentClips();
         })
       );
       unlisteners.push(
         await listen("roster-updated", async () => {
           const previousPeerIds = new Set(peerDevices.map((device) => device.id));
-          await refreshRoom(true);
+          await refreshRoom();
+          await refreshSyncGroups();
           const pairedDevice = peerDevices.find((device) => !previousPeerIds.has(device.id));
           if (pairedDevice) {
-            clearPairingCode();
-            showStatus("ok", `Paired with ${pairedDevice.label}`, 4000);
+            if (showPairing && pairingUri) {
+              pairingApprovalMessage = `${pairedDevice.label} was added to ${networkName}.`;
+              void refreshPendingJoins();
+            } else {
+              showStatus("ok", `Paired with ${pairedDevice.label}`, 4000);
+            }
             launchPairingConfetti();
           }
         })
@@ -286,18 +340,40 @@
       );
       unlisteners.push(
         await listen("sync-group-changed", async () => {
+          pendingFile = null;
+          incomingFileOffer = null;
+          clearPairingCode();
           await refreshSyncGroups();
-          await refreshRoom(true);
-          clips = await invoke<ClipDto[]>("recent_clips", { limit: 50 }).catch(() => []);
+          await refreshRoom();
+          await refreshRecentClips();
           query = "";
           transfers = {};
+          expandedTransferIds = new Set();
           dismissedTransferIds = new Set();
         })
       );
       unlisteners.push(
-        await listen("join-requested", async () => {
+        await listen<string>("sync-group-removed", async (event) => {
+          await handleSyncGroupRemoved(String(event.payload || "This group"));
+        })
+      );
+      unlisteners.push(
+        await listen<string>("join-requested", async (event) => {
           await refreshPendingJoins();
-          showStatus("ok", "A device is waiting for admin approval", 5000);
+          await refreshSyncGroups();
+          const request = pendingJoins.find(
+            (candidate) => candidate.request_id === String(event.payload)
+          );
+          const requestGroup = request
+            ? syncGroups.find((group) => group.id === request.network_id)
+            : null;
+          showStatus(
+            "ok",
+            requestGroup && !requestGroup.active
+              ? `A device is waiting to join ${requestGroup.name}. Switch to ${requestGroup.name} to approve.`
+              : "A device is waiting for admin approval",
+            6000
+          );
         })
       );
       unlisteners.push(
@@ -307,13 +383,14 @@
       );
       unlisteners.push(
         await listen("join-approved", async () => {
-          await refreshRoom(true);
+          await refreshRoom();
+          await refreshSyncGroups();
           showStatus("ok", "Admin approved this device", 5000);
         })
       );
       unlisteners.push(
         await listen("file-offer-received", (e) => {
-          incomingFileOffer = e.payload as FileOfferDto;
+          trackIncomingFileOffer(e.payload as FileOfferDto);
         })
       );
       unlisteners.push(
@@ -343,6 +420,7 @@
         clearInterval(pairingTickTimer);
         pairingTickTimer = null;
       }
+      stopPendingJoinPolling();
       clearStatusTimer();
       clearConfettiTimer();
       unlisteners.forEach((u) => void u());
@@ -414,7 +492,7 @@
   }
 
   async function saveDeviceLabel() {
-    if (savingDeviceLabel || !deviceLabelDraft.trim()) return;
+    if (groupTransitionBusy || !deviceLabelDraft.trim()) return;
     savingDeviceLabel = true;
     try {
       await invoke("rename_device", { label: deviceLabelDraft });
@@ -429,7 +507,7 @@
   }
 
   async function saveNetworkSettings() {
-    if (savingNetwork) return;
+    if (groupTransitionBusy) return;
     savingNetwork = true;
     try {
       const stunServers = stunServersText
@@ -451,32 +529,38 @@
   }
 
   async function handleDroppedFile(grant: FileDropGrantDto) {
-    if (!inRoom) {
+    if (groupTransitionBusy) {
+      showStatus("err", "Wait for the current group action to finish before sending a file");
+      return;
+    }
+    if (!inRoom || !activeSyncGroup) {
       showStatus("err", "Pair another device before sending files");
       return;
     }
     const file = { grant_id: grant.grant_id, name: grant.file_name, size: grant.size };
-    if (peerDevices.length === 0) {
-      showStatus("err", "No paired device is available");
-      return;
-    }
     pendingFile = file;
   }
 
   async function chooseFileForSend() {
-    if (!inRoom) {
-      showStatus("err", "Pair another device before sending files");
+    if (groupTransitionBusy) {
+      showStatus("err", "Wait for the current group action to finish before sending a file");
       return;
     }
-    if (peerDevices.length === 0) {
-      showStatus("err", "No paired device is available");
+    if (!inRoom || !activeSyncGroup) {
+      showStatus("err", "Pair another device before sending files");
       return;
     }
     pendingFile = { grant_id: null, name: "Choose a file" };
   }
 
+  function addDeviceFromRecipientDialog() {
+    pendingFile = null;
+    openPairingCreator();
+  }
+
   async function sendFileTo(file: DroppedFile | null, recipientId: string) {
-    if (sendingFile) return;
+    const targetGroupId = activeSyncGroup?.id;
+    if (groupTransitionBusy || !targetGroupId) return;
     sendingFile = true;
     pendingFile = null;
     showStatus("ok", "Preparing file transfer", 0);
@@ -484,19 +568,25 @@
       const transfer = await invoke<TransferDto>("start_file_send", {
         recipientId,
         grantId: file?.grant_id ?? null,
+        networkId: targetGroupId,
       });
       clearStatus();
+      const existing = transfers[transfer.session_id];
+      const terminal = existing && isTerminalTransfer(existing);
       transfers = {
         ...transfers,
         [transfer.session_id]: {
           session_id: transfer.session_id,
           file_name: transfer.file_name,
           peer_label: transfer.peer_label,
-          direction: transfer.direction,
-          transferred: 0,
+          direction: normalizeTransferDirection(transfer.direction),
+          transferred: terminal ? existing.transferred : 0,
           total: transfer.size,
-          status: transfer.status,
-          message: "Waiting for recipient",
+          status: terminal ? existing.status : transfer.status,
+          message: terminal ? existing.message : "Waiting for recipient",
+          path: existing?.path,
+          started_at: existing?.started_at ?? Date.now(),
+          completed_at: existing?.completed_at,
         },
       };
       activeView = "files";
@@ -508,24 +598,36 @@
   }
 
   async function acceptIncomingFile() {
-    if (!incomingFileOffer || acceptingFile) return;
+    if (
+      !incomingFileOffer ||
+      groupTransitionBusy ||
+      activeSyncGroup?.id !== incomingFileOffer.network_id
+    ) {
+      return;
+    }
     acceptingFile = true;
     try {
       const offer = incomingFileOffer;
       const transfer = await invoke<TransferDto>("accept_file_transfer", {
         sessionId: offer.session_id,
+        networkId: offer.network_id,
       });
+      const existing = transfers[transfer.session_id];
+      const terminal = existing && isTerminalTransfer(existing);
       transfers = {
         ...transfers,
         [transfer.session_id]: {
           session_id: transfer.session_id,
           file_name: transfer.file_name,
           peer_label: transfer.peer_label,
-          direction: transfer.direction,
-          transferred: 0,
+          direction: normalizeTransferDirection(transfer.direction),
+          transferred: terminal ? existing.transferred : 0,
           total: transfer.size,
-          status: transfer.status,
-          message: "Preparing direct connection",
+          status: terminal ? existing.status : transfer.status,
+          message: terminal ? existing.message : "Preparing direct connection",
+          path: existing?.path,
+          started_at: existing?.started_at ?? Date.now(),
+          completed_at: existing?.completed_at,
         },
       };
       incomingFileOffer = null;
@@ -539,10 +641,51 @@
     }
   }
 
+  function trackIncomingFileOffer(offer: FileOfferDto) {
+    if (dismissedTransferIds.has(offer.session_id)) return;
+    if (groupTransitionBusy || activeSyncGroup?.id !== offer.network_id) {
+      void invoke("reject_file_transfer", { sessionId: offer.session_id }).catch(() => {});
+      return;
+    }
+    incomingFileOffer = offer;
+
+    const existing = transfers[offer.session_id];
+    transfers = {
+      ...transfers,
+      [offer.session_id]: {
+        session_id: offer.session_id,
+        file_name: offer.file_name,
+        peer_label: offer.sender_label,
+        direction: "incoming",
+        transferred: existing?.transferred ?? 0,
+        total: offer.size,
+        status: existing?.status ?? "waiting",
+        message: existing?.message ?? "Waiting for your response",
+        path: existing?.path,
+        started_at: existing?.started_at ?? Date.now(),
+        completed_at: existing?.completed_at,
+      },
+    };
+  }
+
   async function rejectIncomingFile() {
     if (!incomingFileOffer) return;
     const offer = incomingFileOffer;
     incomingFileOffer = null;
+
+    const existing = transfers[offer.session_id];
+    if (existing && !isTerminalTransfer(existing)) {
+      transfers = {
+        ...transfers,
+        [offer.session_id]: {
+          ...existing,
+          status: "rejected",
+          message: "Declined",
+          completed_at: Date.now(),
+        },
+      };
+    }
+
     try {
       await invoke("reject_file_transfer", { sessionId: offer.session_id });
     } catch {
@@ -564,10 +707,18 @@
     const next = { ...transfers };
     delete next[sessionId];
     transfers = next;
+    const nextExpanded = new Set(expandedTransferIds);
+    nextExpanded.delete(sessionId);
+    expandedTransferIds = nextExpanded;
   }
 
   function isTerminalTransfer(transfer: TransferView) {
-    return transfer.status === "complete" || transfer.status === "failed" || transfer.status === "cancelled";
+    return (
+      transfer.status === "complete" ||
+      transfer.status === "failed" ||
+      transfer.status === "cancelled" ||
+      transfer.status === "rejected"
+    );
   }
 
   async function deleteTransfer(transfer: TransferView) {
@@ -598,8 +749,9 @@
         })
       );
       transfers = {};
+      expandedTransferIds = new Set();
       confirmDeleteAllFilesOpen = false;
-      showStatus("ok", "File history cleared");
+      showStatus("ok", "Recent transfers cleared");
     } finally {
       deletingAllFiles = false;
     }
@@ -608,18 +760,21 @@
   function upsertTransferProgress(p: FileTransferProgressDto) {
     if (dismissedTransferIds.has(p.session_id)) return;
     const existing = transfers[p.session_id];
-    if (existing?.status === "complete") return;
+    if (existing && isTerminalTransfer(existing)) return;
     transfers = {
       ...transfers,
       [p.session_id]: {
         session_id: p.session_id,
         file_name: existing?.file_name ?? p.message,
         peer_label: existing?.peer_label ?? "",
-        direction: existing?.direction ?? "transfer",
+        direction: existing?.direction ?? "unknown",
         transferred: p.transferred || existing?.transferred || 0,
         total: p.total || existing?.total || 0,
         status: p.status,
         message: p.message,
+        path: existing?.path,
+        started_at: existing?.started_at ?? Date.now(),
+        completed_at: existing?.completed_at,
       },
     };
   }
@@ -628,13 +783,16 @@
     const sessionId = String(payload.session_id ?? "");
     if (!sessionId || dismissedTransferIds.has(sessionId)) return;
     const existing = transfers[sessionId];
+    if (existing && isTerminalTransfer(existing)) return;
     transfers = {
       ...transfers,
       [sessionId]: {
         session_id: sessionId,
         file_name: String(payload.file_name ?? existing?.file_name ?? "File"),
         peer_label: existing?.peer_label ?? "",
-        direction: String(payload.direction ?? existing?.direction ?? "transfer"),
+        direction: normalizeTransferDirection(
+          String(payload.direction ?? existing?.direction ?? "unknown")
+        ),
         transferred: Number(payload.size ?? existing?.total ?? 0),
         total: Number(payload.size ?? existing?.total ?? 0),
         status: "complete",
@@ -643,6 +801,8 @@
           typeof payload.path === "string" && payload.path.length > 0
             ? payload.path
             : existing?.path,
+        started_at: existing?.started_at ?? Date.now(),
+        completed_at: Date.now(),
       },
     };
   }
@@ -651,18 +811,21 @@
     if (incomingFileOffer?.session_id === p.session_id) incomingFileOffer = null;
     if (dismissedTransferIds.has(p.session_id)) return;
     const existing = transfers[p.session_id];
-    if (existing?.status === "complete") return;
+    if (existing && isTerminalTransfer(existing)) return;
     transfers = {
       ...transfers,
       [p.session_id]: {
         session_id: p.session_id,
         file_name: existing?.file_name ?? "File",
         peer_label: existing?.peer_label ?? "",
-        direction: existing?.direction ?? "transfer",
+        direction: existing?.direction ?? "unknown",
         transferred: existing?.transferred ?? 0,
         total: existing?.total ?? 0,
         status: p.status,
         message: p.message,
+        path: existing?.path,
+        started_at: existing?.started_at ?? Date.now(),
+        completed_at: Date.now(),
       },
     };
   }
@@ -708,14 +871,18 @@
 
   function applyPairingCode(code: PairingCodeDto) {
     pairingUri = code.uri;
+    pairingInviteId = code.invite_id;
+    pairingNetworkId = code.network_id;
     pairingExpiresAt = code.expires_at ?? 0;
     pairingIsPermanent = code.is_permanent;
     pairingTemporary = !code.is_permanent;
     pairingError = "";
+    pairingApprovalMessage = "";
     nowSeconds = Math.floor(Date.now() / 1000);
     showPairing = true;
     pairingQrDataUrl = "";
     void renderPairingQr(code.uri);
+    startPendingJoinPolling();
   }
 
   async function renderPairingQr(uri: string) {
@@ -733,14 +900,56 @@
   }
 
   function resetPairingResult() {
+    stopPendingJoinPolling();
     pairingUri = "";
+    pairingInviteId = "";
+    pairingNetworkId = "";
     pairingQrDataUrl = "";
     pairingExpiresAt = 0;
     pairingIsPermanent = true;
     pairingError = "";
+    pairingApprovalMessage = "";
+  }
+
+  function normalizeTransferDirection(direction: string): "incoming" | "outgoing" | "unknown" {
+    if (direction === "incoming" || direction === "outgoing") return direction;
+    return "unknown";
+  }
+
+  function transferDirectionLabel(transfer: TransferView) {
+    if (transfer.direction === "incoming") return "Incoming";
+    if (transfer.direction === "outgoing") return "Outgoing";
+    return "Direction unavailable";
+  }
+
+  function transferPeerLabel(transfer: TransferView) {
+    if (transfer.direction === "incoming") return `Received from ${transfer.peer_label || "device"}`;
+    if (transfer.direction === "outgoing") return `Sent to ${transfer.peer_label || "device"}`;
+    return transfer.peer_label ? `Device: ${transfer.peer_label}` : "Peer device unavailable";
+  }
+
+  function transferStatusLabel(status: string) {
+    const readable = status.replaceAll("_", " ").trim();
+    return readable ? readable[0].toUpperCase() + readable.slice(1) : "Unknown status";
+  }
+
+  function formatTransferTime(timestamp?: number) {
+    if (!timestamp) return "Not available";
+    return new Intl.DateTimeFormat(undefined, {
+      dateStyle: "medium",
+      timeStyle: "medium",
+    }).format(new Date(timestamp));
+  }
+
+  function toggleTransferDetails(sessionId: string) {
+    const next = new Set(expandedTransferIds);
+    if (next.has(sessionId)) next.delete(sessionId);
+    else next.add(sessionId);
+    expandedTransferIds = next;
   }
 
   function openPairingCreator() {
+    if (groupTransitionBusy || !activeSyncGroup || !isGroupAdmin) return;
     resetPairingResult();
     pairingTemporary = false;
     pairingDurationSeconds = 600;
@@ -750,6 +959,7 @@
   function closePairingDialog() {
     showPairing = false;
     pairingError = "";
+    stopPendingJoinPolling();
   }
 
   function clearPairingCode() {
@@ -757,6 +967,25 @@
     pairingTemporary = false;
     pairingDurationSeconds = 600;
     showPairing = false;
+  }
+
+  function startPendingJoinPolling() {
+    stopPendingJoinPolling();
+    void refreshPendingJoins();
+    pendingJoinPollTimer = setInterval(() => {
+      if (!showPairing || !pairingUri) {
+        stopPendingJoinPolling();
+        return;
+      }
+      void refreshPendingJoins();
+    }, 1500);
+  }
+
+  function stopPendingJoinPolling() {
+    if (pendingJoinPollTimer) {
+      clearInterval(pendingJoinPollTimer);
+      pendingJoinPollTimer = null;
+    }
   }
 
   function formatPairingExpiry(seconds: number) {
@@ -773,16 +1002,18 @@
   }
 
   async function generatePairingCode() {
-    if (pairingRefreshing) return;
+    const targetGroupId = activeSyncGroup?.id;
+    if (groupTransitionBusy || !targetGroupId || !isGroupAdmin) return;
     pairingRefreshing = true;
     pairingError = "";
     try {
       const code = pairingTemporary
         ? await invoke<PairingCodeDto>("create_temporary_pairing_code", {
             expiresInSeconds: pairingDurationSeconds,
+            groupId: targetGroupId,
           })
-        : await invoke<PairingCodeDto>("new_pairing_code");
-      applyPairingCode(code);
+        : await invoke<PairingCodeDto>("new_pairing_code", { groupId: targetGroupId });
+      if (!switchingGroup && activeSyncGroup?.id === targetGroupId) applyPairingCode(code);
     } catch (e) {
       pairingError = String(e);
     } finally {
@@ -804,6 +1035,19 @@
     await getCurrentWindow().hide();
   }
 
+  function openDevicesView() {
+    if (groupTransitionBusy || !activeSyncGroup) return;
+    settingsOpen = false;
+    activeView = "devices";
+    void refreshPendingJoins();
+    requestAnimationFrame(() => devicesBackButton?.focus());
+  }
+
+  function closeDevicesView() {
+    activeView = "compose";
+    requestAnimationFrame(() => devicesButton?.focus());
+  }
+
   function closeSettingsOnOutsideClick(event: MouseEvent) {
     if (!settingsOpen || !(event.target instanceof Node)) return;
     if (settingsMenu?.contains(event.target) || settingsButton?.contains(event.target)) return;
@@ -816,9 +1060,8 @@
     void getCurrentWindow().startDragging();
   }
 
-  async function refreshRoom(collapseDevices = false) {
+  async function refreshRoom() {
     try {
-      const wasInRoom = inRoom;
       const rs = await invoke<{
         in_room: boolean;
         member_count: number;
@@ -829,10 +1072,8 @@
       inRoom = rs.in_room;
       networkName = rs.network_name || "Personal";
       devices = inRoom ? await invoke<DeviceDto[]>("roster_devices") : [];
-      if (!inRoom || collapseDevices || !wasInRoom) devicesExpanded = false;
     } catch {
       devices = [];
-      devicesExpanded = false;
     }
   }
 
@@ -840,24 +1081,32 @@
     try {
       syncGroups = await invoke<SyncGroupDto[]>("sync_groups");
       syncGroupNameDraft = syncGroups.find((group) => group.active)?.name ?? "";
+      if (syncGroups.length === 0 && activeView === "devices") activeView = "compose";
     } catch {
       syncGroups = [];
       syncGroupNameDraft = "";
+      if (activeView === "devices") activeView = "compose";
     }
   }
 
   async function switchSyncGroup(groupId: string) {
-    if (!groupId || activeSyncGroup?.id === groupId || switchingGroup) return;
+    if (!groupId || activeSyncGroup?.id === groupId || groupTransitionBusy) {
+      return;
+    }
     switchingGroup = true;
+    settingsOpen = false;
     clearStatus();
     try {
       await invoke("switch_sync_group", { groupId });
-      settingsOpen = false;
+      pendingFile = null;
+      incomingFileOffer = null;
+      clearPairingCode();
       await refreshSyncGroups();
-      await refreshRoom(true);
-      clips = await invoke<ClipDto[]>("recent_clips", { limit: 50 }).catch(() => []);
+      await refreshRoom();
+      await refreshRecentClips();
       query = "";
       transfers = {};
+      expandedTransferIds = new Set();
       dismissedTransferIds = new Set();
       showStatus("ok", `Switched to ${activeSyncGroup?.name ?? "sync group"}`);
     } catch (e) {
@@ -868,11 +1117,18 @@
   }
 
   async function saveSyncGroupName() {
-    if (!activeSyncGroup || !syncGroupNameDraft.trim() || savingSyncGroupName) return;
+    if (
+      !activeSyncGroup ||
+      !syncGroupNameDraft.trim() ||
+      groupTransitionBusy
+    ) {
+      return;
+    }
+    const groupId = activeSyncGroup.id;
     savingSyncGroupName = true;
     try {
       await invoke("rename_sync_group", {
-        groupId: activeSyncGroup.id,
+        groupId,
         name: syncGroupNameDraft,
       });
       await refreshSyncGroups();
@@ -884,28 +1140,105 @@
     }
   }
 
-  async function removeActiveSyncGroup() {
-    if (!activeSyncGroup) return;
-    if (!confirm(`Remove “${activeSyncGroup.name}” from this device?`)) return;
+  async function setActiveSyncGroupAsDefault() {
+    if (
+      !activeSyncGroup ||
+      activeSyncGroup.is_default ||
+      !activeSyncGroup.connected ||
+      groupTransitionBusy
+    ) {
+      return;
+    }
+    const groupId = activeSyncGroup.id;
+    const groupName = activeSyncGroup.name;
+    settingDefaultGroup = true;
     try {
-      await invoke("leave_room");
-      clearPairingCode();
-      settingsOpen = false;
+      await invoke("set_default_sync_group", { groupId });
       await refreshSyncGroups();
-      await refreshRoom(true);
-      clips = activeSyncGroup
-        ? await invoke<ClipDto[]>("recent_clips", { limit: 50 }).catch(() => [])
-        : [];
-      query = "";
-      transfers = {};
-      showStatus("ok", "Sync group removed");
+      showStatus("ok", `${groupName} will be selected when Fwoosh starts`);
     } catch (e) {
       showStatus("err", String(e));
+    } finally {
+      settingDefaultGroup = false;
     }
   }
 
+  async function refreshRecentClips() {
+    const targetGroupId = activeSyncGroup?.id;
+    if (!targetGroupId) {
+      clips = [];
+      return;
+    }
+    try {
+      const next = await invoke<ClipDto[]>("recent_clips", {
+        limit: 50,
+        networkId: targetGroupId,
+      });
+      if (activeSyncGroup?.id === targetGroupId) clips = next;
+    } catch {
+      if (activeSyncGroup?.id === targetGroupId) clips = [];
+    }
+  }
+
+  async function removeActiveSyncGroup() {
+    if (!activeSyncGroup || groupTransitionBusy) return;
+    if (isGroupAdmin && otherGroupDeviceCount > 0) {
+      showStatus("err", "Remove the other devices before deleting this group here");
+      return;
+    }
+    const groupId = activeSyncGroup.id;
+    const groupName = activeSyncGroup.name;
+    const deletingAsAdmin = isGroupAdmin;
+    const action = deletingAsAdmin ? "Delete" : "Leave";
+    const detail = deletingAsAdmin
+      ? "This deletes the group data stored on this device."
+      : "This device will stop receiving anything sent to the group.";
+    if (!confirm(`${action} “${groupName}” on this device?\n\n${detail}`)) return;
+    removingSyncGroup = true;
+    settingsOpen = false;
+    try {
+      await invoke("leave_room", { groupId });
+      clearPairingCode();
+      await refreshSyncGroups();
+      await refreshRoom();
+      await refreshRecentClips();
+      query = "";
+      transfers = {};
+      expandedTransferIds = new Set();
+      dismissedTransferIds = new Set();
+      await refreshPendingJoins();
+      showStatus(
+        "ok",
+        deletingAsAdmin
+          ? `${groupName} was deleted from this device`
+          : `Left ${groupName} on this device`
+      );
+    } catch (e) {
+      showStatus("err", String(e));
+    } finally {
+      removingSyncGroup = false;
+    }
+  }
+
+  async function handleSyncGroupRemoved(groupName: string) {
+    settingsOpen = false;
+    pendingFile = null;
+    incomingFileOffer = null;
+    clearPairingCode();
+    await refreshSyncGroups();
+    await refreshRoom();
+    await refreshPendingJoins();
+    await refreshRecentClips();
+    query = "";
+    transfers = {};
+    expandedTransferIds = new Set();
+    dismissedTransferIds = new Set();
+    showStatus("err", `${groupName} was removed from this device and is no longer connected`, 6000);
+  }
+
   async function revokeReusableInvitation() {
-    if (revokingReusableInvitation) return;
+    if (!activeSyncGroup || groupTransitionBusy) return;
+    const groupId = activeSyncGroup.id;
     if (
       !confirm(
         "Revoke the reusable invitation for this group? Paired devices stay connected. You can create a fresh invitation later."
@@ -914,9 +1247,9 @@
       return;
     }
     revokingReusableInvitation = true;
+    settingsOpen = false;
     try {
-      const revoked = await invoke<boolean>("revoke_permanent_pairing_code");
-      settingsOpen = false;
+      const revoked = await invoke<boolean>("revoke_permanent_pairing_code", { groupId });
       showStatus(
         "ok",
         revoked ? "Reusable invitation revoked" : "There is no active reusable invitation"
@@ -929,6 +1262,7 @@
   }
 
   function openNewSyncGroup() {
+    if (groupTransitionBusy) return;
     settingsOpen = false;
     newSyncGroupName = "";
     newSyncGroupCode = "";
@@ -936,7 +1270,7 @@
   }
 
   async function createOrJoinSyncGroup() {
-    if (!newSyncGroupName.trim() || creatingSyncGroup) return;
+    if (!newSyncGroupName.trim() || groupTransitionBusy) return;
     creatingSyncGroup = true;
     clearStatus();
     try {
@@ -956,10 +1290,12 @@
       }
       newSyncGroupOpen = false;
       await refreshSyncGroups();
-      await refreshRoom(true);
-      clips = await invoke<ClipDto[]>("recent_clips", { limit: 50 }).catch(() => []);
+      await refreshRoom();
+      await refreshRecentClips();
       query = "";
       transfers = {};
+      expandedTransferIds = new Set();
+      dismissedTransferIds = new Set();
     } catch (e) {
       showStatus("err", String(e));
     } finally {
@@ -969,48 +1305,72 @@
 
   async function refreshPendingJoins() {
     try {
-      pendingJoins = inRoom
-        ? await invoke<PendingJoinDto[]>("pending_join_requests")
-        : [];
+      pendingJoins = await invoke<PendingJoinDto[]>("pending_join_requests");
     } catch {
       pendingJoins = [];
     }
   }
 
-  async function approveJoin(requestId: string) {
-    if (resolvingJoinId) return;
-    resolvingJoinId = requestId;
+  async function approveJoin(request: PendingJoinDto) {
+    if (
+      groupTransitionBusy ||
+      activeSyncGroup?.id !== request.network_id
+    ) {
+      return;
+    }
+    resolvingJoinId = request.request_id;
+    resolvingJoinAction = "approve";
     try {
-      await invoke("approve_join_request", { requestId });
+      await invoke("approve_join_request", { requestId: request.request_id });
       await refreshPendingJoins();
       await refreshRoom();
-      showStatus("ok", "Device added to the group", 4000);
+      await refreshSyncGroups();
+      if (
+        showPairing &&
+        request.invite_id === pairingInviteId &&
+        request.network_id === pairingNetworkId
+      ) {
+        pairingApprovalMessage = `${request.label} was added to ${networkName}.${
+          pairingIsPermanent ? " This reusable invitation is still ready to use." : ""
+        }`;
+      } else {
+        showStatus("ok", `${request.label} was added to the group`, 4000);
+      }
     } catch (e) {
       showStatus("err", String(e));
     } finally {
       resolvingJoinId = "";
+      resolvingJoinAction = "";
     }
   }
 
-  async function rejectJoin(requestId: string) {
-    if (resolvingJoinId) return;
-    resolvingJoinId = requestId;
+  async function rejectJoin(request: PendingJoinDto) {
+    if (
+      groupTransitionBusy ||
+      activeSyncGroup?.id !== request.network_id
+    ) {
+      return;
+    }
+    resolvingJoinId = request.request_id;
+    resolvingJoinAction = "reject";
     try {
-      await invoke("reject_join_request", { requestId });
+      await invoke("reject_join_request", { requestId: request.request_id });
       await refreshPendingJoins();
     } catch (e) {
       showStatus("err", String(e));
     } finally {
       resolvingJoinId = "";
+      resolvingJoinAction = "";
     }
   }
 
   async function send() {
-    if (!text.trim() || sending) return;
+    const targetGroupId = activeSyncGroup?.id;
+    if (!inRoom || !text.trim() || groupTransitionBusy || !targetGroupId) return;
     sending = true;
     clearStatus();
     try {
-      await invoke("send_clip", { text, private: privateSend, networkId: null });
+      await invoke("send_clip", { text, private: privateSend, networkId: targetGroupId });
       showStatus("ok", privateSend ? "Sent privately" : "Sent and saved to history");
       text = "";
     } catch (e) {
@@ -1021,8 +1381,15 @@
   }
 
   async function search() {
+    const targetGroupId = activeSyncGroup?.id;
+    const requestedQuery = query;
+    if (!targetGroupId || groupTransitionBusy) return;
     try {
-      clips = await invoke<ClipDto[]>("search_clips", { query });
+      const next = await invoke<ClipDto[]>("search_clips", {
+        query: requestedQuery,
+        networkId: targetGroupId,
+      });
+      if (activeSyncGroup?.id === targetGroupId && query === requestedQuery) clips = next;
     } catch {
       /* ignore */
     }
@@ -1064,20 +1431,26 @@
   }
 
   async function delClip(id: number) {
+    const targetGroupId = activeSyncGroup?.id;
+    if (!targetGroupId || groupTransitionBusy) return;
+    deletingClipId = id;
     try {
-      await invoke("delete_clip", { id });
+      await invoke("delete_clip", { id, networkId: targetGroupId });
       clips = clips.filter((c) => c.id !== id);
     } catch (e) {
       showStatus("err", String(e));
+    } finally {
+      deletingClipId = null;
     }
   }
 
   async function deleteAllClips() {
-    if (deletingAll) return;
+    const targetGroupId = activeSyncGroup?.id;
+    if (!targetGroupId || groupTransitionBusy) return;
     deletingAll = true;
     clearStatus();
     try {
-      await invoke("delete_all_clips");
+      await invoke("delete_all_clips", { networkId: targetGroupId });
       clips = [];
       confirmDeleteAllOpen = false;
       showStatus("ok", "History cleared");
@@ -1093,7 +1466,7 @@
       const code = await invoke<PairingCodeDto>("create_room", { label: preferredDeviceLabel() });
       inRoom = true;
       await refreshSyncGroups();
-      await refreshRoom(true);
+      await refreshRoom();
       applyPairingCode(code);
     } catch (e) {
       showStatus("err", String(e));
@@ -1159,7 +1532,7 @@
   }
 
   function onKeydown(e: KeyboardEvent) {
-    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+    if (activeView === "compose" && e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       send();
     }
@@ -1189,7 +1562,11 @@
         return;
       }
       if (showPairing) {
-        showPairing = false;
+        closePairingDialog();
+        return;
+      }
+      if (activeView === "devices") {
+        closeDevicesView();
         return;
       }
       void hidePopup();
@@ -1197,26 +1574,11 @@
   }
 
   function timeAgo(ts: number): string {
-    const s = Math.floor(Date.now() / 1000 - ts);
+    const s = Math.max(0, Math.floor(Date.now() / 1000 - ts));
     if (s < 60) return `${s}s`;
     if (s < 3600) return `${Math.floor(s / 60)}m`;
     if (s < 86400) return `${Math.floor(s / 3600)}h`;
     return `${Math.floor(s / 86400)}d`;
-  }
-
-  async function leaveRoom() {
-    try {
-      await invoke("leave_room");
-      await refreshSyncGroups();
-      await refreshRoom(true);
-      clips = activeSyncGroup
-        ? await invoke<ClipDto[]>("recent_clips", { limit: 50 }).catch(() => [])
-        : [];
-      clearPairingCode();
-      clearStatus();
-    } catch (e) {
-      showStatus("err", String(e));
-    }
   }
 
   async function joinRoom() {
@@ -1232,12 +1594,17 @@
   }
 
   async function revokeDevice(id: string) {
+    if (!activeSyncGroup || groupTransitionBusy) return;
+    const groupId = activeSyncGroup.id;
     if (!confirm("Remove this device from the group?")) return;
+    removingDeviceId = id;
     try {
-      await invoke("revoke_device", { deviceId: id });
+      await invoke("revoke_device", { deviceId: id, groupId });
       await refreshRoom();
     } catch (e) {
       showStatus("err", String(e));
+    } finally {
+      removingDeviceId = "";
     }
   }
 </script>
@@ -1276,11 +1643,12 @@
     </div>
     <div class="window-actions" data-tauri-drag-region="false">
       <button
-        class="icon-btn"
+        class="icon-btn settings-button"
         bind:this={settingsButton}
         aria-label="Settings"
         title="Settings"
         aria-expanded={settingsOpen}
+        disabled={groupTransitionBusy}
         onclick={() => (settingsOpen = !settingsOpen)}
       >
         <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
@@ -1299,108 +1667,19 @@
       {#if settingsOpen}
         <div bind:this={settingsMenu} class="settings-menu" data-tauri-drag-region="false">
           <div class="settings-section">
-            <div class="settings-title">Sync group</div>
-            <div class="group-picker-row">
-              <select
-                class="settings-select"
-                aria-label="Active sync group"
-                value={activeSyncGroup?.id ?? ""}
-                disabled={switchingGroup || syncGroups.length === 0}
-                onchange={(event) => void switchSyncGroup(event.currentTarget.value)}
-              >
-                {#if syncGroups.length === 0}
-                  <option value="">No groups yet</option>
-                {:else}
-                  {#each syncGroups as group (group.id)}
-                    <option value={group.id}>
-                      {group.name} · {group.member_count} {group.member_count === 1 ? "device" : "devices"}
-                    </option>
-                  {/each}
-                {/if}
-              </select>
-              <button class="mini-action group-add" onclick={openNewSyncGroup}>New</button>
-            </div>
-            {#if activeSyncGroup}
-              <div class="settings-row">
-                <input
-                  id="sync-group-name"
-                  name="sync-group-name"
-                  class="settings-input"
-                  maxlength="48"
-                  autocomplete="off"
-                  aria-label="Sync group name"
-                  bind:value={syncGroupNameDraft}
-                  onkeydown={(event) => {
-                    event.stopPropagation();
-                    if (event.key === "Enter") void saveSyncGroupName();
-                  }}
-                />
-                <button
-                  class="mini-action"
-                  onclick={saveSyncGroupName}
-                  disabled={savingSyncGroupName || !syncGroupNameDraft.trim()}
-                >
-                  {savingSyncGroupName ? "Saving…" : "Rename"}
-                </button>
-              </div>
-              {#if isGroupAdmin}
-                <div class="group-invitation-setting">
-                  <div>
-                    <strong>Reusable invitation</strong>
-                    <span>Stop new pairing requests without removing devices already in this group.</span>
-                  </div>
-                  <button
-                    class="group-invitation-revoke"
-                    onclick={revokeReusableInvitation}
-                    disabled={revokingReusableInvitation}
-                  >
-                    {revokingReusableInvitation ? "Revoking…" : "Revoke"}
-                  </button>
-                </div>
-              {/if}
-              <button class="group-remove" onclick={removeActiveSyncGroup}>
-                Remove this group from this device
-              </button>
-            {/if}
-          </div>
-          <div class="settings-section">
-            <label class="settings-title" for="device-name">Device name</label>
-            <div class="settings-row">
-              <input
-                id="device-name"
-                name="device-name"
-                class="settings-input"
-                maxlength="48"
-                autocomplete="off"
-                bind:value={deviceLabelDraft}
-                onkeydown={(e) => {
-                  e.stopPropagation();
-                  if (e.key === "Enter") void saveDeviceLabel();
-                }}
-              />
-              <button
-                class="mini-action"
-                onclick={saveDeviceLabel}
-                disabled={savingDeviceLabel || !deviceLabelDraft.trim()}
-              >
-                {savingDeviceLabel ? "..." : "Save"}
-              </button>
-            </div>
-          </div>
-          <div class="settings-section">
             <div class="settings-title">Color scheme</div>
             <div class="scheme-toggle" role="radiogroup" aria-label="Color scheme">
               <button
                 class:active={theme === "hacker"}
                 role="radio"
                 aria-checked={theme === "hacker"}
-                onclick={() => setTheme("hacker")}>Hacker</button
+                onclick={() => setTheme("hacker")}>Halfshell</button
               >
               <button
                 class:active={theme === "light"}
                 role="radio"
                 aria-checked={theme === "light"}
-                onclick={() => setTheme("light")}>Light</button
+                onclick={() => setTheme("light")}>Pearl</button
               >
               <button
                 class:active={theme === "onyx"}
@@ -1441,7 +1720,7 @@
               onkeydown={(e) => e.stopPropagation()}
             />
             <button class="mini-action full" onclick={saveNetworkSettings} disabled={savingNetwork}>
-              {savingNetwork ? "Saving..." : "Save group settings"}
+              {savingNetwork ? "Saving..." : "Save connection settings"}
             </button>
           </div>
         </div>
@@ -1450,50 +1729,51 @@
   </header>
 
   {#if activeView === "compose"}
-    <div class="compose" class:devices-open={inRoom && devicesExpanded}>
-      <textarea
-        id="clip-text"
-        name="clip-text"
-        bind:value={text}
-        aria-label="Message to send"
-        placeholder="Paste or type a message, or drag and drop a file to securely transfer it."
-        class="box"
-        autocomplete="off"
-        data-tauri-drag-region="false"></textarea>
+    <div class="compose" class:onboarding={!activeSyncGroup}>
+      {#if activeSyncGroup}
+        <textarea
+          id="clip-text"
+          name="clip-text"
+          bind:value={text}
+          aria-label="Message to send"
+          placeholder="Paste or type a message, or drag and drop a file to securely transfer it."
+          class="box"
+          autocomplete="off"
+          data-tauri-drag-region="false"></textarea>
 
-      <div class="compose-controls">
-        {#if inRoom}
-          <span class="network-target" title="Clipboard destination">
-            To: {networkName} · Default
-          </span>
-          <div class="devices-panel" class:expanded={devicesExpanded}>
-            <div class="devices-compact">
-              <button
-                class="device-toggle"
-                aria-label={devicesExpanded ? "Collapse devices" : "Expand devices"}
-                aria-expanded={devicesExpanded}
-                title={devicesExpanded ? "Collapse devices" : "Expand devices"}
-                onclick={() => (devicesExpanded = !devicesExpanded)}
-              >
-                <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
-                  {#if devicesExpanded}
-                    <path d="M5 12h14" />
-                  {:else}
-                    <path d="M12 5v14" />
-                    <path d="M5 12h14" />
-                  {/if}
-                </svg>
-                <span>Devices</span>
-              </button>
-            </div>
-          </div>
-        {:else}
-          <span class="compose-control-spacer" aria-hidden="true"></span>
-        {/if}
-        <button class="send-btn" onclick={send} disabled={sending || !text.trim()}>
-          {sending ? "Sending..." : "Send"}
-        </button>
-      </div>
+        <div class="compose-controls">
+          <button
+            class="network-target"
+            bind:this={devicesButton}
+            aria-label={`Manage ${activeSyncGroup.name}${pendingJoins.length > 0 ? `, ${pendingJoins.length} device ${pendingJoins.length === 1 ? "request" : "requests"} waiting for approval` : ""}`}
+            title="Manage groups and devices"
+            disabled={groupTransitionBusy}
+            onclick={openDevicesView}
+          >
+            <span class="network-target-prefix">To:</span>
+            <strong>{activeSyncGroup.name}</strong>
+            {#if activeSyncGroup?.is_default}
+              <span class="target-default-badge">Default</span>
+            {/if}
+            {#if !activeSyncGroup.connected}
+              <span class="target-waiting-badge">Waiting</span>
+            {/if}
+            {#if pendingJoins.length > 0}
+              <span class="pending-count" aria-hidden="true">{pendingJoins.length}</span>
+            {/if}
+            <svg class="network-target-chevron" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="m9 6 6 6-6 6" />
+            </svg>
+          </button>
+          <button
+            class="send-btn"
+            onclick={send}
+            disabled={groupTransitionBusy || !inRoom || !text.trim()}
+          >
+            {sending ? "Sending..." : "Send"}
+          </button>
+        </div>
+      {/if}
 
       {#if status !== "idle"}
         <div
@@ -1508,81 +1788,356 @@
       {/if}
 
       {#if !inRoom}
-        <div class="room-empty">
-          <p class="muted">Not connected to a group yet.</p>
+        <div class="room-empty" class:initial-setup={!activeSyncGroup}>
+          {#if !activeSyncGroup}
+            <div class="onboarding-intro">
+              <svg class="onboarding-network" viewBox="0 0 220 88" aria-hidden="true">
+                <path class="onboarding-link" d="M51 56C69 56 77 29 96 29" />
+                <path class="onboarding-link" d="M124 29c19 0 27 27 45 27" />
+                <path class="onboarding-link onboarding-link-low" d="M55 62c31 20 79 20 110 0" />
+                <circle class="onboarding-signal" cx="110" cy="29" r="12" />
+                <g class="onboarding-node" transform="translate(24 42)">
+                  <rect width="34" height="26" rx="7" />
+                  <path d="M11 31h12M17 26v5" />
+                </g>
+                <g class="onboarding-node onboarding-node-primary" transform="translate(93 14)">
+                  <rect width="34" height="26" rx="7" />
+                  <path d="M11 31h12M17 26v5" />
+                </g>
+                <g class="onboarding-node" transform="translate(162 42)">
+                  <rect width="34" height="26" rx="7" />
+                  <path d="M11 31h12M17 26v5" />
+                </g>
+              </svg>
+              <span class="onboarding-eyebrow">FIRST CONNECTION</span>
+              <h2>Bring your devices together</h2>
+              <p>Create a private group for your own devices, or join one with an invitation.</p>
+            </div>
+          {:else}
+            <p class="muted">Not connected to a group yet.</p>
+          {/if}
           <div class="room-actions">
-            <button class="ghost" onclick={createRoom}>Create a group</button>
+            <button
+              class="ghost"
+              class:onboarding-create={!activeSyncGroup}
+              onclick={createRoom}>Create a group</button
+            >
           </div>
-          <div class="divider"><span>or</span></div>
-          <input
-            id="pairing-code"
-            name="pairing-code"
-            class="join-input"
-            aria-label="Pairing code"
-            placeholder="Paste a pairing code..."
-            bind:value={joinUri}
-            autocomplete="off"
-            spellcheck="false"
-            onkeydown={(e) => e.key === "Enter" && joinRoom()} />
-          <button class="ghost" onclick={joinRoom} disabled={!joinUri.trim()}>Request to join</button>
+          <div class="divider">
+            <span>{activeSyncGroup ? "or" : "or join with an invitation"}</span>
+          </div>
+          <div class="onboarding-join-row" class:initial={!activeSyncGroup}>
+            <input
+              id="pairing-code"
+              name="pairing-code"
+              class="join-input"
+              aria-label="Pairing code"
+              placeholder="Paste a pairing code..."
+              bind:value={joinUri}
+              autocomplete="off"
+              spellcheck="false"
+              onkeydown={(e) => e.key === "Enter" && joinRoom()} />
+            <button class="ghost" onclick={joinRoom} disabled={!joinUri.trim()}>Request to join</button>
+          </div>
         </div>
-      {:else}
-        {#if devicesExpanded}
-          <div class="roster">
-            {#if isGroupAdmin}
-              <button class="pair-btn" onclick={openPairingCreator}>Add a device</button>
+      {/if}
+    </div>
+  {:else if activeView === "devices"}
+    <main class="devices-view" aria-labelledby="devices-view-title">
+      <div class="devices-view-scroll">
+        <div class="devices-view-heading">
+          <button
+            class="devices-back"
+            bind:this={devicesBackButton}
+            aria-label="Back to Send"
+            title="Back to Send"
+            onclick={closeDevicesView}
+          >
+            <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="m15 18-6-6 6-6" />
+            </svg>
+          </button>
+          <div class="devices-heading-copy">
+            <span class="devices-eyebrow">MANAGE CONNECTIONS</span>
+            <h2 id="devices-view-title">Devices</h2>
+            <p>Choose a group, approve requests, and manage who is connected.</p>
+          </div>
+        </div>
+
+        {#if status !== "idle"}
+          <div
+            class="status"
+            class:ok={status === "ok"}
+            class:err={status === "err"}
+            role="status"
+            aria-live="polite"
+          >
+            {statusMsg}
+          </div>
+        {/if}
+
+        <section class="devices-section devices-group-section" aria-labelledby="devices-group-title">
+          <div class="devices-section-heading">
+            <div>
+              <h3 id="devices-group-title">Current group</h3>
+              <p>This is also the destination used by Send.</p>
+            </div>
+            <button
+              class="mini-action group-add"
+              onclick={openNewSyncGroup}
+              disabled={groupTransitionBusy}>New group</button
+            >
+          </div>
+          <select
+            class="settings-select devices-group-select"
+            aria-label="Current send destination"
+            value={activeSyncGroup?.id ?? ""}
+            disabled={groupTransitionBusy || syncGroups.length === 0}
+            onchange={(event) => void switchSyncGroup(event.currentTarget.value)}
+          >
+            {#if syncGroups.length === 0}
+              <option value="">No groups yet</option>
+            {:else}
+              {#each syncGroups as group (group.id)}
+                <option value={group.id}>
+                  {group.name}{group.is_default ? " · Default" : ""}{pendingJoinCount(group.id) > 0
+                    ? ` · ${pendingJoinCount(group.id)} waiting`
+                    : ""} · {group.member_count} {group.member_count === 1 ? "device" : "devices"}
+                </option>
+              {/each}
             {/if}
-            {#if pendingJoins.length > 0}
+          </select>
+        </section>
+
+        {#if activeSyncGroup}
+          <section class="devices-section" aria-labelledby="group-devices-title">
+            <div class="devices-section-heading devices-member-heading">
+              <div>
+                <h3 id="group-devices-title">In {activeSyncGroup.name}</h3>
+                <p>
+                  {activeSyncGroup.connected
+                    ? `${activeSyncGroup.member_count} ${activeSyncGroup.member_count === 1 ? "device" : "devices"} connected`
+                    : "Waiting for this device to be approved"}
+                </p>
+              </div>
+              {#if isGroupAdmin && activeSyncGroup.connected}
+                <button
+                  class="devices-add-action"
+                  onclick={openPairingCreator}
+                  disabled={groupTransitionBusy}
+                >
+                  <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M12 5v14" />
+                    <path d="M5 12h14" />
+                  </svg>
+                  Add device
+                </button>
+              {/if}
+            </div>
+
+            {#if activeGroupPendingJoins.length > 0}
               <div class="pending-joins">
                 <span class="recipient-section-title">WAITING FOR APPROVAL</span>
-                {#each pendingJoins as request (request.request_id)}
+                {#each activeGroupPendingJoins as request (request.request_id)}
                   <div class="pending-join-row">
                     <div class="device-main">
                       <span class="device-label">{request.label}</span>
-                      <span class="device-meta">key {request.fingerprint}</span>
+                      <span class="device-meta">
+                        Key {request.fingerprint} · requested {timeAgo(request.received_at)} ago
+                      </span>
                     </div>
                     <div class="pending-join-actions">
                       <button
                         class="ghost"
-                        disabled={Boolean(resolvingJoinId)}
-                        onclick={() => rejectJoin(request.request_id)}>Reject</button
-                      >
+                        disabled={groupTransitionBusy}
+                        onclick={() => rejectJoin(request)}
+                      >{resolvingJoinId === request.request_id && resolvingJoinAction === "reject" ? "Rejecting…" : "Reject"}</button>
                       <button
                         class="send-btn"
-                        disabled={Boolean(resolvingJoinId)}
-                        onclick={() => approveJoin(request.request_id)}>Accept</button
-                      >
+                        disabled={groupTransitionBusy}
+                        onclick={() => approveJoin(request)}
+                      >{resolvingJoinId === request.request_id && resolvingJoinAction === "approve" ? "Adding…" : "Approve"}</button>
                     </div>
                   </div>
                 {/each}
               </div>
             {/if}
-            {#each devices as d (d.id)}
-              <div class="device-row">
-                <div class="device-main">
-                  <span class="device-label">{d.label}</span>
-                  <span class="device-meta">
-                    {d.is_self ? "this device" : d.id.slice(0, 8)}{d.is_admin ? " - admin" : ""}
-                  </span>
-                </div>
-                {#if d.can_revoke}
-                  <button class="revoke-btn" onclick={() => revokeDevice(d.id)}>Revoke</button>
-                {/if}
+
+            {#if inRoom && devices.length > 0}
+              <div class="device-management-list">
+                {#each devices as d (d.id)}
+                  <div class="device-row">
+                    <span class="device-avatar" aria-hidden="true">
+                      <svg class="icon-svg" viewBox="0 0 24 24">
+                        <rect x="4" y="5" width="16" height="11" rx="2" />
+                        <path d="M9 20h6" />
+                        <path d="M12 16v4" />
+                      </svg>
+                    </span>
+                    <div class="device-main">
+                      <span class="device-label">{d.label}</span>
+                      <span class="device-meta">{d.is_self ? "This device" : `Key ${d.id.slice(0, 8)}`}</span>
+                    </div>
+                    <div class="device-row-actions">
+                      {#if d.is_admin}
+                        <span class="device-role">Admin</span>
+                      {/if}
+                      {#if d.can_revoke}
+                        <button
+                          class="revoke-btn"
+                          onclick={() => revokeDevice(d.id)}
+                          disabled={groupTransitionBusy}
+                        >{removingDeviceId === d.id ? "Removing…" : "Remove"}</button>
+                      {/if}
+                    </div>
+                  </div>
+                {/each}
               </div>
-            {/each}
-            <button class="unpair-btn" onclick={leaveRoom}>Unpair Device</button>
-          </div>
+            {:else if activeSyncGroup.connected}
+              <div class="devices-empty-state">Refreshing the devices in this group…</div>
+            {:else}
+              <div class="devices-empty-state">
+                Once the group admin approves this device, the connected devices will appear here.
+              </div>
+            {/if}
+          </section>
+
+          <section class="devices-section" aria-labelledby="this-device-title">
+            <div class="devices-section-heading">
+              <div>
+                <h3 id="this-device-title">This device</h3>
+                <p>The name other people see in pairing requests and device lists.</p>
+              </div>
+            </div>
+            <div class="settings-row">
+              <input
+                id="device-name"
+                name="device-name"
+                class="settings-input"
+                maxlength="48"
+                autocomplete="off"
+                aria-label="Device name"
+                bind:value={deviceLabelDraft}
+                onkeydown={(event) => {
+                  event.stopPropagation();
+                  if (event.key === "Enter") void saveDeviceLabel();
+                }}
+              />
+              <button
+                class="mini-action"
+                onclick={saveDeviceLabel}
+                disabled={savingDeviceLabel || !deviceLabelDraft.trim()}
+              >
+                {savingDeviceLabel ? "Saving…" : "Save"}
+              </button>
+            </div>
+          </section>
+
+          <section class="devices-section devices-group-management" aria-labelledby="group-details-title">
+            <div class="devices-section-heading">
+              <div>
+                <h3 id="group-details-title">Group details</h3>
+                <p>Rename this group, choose its startup behavior, or disconnect it.</p>
+              </div>
+            </div>
+            <label class="settings-title" for="sync-group-name">Group name</label>
+            <div class="settings-row">
+              <input
+                id="sync-group-name"
+                name="sync-group-name"
+                class="settings-input"
+                maxlength="48"
+                autocomplete="off"
+                bind:value={syncGroupNameDraft}
+                onkeydown={(event) => {
+                  event.stopPropagation();
+                  if (event.key === "Enter") void saveSyncGroupName();
+                }}
+              />
+              <button
+                class="mini-action"
+                onclick={saveSyncGroupName}
+                disabled={groupTransitionBusy || !syncGroupNameDraft.trim()}
+              >
+                {savingSyncGroupName ? "Saving…" : "Rename"}
+              </button>
+            </div>
+
+            <div class="group-default-setting" class:is-default={activeSyncGroup.is_default}>
+              <div>
+                <strong>{activeSyncGroup.is_default ? "Default group" : "Startup group"}</strong>
+                <span>
+                  {activeSyncGroup.is_default
+                    ? "Fwoosh selects this destination when it starts."
+                    : !activeSyncGroup.connected
+                      ? "Finish joining this group before using it as your startup group."
+                      : "Changing the current destination does not change your startup group."}
+                </span>
+              </div>
+              {#if activeSyncGroup.is_default}
+                <span class="default-state" aria-label="This is the default group">Default</span>
+              {:else}
+                <button
+                  class="group-default-action"
+                  onclick={setActiveSyncGroupAsDefault}
+                  disabled={groupTransitionBusy || !activeSyncGroup.connected}
+                >
+                  {settingDefaultGroup
+                    ? "Saving…"
+                    : activeSyncGroup.connected
+                      ? "Make default"
+                      : "Waiting for approval"}
+                </button>
+              {/if}
+            </div>
+
+            {#if isGroupAdmin}
+              <div class="group-invitation-setting">
+                <div>
+                  <strong>Reusable invitation</strong>
+                  <span>Invalidate the current code. Existing devices stay connected; create a new invitation to add more.</span>
+                </div>
+                <button
+                  class="group-invitation-revoke"
+                  onclick={revokeReusableInvitation}
+                  disabled={groupTransitionBusy}
+                >
+                  {revokingReusableInvitation ? "Revoking…" : "Revoke code"}
+                </button>
+              </div>
+            {/if}
+
+            {#if isGroupAdmin && otherGroupDeviceCount > 0}
+              <p class="group-remove-guidance" role="note">
+                Remove the other {otherGroupDeviceCount === 1 ? "device" : `${otherGroupDeviceCount} devices`} first. This prevents them from being left in a group with no admin.
+              </p>
+            {/if}
+            <button
+              class="group-remove"
+              onclick={removeActiveSyncGroup}
+              disabled={groupTransitionBusy || (isGroupAdmin && otherGroupDeviceCount > 0)}
+              title={isGroupAdmin && otherGroupDeviceCount > 0
+                ? "Remove the other devices first"
+                : undefined}
+            >
+              {removingSyncGroup
+                ? "Removing…"
+                : isGroupAdmin
+                  ? "Delete group from this device"
+                  : "Leave group on this device"}
+            </button>
+          </section>
         {/if}
-      {/if}
-    </div>
+      </div>
+    </main>
   {:else if activeView === "files"}
     <div class="files">
       <div class="files-toolbar">
-        <span class="files-title">File history</span>
+        <span class="files-title">Recent transfers</span>
         <button
           class="danger-icon-btn"
-          aria-label="Delete all file history"
-          title="Delete all file history"
+          aria-label="Clear recent transfers"
+          title="Clear recent transfers"
           disabled={transferList.length === 0}
           onclick={() => (confirmDeleteAllFilesOpen = true)}
         >
@@ -1609,9 +2164,40 @@
       {#if transferList.length > 0}
         <div class="transfer-list">
           {#each transferList as t (t.session_id)}
-            <div class="transfer-item" class:complete={t.status === "complete"} class:failed={t.status === "failed" || t.status === "cancelled"}>
+            <div
+              class="transfer-item"
+              class:complete={t.status === "complete"}
+              class:failed={t.status === "failed" || t.status === "cancelled" || t.status === "rejected"}
+            >
               <div class="transfer-head">
-                <span class="transfer-file">{t.file_name}</span>
+                <span
+                  class="transfer-direction"
+                  class:incoming={t.direction === "incoming"}
+                  class:outgoing={t.direction === "outgoing"}
+                  class:unknown={t.direction !== "incoming" && t.direction !== "outgoing"}
+                  role="img"
+                  aria-label={transferDirectionLabel(t)}
+                  title={transferDirectionLabel(t)}
+                >
+                  <svg viewBox="0 0 24 24" aria-hidden="true">
+                    {#if t.direction === "incoming"}
+                      <path d="M19 5 5 19" />
+                      <path d="M5 12v7h7" />
+                    {:else if t.direction === "outgoing"}
+                      <path d="M5 19 19 5" />
+                      <path d="M12 5h7v7" />
+                    {:else}
+                      <path d="M5 9h14" />
+                      <path d="m8 6-3 3 3 3M16 12l3 3-3 3M5 15h14" />
+                    {/if}
+                  </svg>
+                </span>
+                <span class="transfer-summary">
+                  <span class="transfer-file">{t.file_name}</span>
+                  <span class="transfer-summary-meta">
+                    {transferDirectionLabel(t)} · {formatBytes(t.total)} · {transferStatusLabel(t.status)}
+                  </span>
+                </span>
                 <span class="transfer-progress">
                   {formatBytes(t.transferred)} / {formatBytes(t.total)}
                   {#if t.status === "complete"}
@@ -1635,6 +2221,18 @@
                     </button>
                   {/if}
                   <button
+                    class="transfer-detail-toggle"
+                    aria-label={`${expandedTransferIds.has(t.session_id) ? "Hide" : "Show"} details for ${t.file_name}`}
+                    aria-expanded={expandedTransferIds.has(t.session_id)}
+                    aria-controls={`transfer-details-${t.session_id}`}
+                    title={expandedTransferIds.has(t.session_id) ? "Hide details" : "Show details"}
+                    onclick={() => toggleTransferDetails(t.session_id)}
+                  >
+                    <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
+                      <path d={expandedTransferIds.has(t.session_id) ? "m7 14 5-5 5 5" : "m7 10 5 5 5-5"} />
+                    </svg>
+                  </button>
+                  <button
                     class="transfer-cancel"
                     aria-label={isTerminalTransfer(t) ? "Delete file transfer" : "Cancel transfer"}
                     title={isTerminalTransfer(t) ? "Delete file transfer" : "Cancel transfer"}
@@ -1650,16 +2248,44 @@
               <div class="transfer-track" aria-hidden="true">
                 <div class="transfer-fill" style={`width: ${progressPct(t)}%`}></div>
               </div>
-              {#if t.status !== "complete"}
-                <div class="transfer-message">
-                  {t.direction === "incoming" ? "from" : "to"} {t.peer_label || "peer"}{t.message ? ` - ${t.message}` : ""}
+              {#if t.status !== "complete" && t.message}
+                <div class="transfer-message">{t.message}</div>
+              {/if}
+              {#if expandedTransferIds.has(t.session_id)}
+                <div class="transfer-details-panel" id={`transfer-details-${t.session_id}`}>
+                  <dl>
+                    <div>
+                      <dt>Device</dt>
+                      <dd>{transferPeerLabel(t)}</dd>
+                    </div>
+                    <div>
+                      <dt>Started</dt>
+                      <dd>{formatTransferTime(t.started_at)}</dd>
+                    </div>
+                    <div>
+                      <dt>Completed</dt>
+                      <dd>{formatTransferTime(t.completed_at)}</dd>
+                    </div>
+                    <div>
+                      <dt>Size</dt>
+                      <dd>{formatBytes(t.total)}</dd>
+                    </div>
+                    <div>
+                      <dt>Status</dt>
+                      <dd>{transferStatusLabel(t.status)}{t.message ? ` · ${t.message}` : ""}</dd>
+                    </div>
+                    <div class="transfer-path-detail">
+                      <dt>Path</dt>
+                      <dd>{t.path || "Not available"}</dd>
+                    </div>
+                  </dl>
                 </div>
               {/if}
             </div>
           {/each}
         </div>
       {:else}
-        <div class="files-empty muted">No files yet.</div>
+        <div class="files-empty muted">No recent transfers.</div>
       {/if}
     </div>
   {:else}
@@ -1679,7 +2305,7 @@
           class="danger-icon-btn"
           aria-label="Delete all history"
           title="Delete all history"
-          disabled={clips.length === 0}
+          disabled={clips.length === 0 || groupTransitionBusy}
           onclick={() => (confirmDeleteAllOpen = true)}
         >
           <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
@@ -1723,6 +2349,7 @@
                 onclick={() => delClip(c.id)}
                 aria-label="Delete clip on all devices"
                 title="Delete clip on all devices"
+                disabled={groupTransitionBusy}
               >
                 <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
                   <path d="M6 6l12 12" />
@@ -1871,12 +2498,56 @@
             <div class="pairing-qr-placeholder" role="status">Generating QR code…</div>
           {/if}
           <code class="pair-code">{pairingUri}</code>
+
+          <div class="pairing-approval-region" aria-live="polite" aria-atomic="false">
+            {#if pairingApprovalMessage}
+              <div class="pairing-approval-success" role="status">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M20 6 9 17l-5-5" />
+                </svg>
+                <span>{pairingApprovalMessage}</span>
+              </div>
+            {/if}
+            {#if visiblePairingPendingJoins.length > 0}
+              <div class="pairing-approval-heading">
+                <strong>Approval needed</strong>
+                <span>Confirm that you recognize each device before adding it.</span>
+              </div>
+              {#each visiblePairingPendingJoins as request (request.request_id)}
+                <div class="pairing-approval-card">
+                  <div class="pairing-request-device">
+                    <span>{request.label}</span>
+                    <small>Key {request.fingerprint} · requested {timeAgo(request.received_at)} ago</small>
+                  </div>
+                  <div class="pairing-request-actions">
+                    <button
+                      class="ghost"
+                      disabled={groupTransitionBusy}
+                      onclick={() => rejectJoin(request)}
+                    >{resolvingJoinId === request.request_id && resolvingJoinAction === "reject" ? "Rejecting…" : "Reject"}</button>
+                    <button
+                      class="send-btn"
+                      disabled={groupTransitionBusy}
+                      onclick={() => approveJoin(request)}
+                    >
+                      {resolvingJoinId === request.request_id && resolvingJoinAction === "approve" ? "Adding…" : "Add device"}
+                    </button>
+                  </div>
+                </div>
+              {/each}
+            {:else if !pairingApprovalMessage}
+              <div class="pairing-awaiting-request" role="status">
+                <span class="pairing-awaiting-dot" aria-hidden="true"></span>
+                Waiting for a device to open this invitation…
+              </div>
+            {/if}
+          </div>
           <div class="pairing-result-actions">
             <button class="ghost" onclick={closePairingDialog}>Done</button>
             <button
               class="send-btn"
               onclick={copyPairingCode}
-              disabled={pairingRefreshing || (!pairingIsPermanent && pairingSecondsLeft <= 0)}
+              disabled={groupTransitionBusy || (!pairingIsPermanent && pairingSecondsLeft <= 0)}
             >
               {pairingIsPermanent || pairingSecondsLeft > 0 ? "Copy invitation" : "Expired"}
             </button>
@@ -1934,7 +2605,7 @@
 
           <div class="pairing-setup-actions">
             <button class="ghost" onclick={closePairingDialog} disabled={pairingRefreshing}>Cancel</button>
-            <button class="send-btn" onclick={generatePairingCode} disabled={pairingRefreshing}>
+            <button class="send-btn" onclick={generatePairingCode} disabled={groupTransitionBusy}>
               {pairingRefreshing
                 ? "Generating…"
                 : pairingTemporary
@@ -1974,7 +2645,10 @@
           <button class="ghost" onclick={() => (confirmDeleteAllOpen = false)} disabled={deletingAll}>
             Cancel
           </button>
-          <button class="danger-btn" onclick={deleteAllClips} disabled={deletingAll}>
+          <button
+            class="danger-btn"
+            onclick={deleteAllClips}
+            disabled={groupTransitionBusy}>
             {deletingAll ? "Deleting..." : "Delete all"}
           </button>
         </div>
@@ -2001,16 +2675,16 @@
         onclick={(e) => e.stopPropagation()}
         onkeydown={(e) => e.stopPropagation()}
       >
-        <h3 id="delete-all-files-title">Delete all file history?</h3>
+        <h3 id="delete-all-files-title">Clear recent transfers?</h3>
         <p class="muted small">
-          This removes every file transfer from this list and cancels any transfers still in progress.
+          This clears this device’s temporary transfer list and cancels anything still in progress.
         </p>
         <div class="dialog-actions">
           <button class="ghost" onclick={() => (confirmDeleteAllFilesOpen = false)} disabled={deletingAllFiles}>
             Cancel
           </button>
           <button class="danger-btn" onclick={deleteAllTransfers} disabled={deletingAllFiles}>
-            {deletingAllFiles ? "Deleting..." : "Delete all"}
+            {deletingAllFiles ? "Clearing..." : "Clear all"}
           </button>
         </div>
       </div>
@@ -2036,27 +2710,51 @@
         onclick={(e) => e.stopPropagation()}
         onkeydown={(e) => e.stopPropagation()}
       >
-        <h3 id="send-file-title">Send file</h3>
-        <div class="transfer-file-card">
-          <span class="transfer-file">{pendingFile.name}</span>
-        </div>
+        <h3 id="send-file-title">
+          {pendingFile.grant_id ? "Send file" : "Choose recipient"}
+        </h3>
+        {#if pendingFile.grant_id}
+          <div class="transfer-file-card">
+            <span class="transfer-file">{pendingFile.name}</span>
+          </div>
+        {:else}
+          <p class="muted small recipient-flow-help">
+            Select a device, then choose the file you want to send.
+          </p>
+        {/if}
         <div class="recipient-list">
-          <span class="recipient-section-title">MY DEVICES · {networkName.toUpperCase()}</span>
-          {#each peerDevices as d (d.id)}
-            <button
-              class="recipient-button"
-              onclick={() => pendingFile && sendFileTo(pendingFile, d.id)}
-              disabled={sendingFile}
-            >
-              <span class="recipient-name">{d.label}</span>
-              <span class="recipient-meta">{d.id.slice(0, 8)}</span>
-            </button>
-          {/each}
-          <span class="recipient-section-title">PEOPLE</span>
-          <p class="muted small recipient-empty">No People connected yet.</p>
+          <span class="recipient-section-title">DEVICES IN {networkName.toUpperCase()}</span>
+          {#if peerDevices.length > 0}
+            {#each peerDevices as d (d.id)}
+              <button
+                class="recipient-button"
+                onclick={() => pendingFile && sendFileTo(pendingFile, d.id)}
+                disabled={groupTransitionBusy || !activeSyncGroup}
+              >
+                <span class="recipient-name">{d.label}</span>
+                <span class="recipient-meta">{d.id.slice(0, 8)}</span>
+              </button>
+            {/each}
+          {:else if isGroupAdmin}
+            <div class="recipient-empty-state">
+              <p>No other devices are in this group yet.</p>
+               <button
+                 class="pair-btn"
+                 onclick={addDeviceFromRecipientDialog}
+                 disabled={groupTransitionBusy}>Add a device</button
+               >
+            </div>
+          {:else}
+            <div class="recipient-empty-state">
+              <p>No other devices are available. The group admin needs to add one before you can send this file.</p>
+            </div>
+          {/if}
         </div>
         <div class="dialog-actions">
-          <button class="ghost" onclick={() => (pendingFile = null)} disabled={sendingFile}>
+          <button
+            class="ghost"
+            onclick={() => (pendingFile = null)}
+            disabled={groupTransitionBusy}>
             Cancel
           </button>
         </div>
@@ -2091,10 +2789,10 @@
           </span>
         </div>
         <div class="dialog-actions">
-          <button class="ghost" onclick={rejectIncomingFile} disabled={acceptingFile}>
+          <button class="ghost" onclick={rejectIncomingFile} disabled={groupTransitionBusy}>
             Decline
           </button>
-          <button class="send-btn" onclick={acceptIncomingFile} disabled={acceptingFile}>
+          <button class="send-btn" onclick={acceptIncomingFile} disabled={groupTransitionBusy}>
             {acceptingFile ? "Opening..." : "Save"}
           </button>
         </div>
@@ -2142,25 +2840,6 @@
   {/if}
 
   <div class="utility-footer" data-tauri-drag-region="false">
-    {#if activeSyncGroup}
-      <button
-        class="group-chip"
-        aria-label={`Active sync group: ${activeSyncGroup.name}`}
-        title="Switch sync group"
-        onclick={(event) => {
-          event.stopPropagation();
-          settingsOpen = true;
-        }}
-      >
-        <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
-          <circle cx="8" cy="9" r="3" />
-          <circle cx="17" cy="8" r="2.5" />
-          <path d="M3.5 19c.7-3.2 2.2-4.8 4.5-4.8s3.8 1.6 4.5 4.8" />
-          <path d="M14 13.2c2.8-.4 4.8 1.3 5.5 4.2" />
-        </svg>
-        <span>{activeSyncGroup.name}</span>
-      </button>
-    {/if}
     {#if activeView === "compose" && inRoom}
       <div class="footer-tools" data-tauri-drag-region="false">
         <button
@@ -2168,7 +2847,7 @@
           aria-label="Send a file"
           title="Send a file"
           onclick={chooseFileForSend}
-          disabled={sendingFile}
+          disabled={groupTransitionBusy || !activeSyncGroup}
         >
           <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
             <path d="M6.5 3.5h7l4 4v13h-11z" />
@@ -2441,46 +3120,6 @@
   .tab.active {
     background: #2a2a32;
     color: #e4e4e7;
-  }
-  .devices-panel {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 8px;
-  }
-  .devices-panel.expanded {
-    align-items: stretch;
-  }
-  .devices-compact {
-    display: flex;
-    align-items: center;
-    gap: 7px;
-  }
-  .device-toggle {
-    min-width: 28px;
-    height: 28px;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    background: #23232b;
-    border: 1px solid #343440;
-    color: #d4d4d8;
-    border-radius: 7px;
-    cursor: pointer;
-    padding: 0 9px;
-    font-size: 12px;
-    font-weight: 600;
-  }
-  .device-toggle:hover,
-  .device-toggle:focus-visible {
-    background: #2a2a32;
-    border-color: #4b4b58;
-    outline: none;
-  }
-  .roster {
-    border: 1px solid #2a2a32;
-    border-radius: 8px;
-    overflow: hidden;
   }
   .pair-btn {
     width: 100%;
@@ -3347,10 +3986,6 @@
     font-weight: 700;
     letter-spacing: 0.08em;
   }
-  .recipient-empty {
-    margin: 0;
-    padding: 4px 2px;
-  }
   .recipient-button {
     width: 100%;
     border: 1px solid #343440;
@@ -3626,9 +4261,6 @@
   :global(html[data-theme="light"]) .device-row {
     border-color: #dce6f1;
   }
-  :global(html[data-theme="light"]) .roster {
-    border-color: #c9d6e6;
-  }
   :global(html[data-theme="light"]) .transfer-track {
     background: #d8e2ef;
   }
@@ -3661,16 +4293,6 @@
   }
   :global(html[data-theme="light"]) .revoke-btn:hover {
     border-color: #b42318;
-  }
-  :global(html[data-theme="light"]) .device-toggle {
-    background: #edf4fb;
-    border-color: #c6d3e3;
-    color: #102033;
-  }
-  :global(html[data-theme="light"]) .device-toggle:hover,
-  :global(html[data-theme="light"]) .device-toggle:focus-visible {
-    background: #e2edf8;
-    border-color: #9fb7d1;
   }
   :global(html[data-theme="light"]) .danger-icon-btn {
     border-color: #d7b9b8;
@@ -4034,8 +4656,7 @@
   }
   .scheme-toggle button,
   .mini-action,
-  .ghost,
-  .unpair-btn {
+  .ghost {
     border: 1px solid var(--line);
     border-radius: 999px;
     background: var(--field-strong);
@@ -4048,8 +4669,7 @@
   }
   .scheme-toggle button.active,
   .mini-action:hover:not(:disabled),
-  .ghost:hover,
-  .unpair-btn:hover {
+  .ghost:hover {
     border-color: var(--line-strong);
     background: var(--mint-panel);
     color: var(--accent);
@@ -4112,7 +4732,6 @@
   :global(html[data-theme="onyx"]) .mini-action,
   :global(html[data-theme="onyx"]) .ghost,
   :global(html[data-theme="onyx"]) .send-btn,
-  :global(html[data-theme="onyx"]) .device-toggle,
   :global(html[data-theme="onyx"]) .pair-btn,
   :global(html[data-theme="onyx"]) .icon-btn,
   :global(html[data-theme="onyx"]) .tab.active,
@@ -4135,8 +4754,6 @@
   :global(html[data-theme="onyx"]) .mini-action:hover:not(:disabled),
   :global(html[data-theme="onyx"]) .ghost:hover,
   :global(html[data-theme="onyx"]) .send-btn:hover:not(:disabled),
-  :global(html[data-theme="onyx"]) .device-toggle:hover,
-  :global(html[data-theme="onyx"]) .device-toggle:focus-visible,
   :global(html[data-theme="onyx"]) .pair-btn:hover,
   :global(html[data-theme="onyx"]) .icon-btn:hover,
   :global(html[data-theme="onyx"]) .icon-btn:focus-visible,
@@ -4195,8 +4812,6 @@
   }
   :global(html[data-theme="melanzana"]) .mini-action:hover:not(:disabled),
   :global(html[data-theme="melanzana"]) .ghost:hover,
-  :global(html[data-theme="melanzana"]) .device-toggle:hover,
-  :global(html[data-theme="melanzana"]) .device-toggle:focus-visible,
   :global(html[data-theme="melanzana"]) .pair-btn:hover,
   :global(html[data-theme="melanzana"]) .icon-btn:hover,
   :global(html[data-theme="melanzana"]) .icon-btn:focus-visible,
@@ -4285,64 +4900,6 @@
     font-size: 14px;
   }
 
-  .devices-panel {
-    gap: 10px;
-  }
-  .device-toggle {
-    height: 48px;
-    min-width: 126px;
-    padding: 0 20px;
-    gap: 9px;
-    border: 1px solid rgba(199, 255, 0, 0.48);
-    border-radius: 999px;
-    background: rgba(199, 255, 0, 0.1);
-    color: var(--accent);
-    font-size: 17px;
-    font-weight: 900;
-  }
-  .device-toggle .icon-svg {
-    width: 18px;
-    height: 18px;
-    stroke-width: 3;
-  }
-  .device-toggle:hover,
-  .device-toggle:focus-visible {
-    background: rgba(199, 255, 0, 0.16);
-    border-color: var(--accent);
-    color: var(--accent);
-  }
-  :global(html[data-theme="light"]) .device-toggle {
-    border-color: rgba(11, 95, 211, 0.32);
-    background: rgba(11, 95, 211, 0.08);
-    color: var(--accent);
-  }
-  :global(html[data-theme="onyx"]) .device-toggle {
-    border-color: rgba(255, 255, 255, 0.32);
-    color: #ffffff;
-  }
-  :global(html[data-theme="onyx"]) .device-toggle:hover,
-  :global(html[data-theme="onyx"]) .device-toggle:focus-visible {
-    border-color: rgba(255, 255, 255, 0.56);
-    color: #ffffff;
-  }
-  :global(html[data-theme="melanzana"]) .device-toggle {
-    border-color: rgba(255, 155, 216, 0.38);
-    background: rgba(255, 155, 216, 0.08);
-    color: var(--accent);
-  }
-  :global(html[data-theme="melanzana"]) .device-toggle:hover,
-  :global(html[data-theme="melanzana"]) .device-toggle:focus-visible {
-    border-color: rgba(255, 178, 230, 0.62);
-    color: var(--text-strong);
-  }
-  .roster {
-    display: flex;
-    flex-direction: column;
-    gap: 9px;
-    border: none;
-    border-radius: 0;
-    overflow: visible;
-  }
   .pair-btn,
   .device-row,
   .transfer-item,
@@ -4390,8 +4947,7 @@
   .revoke-btn,
   .danger-icon-btn,
   .transfer-cancel,
-  .clip-del,
-  .unpair-btn {
+  .clip-del {
     color: var(--danger);
   }
   .revoke-btn,
@@ -4631,9 +5187,7 @@
   }
   .tab,
   .send-btn,
-  .device-toggle,
   .pair-btn,
-  .unpair-btn,
   .mini-action,
   .ghost,
   .danger-btn,
@@ -4720,9 +5274,6 @@
     padding: 14px 18px calc(12px + var(--footer-safe));
     gap: 8px;
   }
-  .compose.devices-open {
-    gap: 7px;
-  }
   .box {
     flex: 1 1 112px;
     min-height: 104px;
@@ -4731,20 +5282,10 @@
     font-size: 15px;
     line-height: 1.42;
   }
-  .compose.devices-open .box {
-    flex: 0 1 84px;
-    min-height: 84px;
-    padding-block: 12px;
-  }
   .compose-controls {
     justify-content: space-between;
     min-height: 40px;
     gap: 12px;
-  }
-  .compose-control-spacer {
-    flex: 1;
-    min-width: 1px;
-    height: 1px;
   }
   .send-btn {
     min-width: 96px;
@@ -4760,50 +5301,6 @@
     font-size: 13px;
   }
 
-  .devices-panel {
-    margin: 0;
-    align-self: center;
-  }
-  .devices-compact {
-    display: flex;
-  }
-  .device-toggle {
-    height: 40px;
-    min-width: 108px;
-    padding: 0 16px;
-    gap: 7px;
-    font-size: 14px;
-  }
-  .device-toggle .icon-svg {
-    width: 16px;
-    height: 16px;
-    stroke-width: 2.5;
-  }
-  .roster {
-    max-height: 122px;
-    overflow-y: auto;
-    gap: 0;
-    padding: 2px 4px 2px 0;
-    border-top: 1px solid var(--line-soft);
-    border-bottom: 1px solid var(--line-soft);
-    scrollbar-width: thin;
-    scrollbar-color: var(--line-strong) transparent;
-  }
-  .compose.devices-open .roster {
-    max-height: 178px;
-  }
-  .roster::-webkit-scrollbar {
-    width: 8px;
-  }
-  .roster::-webkit-scrollbar-track {
-    background: transparent;
-  }
-  .roster::-webkit-scrollbar-thumb {
-    background: var(--line-strong);
-    border: 2px solid transparent;
-    border-radius: 999px;
-    background-clip: padding-box;
-  }
   .pair-btn {
     width: auto;
     align-self: flex-start;
@@ -4834,27 +5331,6 @@
     background: transparent;
     font-size: 12px;
     font-weight: 400;
-  }
-  .unpair-btn {
-    width: 100%;
-    margin: 2px 0 0;
-    padding: 7px 2px 5px;
-    border: 0;
-    border-top: 1px solid var(--line-soft);
-    border-radius: 0;
-    background: transparent;
-    color: var(--danger);
-    font-size: 12px;
-    font-weight: 400;
-    text-align: left;
-    cursor: pointer;
-  }
-  .unpair-btn:hover,
-  .unpair-btn:focus-visible {
-    background: transparent;
-    border-color: var(--line-soft);
-    color: var(--danger);
-    outline: none;
   }
   .room-empty {
     padding-top: 0;
@@ -5184,52 +5660,32 @@
     bottom: auto;
     margin-left: auto;
   }
-  .group-chip {
-    min-width: 0;
-    max-width: 126px;
-    height: 24px;
-    margin-right: 6px;
-    padding: 0 8px 0 6px;
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    border: 1px solid var(--line-soft);
+  .pending-count {
+    display: inline-grid;
+    place-items: center;
+    min-width: 18px;
+    height: 18px;
+    padding: 0 5px;
+    flex: 0 0 auto;
     border-radius: 999px;
-    background: var(--field);
-    color: var(--muted);
-    pointer-events: auto;
-    cursor: pointer;
+    background: var(--accent);
+    color: var(--shell-bg);
+    font-size: 10px;
+    font-weight: 900;
+    line-height: 1;
   }
-  .group-chip:hover,
-  .group-chip:focus-visible {
-    border-color: var(--line-strong);
-    color: var(--accent);
-    outline: none;
-    box-shadow: 0 0 0 2px var(--focus);
+  .settings-button {
+    position: relative;
   }
-  .group-chip .icon-svg {
-    width: 13px;
-    height: 13px;
-    flex: 0 0 13px;
-    stroke-width: 1.8;
-  }
-  .group-chip span {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: 12px;
-    font-weight: 800;
+  .settings-button:disabled {
+    opacity: 0.55;
+    cursor: default;
+    transform: none;
   }
   .settings-menu {
     max-height: calc(100vh - 76px);
     overflow-y: auto;
     overscroll-behavior: contain;
-  }
-  .group-picker-row {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    gap: 6px;
   }
   .settings-select {
     min-width: 0;
@@ -5327,6 +5783,659 @@
     word-break: break-all;
   }
 
+  .group-default-setting {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 10px;
+    border: 1px solid var(--line-soft);
+    border-radius: 13px;
+    background: var(--field);
+  }
+  .group-default-setting.is-default {
+    border-color: var(--line-strong);
+    background: var(--mint-panel);
+  }
+  .group-default-setting > div {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .group-default-setting strong {
+    color: var(--text-strong);
+    font-size: 12px;
+  }
+  .group-default-setting div span {
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.3;
+  }
+  .default-state,
+  .target-default-badge {
+    display: inline-flex;
+    align-items: center;
+    border: 1px solid var(--line-strong);
+    border-radius: 999px;
+    background: var(--mint-panel);
+    color: var(--mint);
+    font-weight: 800;
+    letter-spacing: 0.02em;
+  }
+  .default-state {
+    min-height: 25px;
+    padding: 0 8px;
+    font-size: 11px;
+  }
+  .group-default-action {
+    min-height: 28px;
+    padding: 0 9px;
+    border: 1px solid var(--line-strong);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--accent);
+    font: inherit;
+    font-size: 11px;
+    font-weight: 800;
+    cursor: pointer;
+  }
+  .group-default-action:hover:not(:disabled),
+  .group-default-action:focus-visible {
+    background: var(--field-strong);
+    outline: none;
+    box-shadow: 0 0 0 2px var(--focus);
+  }
+  .group-default-action:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+  .group-remove-guidance {
+    margin: 0;
+    padding: 8px 9px;
+    border: 1px solid var(--danger-line);
+    border-radius: 10px;
+    background: var(--danger-panel);
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.35;
+  }
+  .group-remove:disabled {
+    color: var(--muted-soft);
+    cursor: not-allowed;
+    text-decoration: none;
+  }
+
+  .network-target {
+    min-width: 0;
+    max-width: calc(100% - 112px);
+    height: 40px;
+    padding: 0 7px 0 1px;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    border: 0;
+    border-radius: 10px;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    transition:
+      color 180ms cubic-bezier(0.32, 0.72, 0, 1),
+      background 180ms cubic-bezier(0.32, 0.72, 0, 1);
+  }
+  .network-target:hover:not(:disabled),
+  .network-target:focus-visible {
+    background: var(--field-strong);
+    color: var(--text);
+    outline: none;
+  }
+  .network-target:focus-visible {
+    box-shadow: 0 0 0 2px var(--focus);
+  }
+  .network-target:disabled {
+    opacity: 0.58;
+    cursor: default;
+  }
+  .network-target-prefix {
+    flex: 0 0 auto;
+  }
+  .network-target strong {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--text-strong);
+    font-weight: 800;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .network-target-chevron {
+    width: 13px;
+    height: 13px;
+    flex: 0 0 13px;
+    fill: none;
+    stroke: var(--muted-soft);
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    stroke-width: 2;
+  }
+  .network-target:hover:not(:disabled) .network-target-chevron,
+  .network-target:focus-visible .network-target-chevron {
+    stroke: var(--accent);
+  }
+  .target-waiting-badge {
+    flex: 0 0 auto;
+    padding: 2px 6px;
+    border: 1px solid var(--line-soft);
+    border-radius: 999px;
+    color: var(--muted);
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 0.03em;
+    line-height: 1.2;
+    text-transform: uppercase;
+  }
+  .target-default-badge {
+    flex: 0 0 auto;
+    padding: 2px 6px;
+    font-size: 9px;
+    line-height: 1.2;
+    text-transform: uppercase;
+  }
+
+  .devices-view {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .devices-view-scroll {
+    height: 100%;
+    padding: 15px 18px calc(20px + var(--footer-safe));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    box-sizing: border-box;
+    scrollbar-color: var(--line-strong) transparent;
+    scrollbar-width: thin;
+    animation: devices-view-enter 220ms cubic-bezier(0.32, 0.72, 0, 1) both;
+  }
+  .devices-view-scroll::-webkit-scrollbar {
+    width: 8px;
+  }
+  .devices-view-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .devices-view-scroll::-webkit-scrollbar-thumb {
+    border: 2px solid transparent;
+    border-radius: 999px;
+    background: var(--line-strong);
+    background-clip: padding-box;
+  }
+  @keyframes devices-view-enter {
+    from {
+      opacity: 0;
+      transform: translateX(8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateX(0);
+    }
+  }
+  .devices-view-heading {
+    display: grid;
+    grid-template-columns: 32px minmax(0, 1fr);
+    align-items: start;
+    gap: 10px;
+    padding-bottom: 13px;
+  }
+  .devices-back {
+    width: 32px;
+    height: 32px;
+    display: grid;
+    place-items: center;
+    margin-top: 1px;
+    padding: 0;
+    border: 1px solid var(--line-soft);
+    border-radius: 11px;
+    background: var(--field);
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .devices-back:hover,
+  .devices-back:focus-visible {
+    border-color: var(--line-strong);
+    color: var(--accent);
+    outline: none;
+    box-shadow: 0 0 0 2px var(--focus);
+  }
+  .devices-back .icon-svg {
+    width: 15px;
+    height: 15px;
+  }
+  .devices-heading-copy {
+    min-width: 0;
+  }
+  .devices-eyebrow {
+    display: block;
+    margin-bottom: 1px;
+    color: var(--accent);
+    font-size: 9px;
+    font-weight: 900;
+    letter-spacing: 0.13em;
+  }
+  .devices-heading-copy h2 {
+    margin: 0;
+    color: var(--text-strong);
+    font-size: 20px;
+    font-weight: 750;
+    letter-spacing: -0.025em;
+    line-height: 1.1;
+  }
+  .devices-heading-copy p {
+    margin: 4px 0 0;
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.35;
+  }
+  .devices-view-scroll > .status {
+    margin: 0 0 8px;
+  }
+  .devices-section {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px 0;
+    border-top: 1px solid var(--line-soft);
+  }
+  .devices-group-section {
+    padding: 11px 12px 12px;
+    border: 1px solid var(--line-soft);
+    border-radius: 16px;
+    background: color-mix(in srgb, var(--field) 78%, transparent);
+  }
+  .devices-section + .devices-section {
+    margin-top: 2px;
+  }
+  .devices-section-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .devices-section-heading > div {
+    min-width: 0;
+  }
+  .devices-section-heading h3 {
+    margin: 0;
+    overflow: hidden;
+    color: var(--text-strong);
+    font-size: 13px;
+    font-weight: 750;
+    line-height: 1.25;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .devices-section-heading p {
+    margin: 2px 0 0;
+    color: var(--muted);
+    font-size: 10.5px;
+    line-height: 1.3;
+  }
+  .devices-group-select {
+    height: 38px;
+    padding-block: 0;
+  }
+  .devices-add-action {
+    min-height: 31px;
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 5px;
+    padding: 0 10px;
+    border: 1px solid var(--line-strong);
+    border-radius: 999px;
+    background: var(--accent);
+    color: var(--shell-bg);
+    font: inherit;
+    font-size: 11px;
+    font-weight: 850;
+    cursor: pointer;
+  }
+  .devices-add-action:hover:not(:disabled),
+  .devices-add-action:focus-visible {
+    background: var(--accent-hover);
+    outline: none;
+    box-shadow: 0 0 0 2px var(--focus);
+  }
+  .devices-add-action:disabled {
+    opacity: 0.55;
+    cursor: default;
+  }
+  .devices-add-action .icon-svg {
+    width: 13px;
+    height: 13px;
+    stroke-width: 2.4;
+  }
+  .device-management-list {
+    overflow: hidden;
+    border: 1px solid var(--line-soft);
+    border-radius: 15px;
+    background: var(--field);
+  }
+  .device-management-list .device-row {
+    display: grid;
+    grid-template-columns: 30px minmax(0, 1fr) auto;
+    gap: 9px;
+    min-height: 48px;
+    padding: 8px 9px;
+    border: 0;
+    border-bottom: 1px solid var(--line-soft);
+    border-radius: 0;
+    box-sizing: border-box;
+  }
+  .device-management-list .device-row:last-child {
+    border-bottom: 0;
+  }
+  .device-avatar {
+    width: 30px;
+    height: 30px;
+    display: grid;
+    place-items: center;
+    border: 1px solid var(--line-soft);
+    border-radius: 10px;
+    background: var(--field-strong);
+    color: var(--accent);
+  }
+  .device-avatar .icon-svg {
+    width: 15px;
+    height: 15px;
+    stroke-width: 1.7;
+  }
+  .device-management-list .device-label {
+    color: var(--text-strong);
+    font-size: 12.5px;
+    font-weight: 700;
+  }
+  .device-row-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+  }
+  .device-role {
+    padding: 2px 6px;
+    border: 1px solid var(--line-soft);
+    border-radius: 999px;
+    background: var(--mint-panel);
+    color: var(--mint);
+    font-size: 9px;
+    font-weight: 850;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+  }
+  .device-management-list .revoke-btn {
+    padding: 4px 6px;
+    border: 0;
+    color: var(--danger);
+    font-size: 11px;
+    font-weight: 650;
+  }
+  .device-management-list .revoke-btn:hover,
+  .device-management-list .revoke-btn:focus-visible {
+    background: var(--danger-panel);
+    outline: none;
+  }
+  .devices-empty-state {
+    padding: 12px;
+    border: 1px dashed var(--line-strong);
+    border-radius: 13px;
+    background: var(--field);
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.4;
+  }
+  .devices-group-management {
+    gap: 9px;
+    padding-bottom: 8px;
+  }
+  .devices-view .pending-joins {
+    margin: 0;
+  }
+  .devices-view .pending-join-row {
+    align-items: flex-start;
+  }
+  .devices-view .pending-join-actions {
+    align-self: center;
+  }
+
+  .pairing-approval-region {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+  }
+  .pairing-approval-heading {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding-top: 2px;
+  }
+  .pairing-approval-heading strong {
+    color: var(--text-strong);
+    font-size: 12px;
+  }
+  .pairing-approval-heading span {
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.3;
+  }
+  .pairing-approval-card {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 9px;
+    padding: 9px 10px;
+    border: 1px solid var(--line-strong);
+    border-radius: 12px;
+    background: var(--field-strong);
+  }
+  .pairing-request-device {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .pairing-request-device > span {
+    overflow: hidden;
+    color: var(--text-strong);
+    font-size: 12px;
+    font-weight: 800;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .pairing-request-device small {
+    overflow: hidden;
+    color: var(--muted);
+    font-size: 10px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .pairing-request-actions {
+    display: flex;
+    gap: 5px;
+  }
+  .pairing-request-actions .ghost,
+  .pairing-request-actions .send-btn {
+    min-width: 0;
+    height: 30px;
+    min-height: 30px;
+    padding: 0 9px;
+    font-size: 11px;
+  }
+  .pairing-approval-success {
+    display: flex;
+    align-items: flex-start;
+    gap: 7px;
+    padding: 8px 9px;
+    border: 1px solid var(--line-strong);
+    border-radius: 11px;
+    background: var(--mint-panel);
+    color: var(--text-strong);
+    font-size: 11px;
+    line-height: 1.35;
+  }
+  .pairing-approval-success svg {
+    flex: 0 0 15px;
+    width: 15px;
+    height: 15px;
+    fill: none;
+    stroke: var(--mint);
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    stroke-width: 2;
+  }
+  .pairing-awaiting-request {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    padding: 6px;
+    color: var(--muted);
+    font-size: 11px;
+  }
+  .pairing-awaiting-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 0 var(--focus);
+    animation: pairing-awaiting-pulse 1.8s ease-out infinite;
+  }
+  @keyframes pairing-awaiting-pulse {
+    70%,
+    100% {
+      box-shadow: 0 0 0 7px transparent;
+    }
+  }
+
+  .transfer-head {
+    grid-template-columns: 24px minmax(0, 1fr) auto auto;
+  }
+  .transfer-direction {
+    display: grid;
+    width: 24px;
+    height: 24px;
+    place-items: center;
+    border: 1px solid var(--line-soft);
+    border-radius: 8px;
+    background: var(--field-strong);
+    color: var(--muted);
+  }
+  .transfer-direction.incoming {
+    color: var(--mint);
+  }
+  .transfer-direction.outgoing {
+    color: var(--accent);
+  }
+  .transfer-direction.unknown {
+    border-style: dashed;
+  }
+  .transfer-direction svg {
+    width: 14px;
+    height: 14px;
+    fill: none;
+    stroke: currentColor;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    stroke-width: 1.8;
+  }
+  .transfer-summary {
+    display: flex;
+    min-width: 0;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .transfer-summary-meta {
+    color: var(--muted-soft);
+    font-size: 10px;
+    line-height: 1;
+  }
+  .transfer-detail-toggle {
+    display: grid;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    place-items: center;
+    border: 0;
+    border-radius: 9px;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .transfer-detail-toggle:hover,
+  .transfer-detail-toggle:focus-visible,
+  .transfer-detail-toggle[aria-expanded="true"] {
+    background: var(--field-strong);
+    color: var(--accent);
+    outline: none;
+  }
+  .transfer-detail-toggle .icon-svg {
+    width: 14px;
+    height: 14px;
+  }
+  .transfer-details-panel {
+    padding: 7px 8px 3px 31px;
+    border-top: 1px solid var(--line-soft);
+  }
+  .transfer-details-panel dl {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 7px 12px;
+    margin: 0;
+  }
+  .transfer-details-panel dl > div {
+    min-width: 0;
+  }
+  .transfer-details-panel dt {
+    margin-bottom: 1px;
+    color: var(--muted-soft);
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+  }
+  .transfer-details-panel dd {
+    margin: 0;
+    overflow-wrap: anywhere;
+    color: var(--text);
+    font-size: 10px;
+    line-height: 1.3;
+  }
+  .transfer-path-detail {
+    grid-column: 1 / -1;
+  }
+
+  .recipient-empty-state {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 9px;
+    padding: 11px;
+    border: 1px dashed var(--line-strong);
+    border-radius: 12px;
+    background: var(--field);
+  }
+  .recipient-empty-state p {
+    margin: 0;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.4;
+  }
+  .recipient-empty-state .pair-btn {
+    margin: 0;
+  }
+  .recipient-flow-help {
+    margin: -2px 0 0;
+  }
+
   .title {
     cursor: default;
     user-select: none;
@@ -5371,6 +6480,168 @@
   .transfer-reveal:focus-visible {
     color: var(--accent);
     outline: none;
+  }
+
+  .compose.onboarding {
+    position: relative;
+  }
+  .room-empty.initial-setup {
+    position: relative;
+    width: 100%;
+    max-width: 374px;
+    margin: auto;
+    padding: 15px 17px 17px;
+    overflow: hidden;
+    border: 1px solid var(--line-soft);
+    border-radius: 24px;
+    background:
+      linear-gradient(160deg, color-mix(in srgb, var(--panel-raised) 78%, transparent), transparent 66%),
+      var(--field);
+    box-shadow:
+      inset 0 1px 0 color-mix(in srgb, var(--text-strong) 8%, transparent),
+      0 18px 42px rgba(0, 0, 0, 0.16);
+    text-align: left;
+    box-sizing: border-box;
+    isolation: isolate;
+  }
+  .room-empty.initial-setup::before {
+    content: "";
+    position: absolute;
+    z-index: -1;
+    inset: -80px -40px auto;
+    height: 220px;
+    background: radial-gradient(circle at 50% 46%, var(--focus), transparent 63%);
+    pointer-events: none;
+  }
+  .onboarding-intro {
+    text-align: center;
+  }
+  .onboarding-network {
+    display: block;
+    width: 218px;
+    height: 82px;
+    margin: -5px auto 1px;
+    overflow: visible;
+  }
+  .onboarding-link {
+    fill: none;
+    stroke: var(--line-strong);
+    stroke-dasharray: 3 4;
+    stroke-linecap: round;
+    stroke-width: 1.25;
+    opacity: 0.72;
+  }
+  .onboarding-link-low {
+    opacity: 0.32;
+  }
+  .onboarding-signal {
+    fill: var(--accent);
+    opacity: 0.12;
+    transform-box: fill-box;
+    transform-origin: center;
+    animation: onboarding-signal 2.5s ease-out infinite;
+  }
+  .onboarding-node rect {
+    fill: var(--field-strong);
+    stroke: var(--line-strong);
+    stroke-width: 1.25;
+  }
+  .onboarding-node path {
+    fill: none;
+    stroke: var(--muted);
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    stroke-width: 1.4;
+  }
+  .onboarding-node-primary rect {
+    fill: var(--mint-panel);
+    stroke: var(--accent);
+  }
+  .onboarding-node-primary path {
+    stroke: var(--accent);
+  }
+  @keyframes onboarding-signal {
+    0% {
+      opacity: 0.18;
+      transform: scale(0.72);
+    }
+    68%,
+    100% {
+      opacity: 0;
+      transform: scale(1.85);
+    }
+  }
+  .onboarding-eyebrow {
+    display: block;
+    margin-top: -1px;
+    color: var(--accent);
+    font-size: 9px;
+    font-weight: 900;
+    letter-spacing: 0.14em;
+  }
+  .onboarding-intro h2 {
+    margin: 4px 0 0;
+    color: var(--text-strong);
+    font-size: 19px;
+    font-weight: 760;
+    letter-spacing: -0.025em;
+    line-height: 1.15;
+  }
+  .onboarding-intro p {
+    max-width: 312px;
+    margin: 8px auto 0;
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.5;
+  }
+  .initial-setup .room-actions {
+    margin-top: 18px;
+  }
+  .initial-setup .ghost.onboarding-create {
+    width: 100%;
+    min-height: 41px;
+    border-color: var(--accent);
+    border-radius: 14px;
+    background: var(--accent);
+    color: var(--shell-bg);
+    font-size: 12px;
+    font-weight: 850;
+    box-shadow: 0 8px 24px color-mix(in srgb, var(--accent) 10%, transparent);
+  }
+  .initial-setup .ghost.onboarding-create:hover,
+  .initial-setup .ghost.onboarding-create:focus-visible {
+    border-color: var(--accent-hover);
+    background: var(--accent-hover);
+    color: var(--shell-bg);
+    outline: none;
+    box-shadow: 0 0 0 3px var(--focus);
+  }
+  .initial-setup .divider {
+    gap: 12px;
+    margin: 16px 0 12px;
+    color: var(--muted);
+    font-size: 9px;
+    font-weight: 750;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+  .onboarding-join-row.initial {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 9px;
+  }
+  .onboarding-join-row.initial .join-input {
+    width: 100%;
+    min-width: 0;
+    height: 39px;
+    box-sizing: border-box;
+  }
+  .onboarding-join-row.initial .ghost {
+    min-height: 39px;
+    padding-inline: 11px;
+    border-radius: 13px;
+    font-size: 11px;
+    white-space: nowrap;
   }
 
   .confetti-layer {
@@ -5429,6 +6700,12 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
+    .devices-view-scroll {
+      animation: none;
+    }
+    .onboarding-signal {
+      animation: none;
+    }
     .confetti-layer {
       display: none;
     }
@@ -5436,6 +6713,9 @@
     .footer-tools .private-toggle,
     .transfer-reveal {
       transition: none;
+    }
+    .pairing-awaiting-dot {
+      animation: none;
     }
   }
 

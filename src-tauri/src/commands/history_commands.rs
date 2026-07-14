@@ -6,10 +6,15 @@ use super::*;
 /// already authorized for the active group.
 async fn broadcast_clip_deletions(
     state: &Arc<AppState>,
+    network_id: &str,
     msg_ids: &[[u8; 16]],
 ) -> Result<(), String> {
     if msg_ids.is_empty() {
         return Ok(());
+    }
+    {
+        let settings = state.settings.lock().await;
+        ensure_expected_active_group(&settings, network_id, "deleting clip history")?;
     }
     let room = state
         .roster
@@ -20,6 +25,10 @@ async fn broadcast_clip_deletions(
     let Some((topic, epoch)) = room else {
         return Ok(());
     };
+    {
+        let settings = state.settings.lock().await;
+        ensure_expected_active_group(&settings, network_id, "deleting clip history")?;
+    }
     let base = state.ntfy_base.lock().await.clone();
     for msg_id in msg_ids {
         let delete_msg = sign_delete_clip(&state.device, *msg_id, topic.clone(), epoch, now_unix());
@@ -32,9 +41,14 @@ async fn broadcast_clip_deletions(
 #[tauri::command]
 pub async fn recent_clips(
     state: State<'_, Arc<AppState>>,
+    network_id: String,
     limit: Option<i64>,
 ) -> Result<Vec<ClipDto>, String> {
-    let group_id = current_sync_group_id(state.inner()).await?;
+    let group_id = network_id.trim().to_string();
+    {
+        let settings = state.settings.lock().await;
+        ensure_expected_active_group(&settings, &group_id, "loading clip history")?;
+    }
     let clips = state
         .store
         .recent_for_group(&group_id, limit.unwrap_or(50))
@@ -46,9 +60,14 @@ pub async fn recent_clips(
 #[tauri::command]
 pub async fn search_clips(
     state: State<'_, Arc<AppState>>,
+    network_id: String,
     query: String,
 ) -> Result<Vec<ClipDto>, String> {
-    let group_id = current_sync_group_id(state.inner()).await?;
+    let group_id = network_id.trim().to_string();
+    {
+        let settings = state.settings.lock().await;
+        ensure_expected_active_group(&settings, &group_id, "searching clip history")?;
+    }
     let clips = state
         .store
         .search_for_group(&group_id, &query, 50_i64)
@@ -59,7 +78,16 @@ pub async fn search_clips(
 /// Delete a clip from local history by id, and ask paired devices to remove
 /// their matching history row when this row is tied to a relay message id.
 #[tauri::command]
-pub async fn delete_clip(state: State<'_, Arc<AppState>>, id: i64) -> Result<(), String> {
+pub async fn delete_clip(
+    state: State<'_, Arc<AppState>>,
+    id: i64,
+    network_id: String,
+) -> Result<(), String> {
+    let network_id = network_id.trim().to_string();
+    {
+        let settings = state.settings.lock().await;
+        ensure_expected_active_group(&settings, &network_id, "deleting the clip")?;
+    }
     let active_group_id = current_sync_group_id(state.inner()).await?;
     let clip_group_id = state
         .store
@@ -72,9 +100,13 @@ pub async fn delete_clip(state: State<'_, Arc<AppState>>, id: i64) -> Result<(),
     let msg_id = state.store.msg_id_for_clip(id).map_err(|e| e.to_string())?;
 
     if let Some(msg_id) = msg_id {
-        broadcast_clip_deletions(state.inner(), std::slice::from_ref(&msg_id)).await?;
+        broadcast_clip_deletions(state.inner(), &network_id, std::slice::from_ref(&msg_id)).await?;
     }
 
+    {
+        let settings = state.settings.lock().await;
+        ensure_expected_active_group(&settings, &network_id, "deleting the clip")?;
+    }
     state.store.delete(id).map_err(|e| e.to_string())
 }
 
@@ -84,14 +116,23 @@ pub async fn delete_clip(state: State<'_, Arc<AppState>>, id: i64) -> Result<(),
 pub async fn delete_all_clips(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
+    network_id: String,
 ) -> Result<(), String> {
-    let group_id = current_sync_group_id(state.inner()).await?;
+    let group_id = network_id.trim().to_string();
+    {
+        let settings = state.settings.lock().await;
+        ensure_expected_active_group(&settings, &group_id, "deleting clip history")?;
+    }
     let msg_ids = state
         .store
         .all_msg_ids_for_group(&group_id)
         .map_err(|e| e.to_string())?;
-    broadcast_clip_deletions(state.inner(), &msg_ids).await?;
+    broadcast_clip_deletions(state.inner(), &group_id, &msg_ids).await?;
 
+    {
+        let settings = state.settings.lock().await;
+        ensure_expected_active_group(&settings, &group_id, "deleting clip history")?;
+    }
     state
         .store
         .delete_all_for_group(&group_id)

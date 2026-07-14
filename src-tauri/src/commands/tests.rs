@@ -141,6 +141,382 @@ fn legacy_settings_default_transfer_timeout() {
 }
 
 #[test]
+fn legacy_settings_keep_the_first_group_as_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    let first = "11111111111111111111111111111111";
+    let second = "22222222222222222222222222222222";
+    std::fs::write(
+        &path,
+        format!(
+            r#"{{"device_label":"Desk","stun_servers":["stun:example.com:3478"],"sync_groups":[{{"id":"{first}","name":"My devices"}},{{"id":"{second}","name":"Friends"}}],"active_sync_group_id":"{second}"}}"#
+        ),
+    )
+    .unwrap();
+
+    let settings = load_settings(&path);
+    assert_eq!(settings.active_sync_group_id.as_deref(), Some(second));
+    assert_eq!(settings.default_sync_group_id.as_deref(), Some(first));
+}
+
+#[test]
+fn startup_selects_the_configured_default_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let groups_dir = dir.path().join("groups");
+    let legacy_path = dir.path().join("roster.bin");
+    let first = "11111111111111111111111111111111".to_string();
+    let second = "22222222222222222222222222222222".to_string();
+    let mut settings = AppSettings {
+        sync_groups: vec![
+            SyncGroupConfig {
+                id: first.clone(),
+                name: "My devices".to_string(),
+            },
+            SyncGroupConfig {
+                id: second.clone(),
+                name: "Friends".to_string(),
+            },
+        ],
+        active_sync_group_id: Some(second),
+        default_sync_group_id: Some(first.clone()),
+        ..AppSettings::default()
+    };
+
+    let (selected_path, roster) = prepare_sync_groups(&mut settings, &groups_dir, &legacy_path)
+        .unwrap()
+        .expect("configured groups select one at startup");
+
+    assert!(roster.is_none());
+    assert_eq!(
+        settings.active_sync_group_id.as_deref(),
+        Some(first.as_str())
+    );
+    assert_eq!(
+        settings.default_sync_group_id.as_deref(),
+        Some(first.as_str())
+    );
+    assert_eq!(
+        selected_path.file_name().and_then(|name| name.to_str()),
+        Some("11111111111111111111111111111111.bin")
+    );
+}
+
+#[tokio::test]
+async fn first_created_group_becomes_the_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(AppState::new(
+        DeviceKeypairs::generate(),
+        HistoryStore::open(Path::new(":memory:"), &[12u8; 32]).unwrap(),
+    ));
+    *state.groups_dir.lock().await = Some(dir.path().join("groups"));
+    std::fs::create_dir_all(state.groups_dir.lock().await.as_ref().unwrap()).unwrap();
+
+    let id = ensure_active_sync_group(&state, "My devices")
+        .await
+        .unwrap();
+    let settings = state.settings.lock().await;
+    assert_eq!(settings.active_sync_group_id.as_deref(), Some(id.as_str()));
+    assert_eq!(settings.default_sync_group_id.as_deref(), Some(id.as_str()));
+}
+
+#[test]
+fn adding_another_group_preserves_the_existing_default() {
+    let first = "11111111111111111111111111111111".to_string();
+    let second = "22222222222222222222222222222222".to_string();
+    let mut settings = AppSettings {
+        sync_groups: vec![SyncGroupConfig {
+            id: first.clone(),
+            name: "My devices".to_string(),
+        }],
+        active_sync_group_id: Some(first.clone()),
+        default_sync_group_id: Some(first.clone()),
+        ..AppSettings::default()
+    };
+
+    let (previous_active, previous_default) =
+        sync_groups::add_sync_group_config(&mut settings, second.clone(), "Friends".to_string())
+            .unwrap();
+
+    assert_eq!(previous_active.as_deref(), Some(first.as_str()));
+    assert_eq!(previous_default.as_deref(), Some(first.as_str()));
+    assert_eq!(
+        settings.default_sync_group_id.as_deref(),
+        Some(first.as_str())
+    );
+    assert!(settings.sync_groups.iter().any(|group| group.id == second));
+}
+
+#[test]
+fn disconnected_group_cannot_become_default() {
+    let error = sync_groups::ensure_group_can_be_default(None).unwrap_err();
+    assert!(error.contains("connected, approved group"));
+}
+
+#[test]
+fn destructive_group_action_rejects_a_stale_active_group() {
+    let first = "11111111111111111111111111111111".to_string();
+    let second = "22222222222222222222222222222222".to_string();
+    let settings = AppSettings {
+        active_sync_group_id: Some(second),
+        ..AppSettings::default()
+    };
+
+    let error = sync_groups::ensure_expected_active_group(&settings, &first, "deleting the group")
+        .unwrap_err();
+    assert!(error.contains("active group changed"));
+}
+
+#[test]
+fn removing_a_default_group_selects_a_safe_replacement() {
+    let first = "11111111111111111111111111111111".to_string();
+    let second = "22222222222222222222222222222222".to_string();
+    let mut settings = AppSettings {
+        sync_groups: vec![
+            SyncGroupConfig {
+                id: first.clone(),
+                name: "My devices".to_string(),
+            },
+            SyncGroupConfig {
+                id: second.clone(),
+                name: "Friends".to_string(),
+            },
+        ],
+        active_sync_group_id: Some(first.clone()),
+        default_sync_group_id: Some(first.clone()),
+        ..AppSettings::default()
+    };
+
+    let next = sync_groups::remove_group_from_settings(&mut settings, &first, None).unwrap();
+
+    assert_eq!(next.as_deref(), Some(second.as_str()));
+    assert_eq!(
+        settings.default_sync_group_id.as_deref(),
+        Some(second.as_str())
+    );
+}
+
+#[test]
+fn group_admin_cannot_leave_members_orphaned() {
+    let admin = DeviceKeypairs::generate();
+    let member = DeviceKeypairs::generate();
+    let genesis = roster::sign_and_chain(
+        &admin,
+        roster::build_genesis(&admin, "Admin", "topic"),
+        None,
+    )
+    .unwrap();
+    let with_member = roster::sign_and_chain(
+        &admin,
+        roster::build_add_device(&genesis, identity(&member, "Member")),
+        Some(&genesis),
+    )
+    .unwrap();
+    let verified = VerifiedRoster::verify_first(genesis)
+        .unwrap()
+        .verify_next(with_member)
+        .unwrap();
+
+    assert!(
+        sync_groups::ensure_group_can_be_left_locally(&admin.signing_pub, Some(&verified))
+            .unwrap_err()
+            .contains("cannot leave while other devices remain")
+    );
+    assert!(
+        sync_groups::ensure_group_can_be_left_locally(&member.signing_pub, Some(&verified)).is_ok()
+    );
+    assert!(
+        sync_groups::ensure_group_can_be_left_locally(&admin.signing_pub, None)
+            .unwrap_err()
+            .contains("verified membership could not be loaded")
+    );
+}
+
+#[test]
+fn group_removal_notice_is_private_and_victim_only() {
+    let admin = DeviceKeypairs::generate();
+    let victim = DeviceKeypairs::generate();
+    let bystander = DeviceKeypairs::generate();
+    let old_topic = "old-topic";
+    let sealed = crypto::seal_clip(
+        &admin,
+        &[crypto::Recipient {
+            id: victim.signing_pub.clone(),
+            x25519: victim.x25519_pub.clone(),
+        }],
+        &encode_group_removal_notice(),
+        old_topic,
+        4,
+        StorePolicy::Private,
+        100,
+    )
+    .unwrap();
+
+    assert_eq!(sealed.manifest.room_id, old_topic);
+    assert_eq!(sealed.manifest.recipients.len(), 1);
+    assert_eq!(
+        sealed.manifest.recipients[0].recipient_id,
+        victim.signing_pub
+    );
+    assert_eq!(sealed.manifest.store_policy, StorePolicy::Private);
+    let opened = crypto::open_clip(&sealed.manifest, &sealed.chunks, &victim, 4, |id, _| {
+        id == &admin.signing_pub
+    })
+    .unwrap();
+    assert_eq!(opened.plaintext, encode_group_removal_notice());
+    assert!(
+        crypto::open_clip(&sealed.manifest, &sealed.chunks, &bystander, 4, |id, _| {
+            id == &admin.signing_pub
+        })
+        .is_err()
+    );
+}
+
+#[tokio::test]
+async fn background_join_request_requires_switching_to_its_group() {
+    let admin = DeviceKeypairs::generate();
+    let joining = DeviceKeypairs::generate();
+    let first = "11111111111111111111111111111111".to_string();
+    let second = "22222222222222222222222222222222".to_string();
+    let state = Arc::new(AppState::new(
+        admin,
+        HistoryStore::open(Path::new(":memory:"), &[13u8; 32]).unwrap(),
+    ));
+    {
+        let mut settings = state.settings.lock().await;
+        settings.sync_groups = vec![
+            SyncGroupConfig {
+                id: first.clone(),
+                name: "My devices".to_string(),
+            },
+            SyncGroupConfig {
+                id: second.clone(),
+                name: "Friends".to_string(),
+            },
+        ];
+        settings.active_sync_group_id = Some(first);
+        settings.default_sync_group_id = Some(second.clone());
+    }
+    let invite_id = network::new_id();
+    let secret = crate::pairing::random_secret();
+    let request = crate::pairing::build_network_join_request(
+        invite_id,
+        identity(&joining, "Laptop"),
+        &secret,
+        now_unix(),
+    );
+    let pending = PendingJoinRecord {
+        request_id: "request".to_string(),
+        request_key: [7; 16],
+        network_id: second.clone(),
+        rendezvous_topic: "invite-topic".to_string(),
+        request,
+        received_at: now_unix(),
+    };
+
+    let error = pairing_commands::require_pending_group_active(&state, &pending, "approving")
+        .await
+        .unwrap_err();
+    assert!(error.contains("Switch to the \"Friends\" group"));
+
+    state.settings.lock().await.active_sync_group_id = Some(second);
+    assert!(
+        pairing_commands::require_pending_group_active(&state, &pending, "approving")
+            .await
+            .is_ok()
+    );
+}
+
+#[test]
+fn pairing_request_keys_are_deterministic_and_group_scoped() {
+    let joining = DeviceKeypairs::generate();
+    let first_invite = network::new_id();
+    let second_invite = network::new_id();
+    let secret = crate::pairing::random_secret();
+    let first = crate::pairing::build_network_join_request(
+        first_invite,
+        identity(&joining, "Laptop"),
+        &secret,
+        123,
+    );
+    let second = crate::pairing::build_network_join_request(
+        second_invite,
+        identity(&joining, "Laptop"),
+        &secret,
+        123,
+    );
+
+    let first_key = pairing_commands::pairing_request_key("group-a", &first).unwrap();
+    assert_eq!(
+        first_key,
+        pairing_commands::pairing_request_key("group-a", &first).unwrap()
+    );
+    assert_ne!(
+        first_key,
+        pairing_commands::pairing_request_key("group-b", &first).unwrap()
+    );
+    assert_ne!(
+        first_key,
+        pairing_commands::pairing_request_key("group-a", &second).unwrap()
+    );
+}
+
+#[test]
+fn pairing_request_decisions_survive_store_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("history.db");
+    let key = [44u8; 16];
+    let db_key = [15u8; 32];
+    {
+        let store = HistoryStore::open(&path, &db_key).unwrap();
+        assert!(!store.has_seen_message(&key).unwrap());
+        store.mark_seen_message(&key, 123).unwrap();
+    }
+    let reopened = HistoryStore::open(&path, &db_key).unwrap();
+    assert!(reopened.has_seen_message(&key).unwrap());
+}
+
+#[tokio::test]
+async fn strict_roster_persistence_is_retry_safe() {
+    let dir = tempfile::tempdir().unwrap();
+    let groups_dir = dir.path().join("groups");
+    std::fs::create_dir_all(&groups_dir).unwrap();
+    let state = Arc::new(AppState::new(
+        DeviceKeypairs::generate(),
+        HistoryStore::open(Path::new(":memory:"), &[16u8; 32]).unwrap(),
+    ));
+    *state.groups_dir.lock().await = Some(groups_dir.clone());
+    let group_id = "33333333333333333333333333333333";
+    let admin = DeviceKeypairs::generate();
+    let joining = DeviceKeypairs::generate();
+    let genesis = roster::sign_and_chain(
+        &admin,
+        roster::build_genesis(&admin, "Admin", "topic"),
+        None,
+    )
+    .unwrap();
+    sync_groups::persist_sync_group_roster_checked(&state, group_id, &genesis)
+        .await
+        .unwrap();
+    let with_member = roster::sign_and_chain(
+        &admin,
+        roster::build_add_device(&genesis, identity(&joining, "Laptop")),
+        Some(&genesis),
+    )
+    .unwrap();
+
+    let path = sync_groups::persist_sync_group_roster_checked(&state, group_id, &with_member)
+        .await
+        .unwrap();
+    sync_groups::persist_sync_group_roster_checked(&state, group_id, &with_member)
+        .await
+        .unwrap();
+
+    let persisted = load_persisted_roster(&path).unwrap();
+    assert_eq!(persisted.epoch(), 1);
+    assert!(persisted.is_active(&joining.signing_pub));
+}
+
+#[test]
 fn transfer_timeout_bounds_are_validated() {
     assert!(normalize_transfer_timeout_minutes(0).is_err());
     assert!(normalize_transfer_timeout_minutes(DEFAULT_FILE_TRANSFER_TIMEOUT_MINUTES).is_ok());
@@ -156,6 +532,7 @@ async fn stale_transfer_timeout_token_does_not_cleanup() {
     state.file_transfers.lock().await.insert(
         session_id.to_string(),
         TransferRecord::PendingIncoming(PendingIncomingTransfer {
+            network_id: "group-a".to_string(),
             sender_id: crypto::Ed25519PubKey([1u8; 32]),
             file_name: "large.bin".to_string(),
             size: u64::from(u32::MAX) + 1,
@@ -180,6 +557,7 @@ async fn terminal_transfer_state_can_only_be_claimed_once() {
     state.file_transfers.lock().await.insert(
         session_id.to_string(),
         TransferRecord::PendingIncoming(PendingIncomingTransfer {
+            network_id: "group-a".to_string(),
             sender_id: crypto::Ed25519PubKey([1u8; 32]),
             file_name: "complete.bin".to_string(),
             size: 1,
@@ -309,6 +687,10 @@ fn legacy_roster_migrates_into_default_sync_group() {
     assert_eq!(settings.sync_groups[0].name, "My devices");
     assert_eq!(
         settings.active_sync_group_id.as_deref(),
+        Some(settings.sync_groups[0].id.as_str())
+    );
+    assert_eq!(
+        settings.default_sync_group_id.as_deref(),
         Some(settings.sync_groups[0].id.as_str())
     );
     assert!(path.starts_with(&groups_dir));
