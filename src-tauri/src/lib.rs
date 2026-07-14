@@ -151,14 +151,14 @@ pub fn run() {
 
             app.manage(state.clone());
 
-            let state_clone = state.clone();
-            let app_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                if let Some(topic) = startup_topic {
+            if let Some(topic) = startup_topic {
+                let state_clone = state.clone();
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
                     commands::start_subscriber(&state_clone, app_handle.clone(), &topic).await;
-                }
-                commands::start_invitation_subscribers(&state_clone, app_handle).await;
-            });
+                    commands::start_invitation_subscribers(&state_clone, app_handle).await;
+                });
+            }
 
             // --- Tray icon + menu ---
             let show_item = MenuItem::with_id(app, "show", "Show Fwoosh", true, None::<&str>)?;
@@ -219,7 +219,6 @@ pub fn run() {
             commands::pairing_commands::create_temporary_pairing_code,
             commands::pairing_commands::rotate_pairing_code,
             commands::pairing_commands::revoke_pairing_code,
-            commands::pairing_commands::revoke_permanent_pairing_code,
             commands::pairing_commands::pending_join_requests,
             commands::pairing_commands::approve_join_request,
             commands::pairing_commands::reject_join_request,
@@ -228,7 +227,6 @@ pub fn run() {
             commands::sync_groups::leave_room,
             commands::sync_groups::sync_groups,
             commands::sync_groups::switch_sync_group,
-            commands::sync_groups::set_default_sync_group,
             commands::sync_groups::rename_sync_group,
             commands::sync_groups::suggest_device_label,
             commands::sync_groups::rename_device,

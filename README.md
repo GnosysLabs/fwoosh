@@ -147,7 +147,7 @@ src-tauri/src/
   keychain.rs  OS credential storage (device keys + history key)
   ntfy.rs      TLS-enforced publish + WSS subscribe + reconnect
   pairing.rs   durable invitation URI + reusable HMAC proof-of-knowledge
-  network.rs   Group, invitation, People/contact, and recipient domain types
+  network.rs   Network, invitation, People/contact, and recipient domain types
   commands.rs  thin shared command facade and clipboard-send orchestration
   commands/
     state.rs             shared AppState, settings, wire types, and IPC DTOs

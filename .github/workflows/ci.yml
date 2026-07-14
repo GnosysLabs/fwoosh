@@ -1,12 +1,13 @@
 name: CI
 
 on:
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
-  workflow_dispatch:
 
 jobs:
-  # ---- Test + lint the Rust core for pull requests and manual runs ----
+  # ---- Test + lint the Rust core on every push ----
   test:
     name: Test (${{ matrix.os }})
     strategy:
