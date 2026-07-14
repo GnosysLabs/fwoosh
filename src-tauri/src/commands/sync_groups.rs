@@ -27,25 +27,14 @@ pub fn load_settings(path: &Path) -> AppSettings {
                     group.name = name;
                 }
             }
-            let valid_active = settings
+            if settings
                 .active_sync_group_id
-                .clone()
-                .filter(|active| settings.sync_groups.iter().any(|group| &group.id == active));
-            let valid_default = settings.default_sync_group_id.clone().filter(|default| {
-                settings
-                    .sync_groups
-                    .iter()
-                    .any(|group| &group.id == default)
-            });
-            // Before defaults were explicit, creating a group also made it
-            // active. Using that legacy active value here would accidentally
-            // cement the newest group as the default. The catalog is ordered by
-            // creation, so migrate to the original group unless a real default
-            // has already been persisted.
-            settings.default_sync_group_id = valid_default
-                .or_else(|| settings.sync_groups.first().map(|group| group.id.clone()));
-            settings.active_sync_group_id =
-                valid_active.or_else(|| settings.default_sync_group_id.clone());
+                .as_ref()
+                .is_none_or(|active| !settings.sync_groups.iter().any(|group| &group.id == active))
+            {
+                settings.active_sync_group_id =
+                    settings.sync_groups.first().map(|group| group.id.clone());
+            }
             settings
         }
         Err(_) => AppSettings::default(),
@@ -74,7 +63,7 @@ pub(super) fn sanitize_sync_group_name(name: &str) -> Result<String, String> {
     Ok(name)
 }
 
-pub(super) fn group_roster_path(groups_dir: &Path, group_id: &str) -> Result<PathBuf, String> {
+fn group_roster_path(groups_dir: &Path, group_id: &str) -> Result<PathBuf, String> {
     if !network::valid_id(group_id) {
         return Err("invalid sync group id".to_string());
     }
@@ -97,23 +86,19 @@ pub fn prepare_sync_groups(
                 id: id.clone(),
                 name: "My devices".to_string(),
             });
-            settings.active_sync_group_id = Some(id.clone());
-            settings.default_sync_group_id = Some(id);
+            settings.active_sync_group_id = Some(id);
             return Ok(Some((path, Some(legacy_roster))));
         }
         return Ok(None);
     }
 
-    let default_id = settings
-        .default_sync_group_id
+    let active_id = settings
+        .active_sync_group_id
         .clone()
         .filter(|id| settings.sync_groups.iter().any(|group| &group.id == id))
         .unwrap_or_else(|| settings.sync_groups[0].id.clone());
-    settings.default_sync_group_id = Some(default_id.clone());
-    // Each launch starts on the explicitly configured default destination;
-    // later UI switches only affect the active group for this process.
-    settings.active_sync_group_id = Some(default_id.clone());
-    let path = group_roster_path(groups_dir, &default_id)?;
+    settings.active_sync_group_id = Some(active_id.clone());
+    let path = group_roster_path(groups_dir, &active_id)?;
     let roster = load_persisted_roster(&path);
     Ok(Some((path, roster)))
 }
@@ -230,34 +215,13 @@ pub struct DeviceDto {
     pub can_revoke: bool,
 }
 
-pub(super) async fn configured_groups_dir(state: &Arc<AppState>) -> Result<PathBuf, String> {
+async fn configured_groups_dir(state: &Arc<AppState>) -> Result<PathBuf, String> {
     state
         .groups_dir
         .lock()
         .await
         .clone()
         .ok_or_else(|| "sync group storage is not initialized".to_string())
-}
-
-pub(super) async fn load_sync_group_roster(
-    state: &Arc<AppState>,
-    group_id: &str,
-) -> Result<Option<VerifiedRoster>, String> {
-    let configured = state
-        .settings
-        .lock()
-        .await
-        .sync_groups
-        .iter()
-        .any(|group| group.id == group_id);
-    if !configured {
-        return Ok(None);
-    }
-    let groups_dir = configured_groups_dir(state).await?;
-    Ok(load_persisted_roster(&group_roster_path(
-        &groups_dir,
-        group_id,
-    )?))
 }
 
 pub(super) async fn current_sync_group_id(state: &Arc<AppState>) -> Result<String, String> {
@@ -268,46 +232,6 @@ pub(super) async fn current_sync_group_id(state: &Arc<AppState>) -> Result<Strin
         .active_sync_group_id
         .clone()
         .ok_or_else(|| "no sync group is active".to_string())
-}
-
-pub(super) fn ensure_expected_active_group(
-    settings: &AppSettings,
-    expected_group_id: &str,
-    action: &str,
-) -> Result<(), String> {
-    match settings.active_sync_group_id.as_deref() {
-        Some(active) if active == expected_group_id => Ok(()),
-        Some(_) => Err(format!(
-            "The active group changed before {action}. Reopen the group and try again."
-        )),
-        None => Err("no sync group is active".to_string()),
-    }
-}
-
-pub(super) fn add_sync_group_config(
-    settings: &mut AppSettings,
-    id: String,
-    name: String,
-) -> Result<(Option<String>, Option<String>), String> {
-    if settings.sync_groups.len() >= 32 {
-        return Err("at most 32 sync groups are supported".to_string());
-    }
-    let previous_id = settings.active_sync_group_id.clone();
-    let previous_default_id = settings.default_sync_group_id.clone();
-    let default_is_valid = previous_default_id.as_ref().is_some_and(|default| {
-        settings
-            .sync_groups
-            .iter()
-            .any(|group| &group.id == default)
-    });
-    settings.sync_groups.push(SyncGroupConfig {
-        id: id.clone(),
-        name,
-    });
-    if !default_is_valid {
-        settings.default_sync_group_id = Some(id);
-    }
-    Ok((previous_id, previous_default_id))
 }
 
 pub(super) async fn ensure_active_sync_group(
@@ -335,27 +259,12 @@ pub(super) async fn ensure_active_sync_group(
             name,
         });
         settings.active_sync_group_id = Some(id.clone());
-        if settings
-            .default_sync_group_id
-            .as_ref()
-            .is_none_or(|default| {
-                !settings
-                    .sync_groups
-                    .iter()
-                    .any(|group| &group.id == default)
-            })
-        {
-            settings.default_sync_group_id = Some(id.clone());
-        }
     }
     *state.roster_path.lock().await = Some(group_roster_path(&groups_dir, &id)?);
     if let Err(error) = persist_settings(state).await {
         let mut settings = state.settings.lock().await;
         settings.sync_groups.retain(|group| group.id != id);
         settings.active_sync_group_id = None;
-        if settings.default_sync_group_id.as_deref() == Some(id.as_str()) {
-            settings.default_sync_group_id = None;
-        }
         *state.roster_path.lock().await = None;
         return Err(error);
     }
@@ -370,6 +279,7 @@ async fn stop_active_group_runtime(state: &Arc<AppState>) {
     for (_, tx) in state.auxiliary_subscriber_shutdowns.lock().await.drain() {
         let _ = tx.send(());
     }
+    state.pending_joins.lock().await.clear();
     *state.pending_network_join.lock().await = None;
     state.pending.lock().await.clear();
 }
@@ -405,11 +315,8 @@ pub(super) async fn activate_sync_group(
 
     if let Some(topic) = topic {
         start_subscriber(state, app.clone(), &topic).await;
+        start_invitation_subscribers(state, app.clone()).await;
     }
-    // Invitations belong to configured groups, not only the active runtime.
-    // Restart all eligible invitation listeners even when this group does not
-    // yet have a roster (for example while joining a second group).
-    start_invitation_subscribers(state, app.clone()).await;
     let _ = app.emit("sync-group-changed", group_id);
     let _ = app.emit("roster-updated", ());
     Ok(())
@@ -420,11 +327,9 @@ pub async fn sync_groups(state: State<'_, Arc<AppState>>) -> Result<Vec<SyncGrou
     let settings = state.settings.lock().await.clone();
     let groups_dir = configured_groups_dir(state.inner()).await?;
     let active_id = settings.active_sync_group_id.as_deref();
-    let default_id = settings.default_sync_group_id.as_deref();
     let mut out = Vec::with_capacity(settings.sync_groups.len());
     for group in settings.sync_groups {
         let active = active_id == Some(group.id.as_str());
-        let is_default = default_id == Some(group.id.as_str());
         let roster = if active {
             state.roster.lock().await.clone()
         } else {
@@ -435,7 +340,6 @@ pub async fn sync_groups(state: State<'_, Arc<AppState>>) -> Result<Vec<SyncGrou
             id: group.id,
             name: group.name,
             active,
-            is_default,
             connected: roster.is_some(),
             member_count: roster
                 .as_ref()
@@ -453,37 +357,6 @@ pub async fn switch_sync_group(
     group_id: String,
 ) -> Result<(), String> {
     activate_sync_group(state.inner(), &app, group_id.trim()).await
-}
-
-#[tauri::command]
-pub async fn set_default_sync_group(
-    state: State<'_, Arc<AppState>>,
-    app: tauri::AppHandle,
-    group_id: String,
-) -> Result<(), String> {
-    let group_id = group_id.trim().to_string();
-    let roster = load_sync_group_roster(state.inner(), &group_id).await?;
-    ensure_group_can_be_default(roster.as_ref())?;
-    {
-        let mut settings = state.settings.lock().await;
-        if !settings
-            .sync_groups
-            .iter()
-            .any(|group| group.id == group_id)
-        {
-            return Err("sync group not found".to_string());
-        }
-        settings.default_sync_group_id = Some(group_id);
-    }
-    persist_settings(state.inner()).await?;
-    let _ = app.emit("sync-groups-updated", ());
-    Ok(())
-}
-
-pub(super) fn ensure_group_can_be_default(verified: Option<&VerifiedRoster>) -> Result<(), String> {
-    verified.map(|_| ()).ok_or_else(|| {
-        "Only a connected, approved group can be selected as the default.".to_string()
-    })
 }
 
 #[tauri::command]
@@ -519,8 +392,7 @@ async fn create_roster_for_active_group(
     start_subscriber(state, app.clone(), &topic).await;
     broadcast_roster(state, &signed, &topic).await;
     let _ = app.emit("sync-groups-updated", ());
-    let network_id = current_sync_group_id(state).await?;
-    let code = issue_pairing_code(state, &network_id, None, true).await?;
+    let code = issue_pairing_code(state, None, true).await?;
     start_invitation_subscribers(state, app).await;
     Ok(code)
 }
@@ -534,21 +406,31 @@ pub async fn create_sync_group(
 ) -> Result<PairingCodeDto, String> {
     let name = sanitize_sync_group_name(&name)?;
     let id = network::new_id();
-    let (previous_id, previous_default_id) = {
+    let previous_id;
+    {
         let mut settings = state.settings.lock().await;
-        add_sync_group_config(&mut settings, id.clone(), name)?
-    };
+        if settings.sync_groups.len() >= 32 {
+            return Err("at most 32 sync groups are supported".to_string());
+        }
+        settings.sync_groups.push(SyncGroupConfig {
+            id: id.clone(),
+            name,
+        });
+        previous_id = settings.active_sync_group_id.clone();
+    }
     if let Err(error) = persist_settings(state.inner()).await {
-        let mut settings = state.settings.lock().await;
-        settings.sync_groups.retain(|group| group.id != id);
-        settings.default_sync_group_id = previous_default_id;
+        state
+            .settings
+            .lock()
+            .await
+            .sync_groups
+            .retain(|group| group.id != id);
         return Err(error);
     }
     if let Err(error) = activate_sync_group(state.inner(), &app, &id).await {
         let mut settings = state.settings.lock().await;
         settings.sync_groups.retain(|group| group.id != id);
         settings.active_sync_group_id = previous_id;
-        settings.default_sync_group_id = previous_default_id;
         drop(settings);
         let _ = persist_settings(state.inner()).await;
         return Err(error);
@@ -703,18 +585,6 @@ pub(super) async fn broadcast_roster(
 
 /// Persist the current roster chain to disk so it survives restarts without
 /// trusting a lone non-genesis snapshot.
-pub(super) async fn persist_sync_group_roster_checked(
-    state: &Arc<AppState>,
-    group_id: &str,
-    entry: &roster::RosterEntry,
-) -> Result<PathBuf, String> {
-    let groups_dir = configured_groups_dir(state).await?;
-    let path = group_roster_path(&groups_dir, group_id)?;
-    let bytes = build_persisted_roster_chain(&path, entry)?;
-    std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
-    Ok(path)
-}
-
 pub(super) async fn persist_roster(state: &Arc<AppState>, entry: &roster::RosterEntry) {
     if let Some(path) = state.roster_path.lock().await.clone() {
         match build_persisted_roster_chain(&path, entry) {
@@ -798,38 +668,6 @@ pub(super) fn verify_persisted_roster_entries(
     Ok(verified)
 }
 
-pub(super) fn remove_group_from_settings(
-    settings: &mut AppSettings,
-    group_id: &str,
-    preferred_next: Option<&str>,
-) -> Result<Option<String>, String> {
-    if settings.active_sync_group_id.as_deref() != Some(group_id) {
-        return Err("sync group is not active".to_string());
-    }
-    settings.sync_groups.retain(|group| group.id != group_id);
-    let preferred_next = preferred_next
-        .filter(|candidate| {
-            settings
-                .sync_groups
-                .iter()
-                .any(|group| group.id == *candidate)
-        })
-        .map(str::to_string);
-    let existing_default = settings.default_sync_group_id.clone().filter(|candidate| {
-        settings
-            .sync_groups
-            .iter()
-            .any(|group| &group.id == candidate)
-    });
-    let next_id = preferred_next
-        .or(existing_default.clone())
-        .or_else(|| settings.sync_groups.first().map(|group| group.id.clone()));
-    if existing_default.is_none() {
-        settings.default_sync_group_id = next_id.clone();
-    }
-    Ok(next_id)
-}
-
 pub(super) async fn remove_sync_group_from_device(
     state: &Arc<AppState>,
     app: &tauri::AppHandle,
@@ -842,17 +680,26 @@ pub(super) async fn remove_sync_group_from_device(
     let current_path = state.roster_path.lock().await.clone();
     let next_id = {
         let mut settings = state.settings.lock().await;
-        remove_group_from_settings(&mut settings, group_id, preferred_next)?
+        if settings.active_sync_group_id.as_deref() != Some(group_id) {
+            return Err("sync group is not active".to_string());
+        }
+        settings.sync_groups.retain(|group| group.id != group_id);
+        preferred_next
+            .filter(|candidate| {
+                settings
+                    .sync_groups
+                    .iter()
+                    .any(|group| group.id == *candidate)
+            })
+            .map(str::to_string)
+            .or_else(|| settings.sync_groups.first().map(|group| group.id.clone()))
     };
 
     if let Some(next_id) = next_id {
         activate_sync_group(state, app, &next_id).await?;
     } else {
         stop_active_group_runtime(state).await;
-        let mut settings = state.settings.lock().await;
-        settings.active_sync_group_id = None;
-        settings.default_sync_group_id = None;
-        drop(settings);
+        state.settings.lock().await.active_sync_group_id = None;
         *state.roster_path.lock().await = None;
         persist_settings(state).await?;
         let _ = app.emit("sync-group-changed", "");
@@ -875,11 +722,6 @@ pub(super) async fn remove_sync_group_from_device(
         .lock()
         .await
         .retain(|_, invite| invite.network_id != group_id);
-    state
-        .pending_joins
-        .lock()
-        .await
-        .retain(|_, pending| pending.network_id != group_id);
     persist_invitations(state).await?;
     let _ = app.emit("sync-groups-updated", ());
     let _ = app.emit("clip-stored", ());
@@ -888,43 +730,16 @@ pub(super) async fn remove_sync_group_from_device(
 
 /// Remove the active sync group from this device, then activate the next group
 /// if one remains.
-pub(super) fn ensure_group_can_be_left_locally(
-    device_id: &crypto::Ed25519PubKey,
-    verified: Option<&VerifiedRoster>,
-) -> Result<(), String> {
-    let verified = verified.ok_or_else(|| {
-        "This group's verified membership could not be loaded, so Fwoosh cannot safely determine whether leaving would orphan other devices."
-            .to_string()
-    })?;
-    if verified.entry.admin_id == *device_id && verified.entry.devices.len() > 1 {
-        return Err(
-            "A group admin cannot leave while other devices remain. Remove the other devices before leaving this group."
-                .to_string(),
-        );
-    }
-    Ok(())
-}
-
 #[tauri::command]
 pub async fn leave_room(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
-    group_id: String,
 ) -> Result<(), String> {
-    let group_id = group_id.trim();
-    let active_id = state
-        .settings
-        .lock()
-        .await
-        .active_sync_group_id
-        .clone()
-        .ok_or_else(|| "no sync group is active".to_string())?;
-    {
-        let settings = state.settings.lock().await;
-        ensure_expected_active_group(&settings, group_id, "leaving the group")?;
-    }
-    let verified = state.roster.lock().await.clone();
-    ensure_group_can_be_left_locally(&state.device.signing_pub, verified.as_ref())?;
+    let active_id = state.settings.lock().await.active_sync_group_id.clone();
+    let Some(active_id) = active_id else {
+        stop_active_group_runtime(state.inner()).await;
+        return Ok(());
+    };
     remove_sync_group_from_device(state.inner(), &app, &active_id, None).await
 }
 
@@ -932,14 +747,8 @@ pub async fn leave_room(
 pub async fn revoke_device(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
-    group_id: String,
     device_id: String,
 ) -> Result<(), String> {
-    let group_id = group_id.trim().to_string();
-    {
-        let settings = state.settings.lock().await;
-        ensure_expected_active_group(&settings, &group_id, "removing the device")?;
-    }
     let decoded = hex::decode(device_id.trim()).map_err(|_| "bad device id".to_string())?;
     if decoded.len() != 32 {
         return Err("bad device id".to_string());
@@ -949,47 +758,11 @@ pub async fn revoke_device(
     let victim = crypto::Ed25519PubKey(victim);
 
     let verified = require_admin_roster(state.inner(), "revoke devices").await?;
-    {
-        let settings = state.settings.lock().await;
-        ensure_expected_active_group(&settings, &group_id, "removing the device")?;
-    }
     if victim == state.device.signing_pub {
         return Err("cannot revoke this device".to_string());
     }
 
     let old_topic = verified.topic().to_string();
-    let victim_recipient = verified
-        .entry
-        .devices
-        .iter()
-        .find(|device| device.signing_pub == victim)
-        .map(|device| crypto::Recipient {
-            id: device.signing_pub.clone(),
-            x25519: device.x25519_pub.clone(),
-        })
-        .ok_or_else(|| "device is not an active group member".to_string())?;
-    let removal_notice = crypto::seal_clip(
-        &state.device,
-        &[victim_recipient],
-        &encode_group_removal_notice(),
-        &old_topic,
-        verified.epoch(),
-        StorePolicy::Private,
-        now_unix(),
-    )
-    .map_err(|e| e.to_string())?;
-    let base = state.ntfy_base.lock().await.clone();
-    // The victim must receive this authenticated tombstone while it can still
-    // decrypt the current epoch. Relay caching allows an offline victim to
-    // catch up, while the private store policy keeps it out of clip history.
-    publish_sealed_clip(
-        &base,
-        &old_topic,
-        removal_notice,
-        ntfy::PublishOptions::default(),
-    )
-    .await?;
-
     let new_topic = roster::new_topic();
     let unsigned = roster::build_revoke_device(&verified.entry, &victim, &new_topic)
         .map_err(|e| e.to_string())?;
@@ -1012,6 +785,7 @@ pub async fn revoke_device(
     )
     .map_err(|e| e.to_string())?;
 
+    let base = state.ntfy_base.lock().await.clone();
     publish_sealed_clip(&base, &old_topic, sealed, ntfy::PublishOptions::default()).await?;
 
     *state.roster.lock().await = Some(next.clone());

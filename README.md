@@ -65,7 +65,7 @@ installer releases, and a cross-device installed-app smoke test.
 | Sync Groups | Named groups, isolated roster files/history, legacy-room migration, active-group switching |
 | P2P file transfer (`commands/transfer/`) | WebRTC data channels; streamed encrypted chunks; configurable timeout |
 | Desktop shell (tray, hotkey, popup UI) | ✅ builds |
-| CI / release pipeline | Tests plus cargo/npm audit in CI; installer publishing and signing remain before public release |
+| CI / release pipeline | Tests plus cargo/npm audit in CI; Windows NSIS/MSI installer publishing is wired, signing remains before public release |
 
 ## Threat model (honest)
 
@@ -110,6 +110,18 @@ npm run build
 cd src-tauri && cargo build --release
 ```
 
+### Build Windows installers
+
+On a Windows machine with the Visual Studio C++ workload installed:
+
+```cmd
+npm ci
+npm run build:windows
+```
+
+The NSIS setup executable and MSI installer are written to
+`src-tauri/target/x86_64-pc-windows-msvc/release/bundle/`.
+
 ### Run the test suite
 ```bash
 cd src-tauri && cargo test --lib
@@ -131,6 +143,9 @@ npm run version:bump -- patch   # or minor, major, 0.2.0
 Before tagging a release, move the relevant `CHANGELOG.md` entries from
 `Unreleased` to the target version and create a matching `vX.Y.Z` tag.
 
+Every frontend and installer build checks that these version values agree. The
+current version is also shown in the app's Settings menu.
+
 > **Windows + Git Bash:** because Git Bash's `/usr/bin/link` (GNU coreutils)
 > shadows MSVC's `link.exe` in PATH, builds from Git Bash use
 > `src-tauri/cargo-dev.cmd`, which discovers Visual Studio locally, loads
@@ -147,7 +162,7 @@ src-tauri/src/
   keychain.rs  OS credential storage (device keys + history key)
   ntfy.rs      TLS-enforced publish + WSS subscribe + reconnect
   pairing.rs   durable invitation URI + reusable HMAC proof-of-knowledge
-  network.rs   Group, invitation, People/contact, and recipient domain types
+  network.rs   Network, invitation, People/contact, and recipient domain types
   commands.rs  thin shared command facade and clipboard-send orchestration
   commands/
     state.rs             shared AppState, settings, wire types, and IPC DTOs

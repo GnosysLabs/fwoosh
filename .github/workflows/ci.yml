@@ -1,12 +1,13 @@
 name: CI
 
 on:
+  push:
+    branches: [main]
   pull_request:
     branches: [main]
-  workflow_dispatch:
 
 jobs:
-  # ---- Test + lint the Rust core for pull requests and manual runs ----
+  # ---- Test + lint the Rust core on every push ----
   test:
     name: Test (${{ matrix.os }})
     strategy:
@@ -29,7 +30,7 @@ jobs:
           workspaces: src-tauri
       - name: Install JS deps
         working-directory: .
-        run: npm install
+        run: npm ci
       - name: Check app version consistency
         run: npm run version:check
       - name: Run Rust tests

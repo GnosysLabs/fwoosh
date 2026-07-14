@@ -83,7 +83,7 @@ pub struct NetworkJoinRequest {
 /// NOTE: the returned string contains the full bootstrap secret. Handle with
 /// care — render to a QR in-app and do not log it.
 /// Build a durable device-sync invitation. It deliberately contains no
-/// mutable group relay topic; the stable rendezvous topic is derived from
+/// mutable Network relay topic; the stable rendezvous topic is derived from
 /// the secret by both endpoints.
 pub fn build_network_uri(
     invite_id: &str,

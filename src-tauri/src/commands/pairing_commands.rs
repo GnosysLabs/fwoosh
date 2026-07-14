@@ -32,53 +32,6 @@ pub(super) async fn persist_invitations(state: &Arc<AppState>) -> Result<(), Str
     crate::keychain::save_invitation_blob(&blob).map_err(|e| e.to_string())
 }
 
-pub(super) fn pairing_request_key(
-    network_id: &str,
-    request: &crate::pairing::NetworkJoinRequest,
-) -> Result<[u8; 16], String> {
-    let encoded = postcard::to_allocvec(request).map_err(|e| e.to_string())?;
-    let mut hasher = Sha256::new();
-    hasher.update(b"Fwoosh pairing request decision v1\0");
-    hasher.update((network_id.len() as u64).to_le_bytes());
-    hasher.update(network_id.as_bytes());
-    hasher.update(encoded);
-    let digest = hasher.finalize();
-    let mut key = [0u8; 16];
-    key.copy_from_slice(&digest[..16]);
-    Ok(key)
-}
-
-fn mark_pairing_request_decided(
-    state: &Arc<AppState>,
-    pending: &PendingJoinRecord,
-) -> Result<(), String> {
-    state
-        .store
-        .mark_seen_message(&pending.request_key, now_unix())
-        .map_err(|e| format!("failed to persist the join-request decision: {e}"))
-}
-
-async fn remove_pairing_invitations(
-    state: &Arc<AppState>,
-    invite_ids: Vec<String>,
-) -> Result<usize, String> {
-    let removed_ids = {
-        let mut invitations = state.invitations.lock().await;
-        invite_ids
-            .into_iter()
-            .filter(|id| invitations.remove(id).is_some())
-            .collect::<Vec<_>>()
-    };
-    if removed_ids.is_empty() {
-        return Ok(0);
-    }
-    for id in &removed_ids {
-        stop_auxiliary_subscriber(state, &format!("invite:{id}")).await;
-    }
-    persist_invitations(state).await?;
-    Ok(removed_ids.len())
-}
-
 pub(super) async fn current_network_identity(
     state: &Arc<AppState>,
 ) -> Result<(String, String), String> {
@@ -86,13 +39,13 @@ pub(super) async fn current_network_identity(
     let id = settings
         .active_sync_group_id
         .clone()
-        .ok_or_else(|| "group has no stable id".to_string())?;
+        .ok_or_else(|| "network has no stable id".to_string())?;
     let name = settings
         .sync_groups
         .iter()
         .find(|group| group.id == id)
         .map(|group| group.name.clone())
-        .ok_or_else(|| "active group metadata is missing".to_string())?;
+        .ok_or_else(|| "active Network metadata is missing".to_string())?;
     Ok((id, name))
 }
 
@@ -113,13 +66,10 @@ fn pairing_code_dto(state: &Arc<AppState>, invite: &InvitationRecord) -> Pairing
 
 pub(super) async fn issue_pairing_code(
     state: &Arc<AppState>,
-    network_id: &str,
     expires_in_seconds: Option<u64>,
     reuse_permanent: bool,
 ) -> Result<PairingCodeDto, String> {
-    if !network::valid_id(network_id) {
-        return Err("invalid sync group id".to_string());
-    }
+    let (network_id, _) = current_network_identity(state).await?;
     let now = now_unix();
 
     if expires_in_seconds.is_none() && reuse_permanent {
@@ -136,7 +86,7 @@ pub(super) async fn issue_pairing_code(
     let expires_at = expires_in_seconds.map(|seconds| now.saturating_add(seconds.max(1)));
     let invite = InvitationRecord {
         id: network::new_id(),
-        network_id: network_id.to_string(),
+        network_id,
         secret: crate::pairing::random_secret(),
         created_at: now,
         expires_at,
@@ -163,15 +113,9 @@ pub(super) async fn issue_pairing_code(
 pub async fn new_pairing_code(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
-    group_id: String,
 ) -> Result<PairingCodeDto, String> {
-    let group_id = group_id.trim().to_string();
-    {
-        let settings = state.settings.lock().await;
-        ensure_expected_active_group(&settings, &group_id, "creating the invitation")?;
-    }
     require_admin_roster(state.inner(), "create pairing codes").await?;
-    let code = issue_pairing_code(&state, &group_id, None, true).await?;
+    let code = issue_pairing_code(&state, None, true).await?;
     start_invitation_subscribers(&state, app).await;
     Ok(code)
 }
@@ -180,19 +124,13 @@ pub async fn new_pairing_code(
 pub async fn create_temporary_pairing_code(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
-    group_id: String,
     expires_in_seconds: u64,
 ) -> Result<PairingCodeDto, String> {
-    let group_id = group_id.trim().to_string();
-    {
-        let settings = state.settings.lock().await;
-        ensure_expected_active_group(&settings, &group_id, "creating the invitation")?;
-    }
     require_admin_roster(state.inner(), "create invitations").await?;
     if !(60..=30 * 24 * 60 * 60).contains(&expires_in_seconds) {
         return Err("temporary invitation must last between 1 minute and 30 days".to_string());
     }
-    let code = issue_pairing_code(&state, &group_id, Some(expires_in_seconds), false).await?;
+    let code = issue_pairing_code(&state, Some(expires_in_seconds), false).await?;
     start_invitation_subscribers(&state, app).await;
     Ok(code)
 }
@@ -205,41 +143,31 @@ pub async fn rotate_pairing_code(
     require_admin_roster(state.inner(), "rotate invitations").await?;
     let (network_id, _) = current_network_identity(state.inner()).await?;
     let revoked_ids = {
-        let invitations = state.invitations.lock().await;
-        invitations
+        let mut invitations = state.invitations.lock().await;
+        let ids: Vec<String> = invitations
             .values()
             .filter(|invite| invite.network_id == network_id && invite.expires_at.is_none())
             .map(|invite| invite.id.clone())
-            .collect()
+            .collect();
+        for id in &ids {
+            invitations.remove(id);
+        }
+        ids
     };
-    remove_pairing_invitations(state.inner(), revoked_ids).await?;
-    let code = issue_pairing_code(state.inner(), &network_id, None, false).await?;
+    for id in revoked_ids {
+        if let Some(tx) = state
+            .auxiliary_subscriber_shutdowns
+            .lock()
+            .await
+            .remove(&format!("invite:{id}"))
+        {
+            let _ = tx.send(());
+        }
+    }
+    persist_invitations(state.inner()).await?;
+    let code = issue_pairing_code(state.inner(), None, false).await?;
     start_invitation_subscribers(state.inner(), app).await;
     Ok(code)
-}
-
-#[tauri::command]
-pub async fn revoke_permanent_pairing_code(
-    state: State<'_, Arc<AppState>>,
-    group_id: String,
-) -> Result<bool, String> {
-    let group_id = group_id.trim().to_string();
-    {
-        let settings = state.settings.lock().await;
-        ensure_expected_active_group(&settings, &group_id, "revoking the reusable invitation")?;
-    }
-    require_admin_roster(state.inner(), "revoke invitations").await?;
-    let invite_ids = {
-        let settings = state.settings.lock().await;
-        ensure_expected_active_group(&settings, &group_id, "revoking the reusable invitation")?;
-        let invitations = state.invitations.lock().await;
-        invitations
-            .values()
-            .filter(|invite| invite.network_id == group_id && invite.expires_at.is_none())
-            .map(|invite| invite.id.clone())
-            .collect()
-    };
-    Ok(remove_pairing_invitations(state.inner(), invite_ids).await? > 0)
 }
 
 #[tauri::command]
@@ -248,7 +176,21 @@ pub async fn revoke_pairing_code(
     invite_id: String,
 ) -> Result<(), String> {
     require_admin_roster(state.inner(), "revoke invitations").await?;
-    remove_pairing_invitations(state.inner(), vec![invite_id]).await?;
+    let changed = {
+        let mut invitations = state.invitations.lock().await;
+        invitations.remove(&invite_id).is_some()
+    };
+    if changed {
+        persist_invitations(state.inner()).await?;
+    }
+    if let Some(tx) = state
+        .auxiliary_subscriber_shutdowns
+        .lock()
+        .await
+        .remove(&format!("invite:{invite_id}"))
+    {
+        let _ = tx.send(());
+    }
     Ok(())
 }
 
@@ -274,47 +216,12 @@ pub async fn pending_join_requests(
     Ok(out)
 }
 
-pub(super) async fn require_pending_group_active(
-    state: &Arc<AppState>,
-    pending: &PendingJoinRecord,
-    action: &str,
-) -> Result<(), String> {
-    let settings = state.settings.lock().await;
-    if settings.active_sync_group_id.as_deref() == Some(pending.network_id.as_str()) {
-        return Ok(());
-    }
-    let name = settings
-        .sync_groups
-        .iter()
-        .find(|group| group.id == pending.network_id)
-        .map(|group| group.name.as_str())
-        .unwrap_or("the requested");
-    Err(format!(
-        "Switch to the \"{name}\" group before {action} this join request."
-    ))
-}
-
 #[tauri::command]
 pub async fn reject_join_request(
     state: State<'_, Arc<AppState>>,
     request_id: String,
 ) -> Result<(), String> {
-    let pending = state
-        .pending_joins
-        .lock()
-        .await
-        .get(&request_id)
-        .cloned()
-        .ok_or_else(|| "join request not found".to_string())?;
-    require_pending_group_active(state.inner(), &pending, "rejecting").await?;
-    let verified = require_admin_roster(state.inner(), "reject join requests").await?;
-    if verified.is_active(&pending.request.identity.signing_pub) {
-        return Err(
-            "This device was already committed to the group. Retry approval to deliver its access, or remove the device from the group."
-                .to_string(),
-        );
-    }
-    mark_pairing_request_decided(state.inner(), &pending)?;
+    require_admin_roster(state.inner(), "reject join requests").await?;
     state.pending_joins.lock().await.remove(&request_id);
     Ok(())
 }
@@ -332,7 +239,6 @@ pub async fn approve_join_request(
         .get(&request_id)
         .cloned()
         .ok_or_else(|| "join request not found".to_string())?;
-    require_pending_group_active(state.inner(), &pending, "approving").await?;
     let now = now_unix();
     if now.saturating_sub(pending.request.requested_at) > JOIN_REQUEST_MAX_AGE_SECS {
         state.pending_joins.lock().await.remove(&request_id);
@@ -350,19 +256,13 @@ pub async fn approve_join_request(
     }
 
     let verified = require_admin_roster(state.inner(), "approve join requests").await?;
-    let existing_identity = verified
+    let next = if verified
         .entry
         .devices
         .iter()
-        .find(|device| device.signing_pub == pending.request.identity.signing_pub);
-    let (next, roster_changed) = if let Some(existing) = existing_identity {
-        if existing.x25519_pub != pending.request.identity.x25519_pub {
-            return Err(
-                "The retry identity does not match the device already committed to the group."
-                    .to_string(),
-            );
-        }
-        (verified, false)
+        .any(|device| device.signing_pub == pending.request.identity.signing_pub)
+    {
+        verified
     } else {
         let unsigned = roster::build_add_device(&verified.entry, pending.request.identity.clone());
         let signed = roster::sign_and_chain(&state.device, unsigned, Some(&verified.entry))
@@ -370,22 +270,19 @@ pub async fn approve_join_request(
         let next = verified
             .verify_next(signed.clone())
             .map_err(|e| e.to_string())?;
-        (next, true)
+        *state.roster.lock().await = Some(next.clone());
+        cancel_transfers_not_in_roster(&state, &app, &next).await;
+        persist_roster(&state, &signed).await;
+        broadcast_roster(&state, &signed, next.topic()).await;
+        next
     };
 
-    // Commit before granting access. On a write failure the in-memory roster
-    // remains unchanged and this pending request can be approved again. If a
-    // prior attempt committed but failed to publish its grant, writing the
-    // current entry again is idempotent and repairs a one-epoch disk lag.
-    let roster_path =
-        persist_sync_group_roster_checked(state.inner(), &pending.network_id, &next.entry).await?;
-    require_pending_group_active(state.inner(), &pending, "approving").await?;
-    *state.roster.lock().await = Some(next.clone());
-    if roster_changed {
-        cancel_transfers_not_in_roster(&state, &app, &next).await;
-        broadcast_roster(&state, &next.entry, next.topic()).await;
-    }
-
+    let roster_path = state
+        .roster_path
+        .lock()
+        .await
+        .clone()
+        .ok_or_else(|| "roster persistence is unavailable".to_string())?;
     let roster_chain = std::fs::read(&roster_path)
         .ok()
         .and_then(|bytes| decode_persisted_roster_entries(&bytes))
@@ -396,15 +293,7 @@ pub async fn approve_join_request(
     {
         return Err("joining device was not committed to the roster chain".to_string());
     }
-    let network_name = state
-        .settings
-        .lock()
-        .await
-        .sync_groups
-        .iter()
-        .find(|group| group.id == pending.network_id)
-        .map(|group| group.name.clone())
-        .ok_or_else(|| "join request group metadata is missing".to_string())?;
+    let (_, network_name) = current_network_identity(state.inner()).await?;
     let payload = PairingRosterPayload {
         network_id: pending.network_id.clone(),
         network_name,
@@ -427,7 +316,6 @@ pub async fn approve_join_request(
         "join-approved",
     )
     .await?;
-    mark_pairing_request_decided(state.inner(), &pending)?;
     state.pending_joins.lock().await.remove(&request_id);
     let _ = app.emit("roster-updated", ());
     let _ = app.emit("join-request-resolved", request_id);
@@ -545,21 +433,31 @@ pub async fn join_sync_group(
     let name = sanitize_sync_group_name(&name)?;
     let invite = crate::pairing::parse_uri(&uri).map_err(|e| e.to_string())?;
     let id = network::new_id();
-    let (previous_id, previous_default_id) = {
+    let previous_id;
+    {
         let mut settings = state.settings.lock().await;
-        add_sync_group_config(&mut settings, id.clone(), name)?
-    };
+        if settings.sync_groups.len() >= 32 {
+            return Err("at most 32 sync groups are supported".to_string());
+        }
+        settings.sync_groups.push(SyncGroupConfig {
+            id: id.clone(),
+            name,
+        });
+        previous_id = settings.active_sync_group_id.clone();
+    }
     if let Err(error) = persist_settings(state.inner()).await {
-        let mut settings = state.settings.lock().await;
-        settings.sync_groups.retain(|group| group.id != id);
-        settings.default_sync_group_id = previous_default_id;
+        state
+            .settings
+            .lock()
+            .await
+            .sync_groups
+            .retain(|group| group.id != id);
         return Err(error);
     }
     if let Err(error) = activate_sync_group(state.inner(), &app, &id).await {
         let mut settings = state.settings.lock().await;
         settings.sync_groups.retain(|group| group.id != id);
         settings.active_sync_group_id = previous_id;
-        settings.default_sync_group_id = previous_default_id;
         drop(settings);
         let _ = persist_settings(state.inner()).await;
         return Err(error);

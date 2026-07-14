@@ -4,8 +4,8 @@ use super::*;
 
 mod webrtc;
 
+pub(super) use webrtc::cancel_transfers_not_in_roster;
 use webrtc::*;
-pub(super) use webrtc::{cancel_all_transfers, cancel_transfers_not_in_roster};
 #[cfg(test)]
 pub(super) use webrtc::{
     cleanup_transfer, cleanup_transfer_if_timeout_token, completed_received_file_path,
@@ -149,15 +149,9 @@ pub(super) fn normalize_transfer_timeout_minutes(minutes: u64) -> Result<u64, St
 pub async fn start_file_send(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
-    network_id: String,
     recipient_id: String,
     grant_id: Option<String>,
 ) -> Result<TransferDto, String> {
-    let network_id = network_id.trim().to_string();
-    {
-        let settings = state.settings.lock().await;
-        ensure_expected_active_group(&settings, &network_id, "starting the file transfer")?;
-    }
     let path = match grant_id
         .as_deref()
         .map(str::trim)
@@ -168,10 +162,6 @@ pub async fn start_file_send(
     };
     let (path, file_name, size) = inspect_local_file(path)?;
     let recipient = parse_device_id(&recipient_id)?;
-    {
-        let settings = state.settings.lock().await;
-        ensure_expected_active_group(&settings, &network_id, "starting the file transfer")?;
-    }
     let (recipient_label, recipient_identity, topic, epoch) =
         recipient_for_transfer(state.inner(), &recipient).await?;
 
@@ -232,14 +222,6 @@ pub async fn start_file_send(
     let sdp_json = serde_json::to_string(&local).map_err(|e| e.to_string())?;
     validate_sdp_json(&sdp_json)?;
 
-    let group_error = {
-        let settings = state.settings.lock().await;
-        ensure_expected_active_group(&settings, &network_id, "starting the file transfer").err()
-    };
-    if let Some(error) = group_error {
-        let _ = peer.close().await;
-        return Err(error);
-    }
     {
         let mut transfers = state.file_transfers.lock().await;
         if let Err(e) = ensure_transfer_capacity(&transfers) {
@@ -295,26 +277,15 @@ pub async fn start_file_send(
 pub async fn accept_file_transfer(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
-    network_id: String,
     session_id: String,
 ) -> Result<TransferDto, String> {
-    let network_id = network_id.trim().to_string();
-    {
-        let settings = state.settings.lock().await;
-        ensure_expected_active_group(&settings, &network_id, "accepting the file transfer")?;
-    }
     if !is_valid_session_id(&session_id) {
         return Err("transfer id is invalid".to_string());
     }
     let pending_for_dialog = {
         let transfers = state.file_transfers.lock().await;
         match transfers.get(&session_id) {
-            Some(TransferRecord::PendingIncoming(pending)) if pending.network_id == network_id => {
-                pending.clone()
-            }
-            Some(TransferRecord::PendingIncoming(_)) => {
-                return Err("file offer belongs to another sync group".to_string())
-            }
+            Some(TransferRecord::PendingIncoming(pending)) => pending.clone(),
             Some(_) => return Err("transfer is not waiting for acceptance".to_string()),
             None => return Err("transfer not found".to_string()),
         }
@@ -323,10 +294,6 @@ pub async fn accept_file_transfer(
     ensure_receive_destination_available(&save_path)?;
     let part_path = part_path_for(&save_path);
     ensure_receive_destination_available(&part_path)?;
-    {
-        let settings = state.settings.lock().await;
-        ensure_expected_active_group(&settings, &network_id, "accepting the file transfer")?;
-    }
 
     let pending = {
         let mut transfers = state.file_transfers.lock().await;
@@ -735,7 +702,6 @@ pub(super) fn decode_file_signal(text: &str) -> Result<Option<FileSignal>, Strin
 pub(super) async fn handle_file_signal(
     state: &Arc<AppState>,
     app: &tauri::AppHandle,
-    network_id: String,
     sender_id: crypto::Ed25519PubKey,
     signal: FileSignal,
 ) {
@@ -776,7 +742,6 @@ pub(super) async fn handle_file_signal(
                 transfers.insert(
                     session_id.clone(),
                     TransferRecord::PendingIncoming(PendingIncomingTransfer {
-                        network_id: network_id.clone(),
                         sender_id: sender_id.clone(),
                         file_name: file_name.clone(),
                         size,
@@ -798,7 +763,6 @@ pub(super) async fn handle_file_signal(
                 "file-offer-received",
                 FileOfferDto {
                     session_id,
-                    network_id,
                     sender_id: hex::encode(sender_id.0),
                     sender_label,
                     file_name,
