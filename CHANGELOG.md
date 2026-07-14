@@ -13,12 +13,12 @@ This project uses SemVer. Release tags should use the form `vX.Y.Z`.
 - Add multiple named Sync Groups with isolated rosters and clip history,
   active-group switching, create/join/rename/remove controls, and automatic
   migration of the legacy single-room state.
-- Replace short-lived single-use pairing with reusable, revocable Network
+- Replace short-lived single-use pairing with reusable, revocable group
   invitations stored in the OS keychain, plus optional expiring invitations.
 - Encrypt pairing bootstrap requests and grants with HPKE and require explicit
   admin approval before a device is added to the signed roster.
-- Add stable Network identity/default-target scaffolding and make clipboard
-  routing fail closed when the requested Network is unavailable.
+- Add stable group identity/default-target scaffolding and make clipboard
+  routing fail closed when the requested group is unavailable.
 - Always show the file recipient picker and separate My Devices from the
   reserved People/direct-share section.
 - Add coordinated version tooling for npm, Cargo, Tauri, and lockfiles.

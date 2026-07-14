@@ -2,38 +2,67 @@
 
 use super::*;
 
-async fn spawn_relay_message_pump(
-    state: &Arc<AppState>,
+const GROUP_REMOVAL_NOTICE_MARKER: &str = "fwoosh-group-removal-v1";
+
+fn invitation_is_subscribable(
+    invite: &InvitationRecord,
+    local_group_ids: &HashSet<String>,
+    now: u64,
+) -> bool {
+    local_group_ids.contains(&invite.network_id) && invite.is_active_at(now)
+}
+
+fn file_signal_is_fresh(sent_at: u64, now: u64, timeout_minutes: u64) -> bool {
+    now.saturating_sub(sent_at) <= timeout_minutes.saturating_mul(60)
+}
+
+fn spawn_relay_message_pump<'a>(
+    state: &'a Arc<AppState>,
     app: tauri::AppHandle,
     topic: String,
-) -> tokio::sync::oneshot::Sender<()> {
-    let base = state.ntfy_base.lock().await.clone();
-    let since = state.last_msg_ids.lock().await.get(&topic).cloned();
-    let cfg = ntfy::SubscribeConfig {
-        base,
-        topic: topic.clone(),
-        since,
-    };
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<ntfy::RelayMessage>(64);
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    ntfy::spawn_subscriber(cfg, tx, shutdown_rx);
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = tokio::sync::oneshot::Sender<()>> + Send + 'a>,
+> {
+    Box::pin(async move {
+        let base = state.ntfy_base.lock().await.clone();
+        let since = state
+            .last_msg_ids
+            .lock()
+            .await
+            .get(&topic)
+            .cloned()
+            // A topic may have been inactive, or the app may have restarted
+            // before a cached removal notice was observed. Ask ntfy for the
+            // bounded server-side cache on the first local subscription; all
+            // replayed payloads still pass normal signature, epoch, recipient,
+            // and message-id validation below.
+            .or_else(|| Some("all".to_string()));
+        let cfg = ntfy::SubscribeConfig {
+            base,
+            topic: topic.clone(),
+            since,
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ntfy::RelayMessage>(64);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        ntfy::spawn_subscriber(cfg, tx, shutdown_rx);
 
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if msg.payload.is_empty() {
-                continue;
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                if msg.payload.is_empty() {
+                    continue;
+                }
+                state_clone
+                    .last_msg_ids
+                    .lock()
+                    .await
+                    .insert(topic.clone(), msg.id.clone());
+                handle_relay_message(&state_clone, &app, &topic, msg).await;
             }
-            state_clone
-                .last_msg_ids
-                .lock()
-                .await
-                .insert(topic.clone(), msg.id.clone());
-            handle_relay_message(&state_clone, &app, &topic, msg).await;
-        }
-    });
+        });
 
-    shutdown_tx
+        shutdown_tx
+    })
 }
 
 /// Spawn (or replace) the ntfy subscriber for the given topic. Messages are
@@ -79,15 +108,20 @@ pub(super) async fn stop_auxiliary_subscriber(state: &Arc<AppState>, key: &str) 
 
 pub async fn start_invitation_subscribers(state: &Arc<AppState>, app: tauri::AppHandle) {
     let now = now_unix();
-    let active_network_id = current_network_identity(state).await.ok().map(|(id, _)| id);
+    let local_group_ids: HashSet<String> = state
+        .settings
+        .lock()
+        .await
+        .sync_groups
+        .iter()
+        .map(|group| group.id.clone())
+        .collect();
     let invites: Vec<InvitationRecord> = state
         .invitations
         .lock()
         .await
         .values()
-        .filter(|invite| {
-            active_network_id.as_ref() == Some(&invite.network_id) && invite.is_active_at(now)
-        })
+        .filter(|invite| invitation_is_subscribable(invite, &local_group_ids, now))
         .cloned()
         .collect();
     let desired_keys: HashSet<String> = invites
@@ -468,17 +502,10 @@ pub async fn handle_relay_message(
             if source_topic != crate::pairing::rendezvous_topic(&invite.secret) {
                 return;
             }
-            let current_network_id = match current_network_identity(state).await {
-                Ok((id, _)) => id,
-                Err(_) => return,
-            };
-            let verified = match state.roster.lock().await.clone() {
-                Some(roster) if roster.entry.admin_id == state.device.signing_pub => roster,
+            let verified = match load_sync_group_roster(state, &invite.network_id).await {
+                Ok(Some(roster)) if roster.entry.admin_id == state.device.signing_pub => roster,
                 _ => return,
             };
-            if invite.network_id != current_network_id {
-                return;
-            }
             let info = pairing_bootstrap_info(&invite.id, "join");
             let plaintext = match crypto::open_bootstrap(&state.device, &info, &envelope.sealed) {
                 Ok(plaintext) => plaintext,
@@ -499,19 +526,42 @@ pub async fn handle_relay_message(
             {
                 return;
             }
-            if verified
+            let request_key =
+                match pairing_commands::pairing_request_key(&invite.network_id, &request) {
+                    Ok(key) => key,
+                    Err(e) => {
+                        eprintln!("[pairing] failed to identify join request: {e}");
+                        return;
+                    }
+                };
+            match state.store.has_seen_message(&request_key) {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("[pairing] join-request replay check failed: {e}");
+                    return;
+                }
+            }
+            if let Some(existing) = verified
                 .entry
                 .devices
                 .iter()
-                .any(|device| device.signing_pub == request.identity.signing_pub)
+                .find(|device| device.signing_pub == request.identity.signing_pub)
             {
-                return;
+                // An unseen request from an already committed device is a
+                // retry after a grant/persistence interruption. Only permit it
+                // when the encryption identity is unchanged; otherwise an
+                // invitation holder could redirect that device's roster grant.
+                if existing.x25519_pub != request.identity.x25519_pub {
+                    return;
+                }
             }
-            let request_id = hex::encode(request.identity.signing_pub.0);
+            let request_id = hex::encode(request_key);
             state.pending_joins.lock().await.insert(
                 request_id.clone(),
                 PendingJoinRecord {
                     request_id: request_id.clone(),
+                    request_key,
                     network_id: invite.network_id,
                     rendezvous_topic: source_topic.to_string(),
                     request,
@@ -761,13 +811,89 @@ async fn try_open_clip(
 
     match opened {
         Ok(o) => {
+            match decode_group_removal_notice(&o.plaintext) {
+                Ok(true) => {
+                    if o.sender_id != admin_id {
+                        eprintln!("group removal notice rejected: sender is not admin");
+                        return;
+                    }
+                    let group_id = match current_sync_group_id(state).await {
+                        Ok(group_id) => group_id,
+                        Err(e) => {
+                            eprintln!("group removal notice rejected: {e}");
+                            return;
+                        }
+                    };
+                    let group_name = {
+                        let settings = state.settings.lock().await;
+                        if settings.active_sync_group_id.as_deref() != Some(group_id.as_str()) {
+                            eprintln!(
+                                "group removal notice rejected: group is not the active group"
+                            );
+                            return;
+                        }
+                        match settings
+                            .sync_groups
+                            .iter()
+                            .find(|group| group.id == group_id)
+                        {
+                            Some(group) => group.name.clone(),
+                            None => {
+                                eprintln!(
+                                    "group removal notice rejected: active group is not configured"
+                                );
+                                return;
+                            }
+                        }
+                    };
+                    cancel_all_transfers(state, app, "This device was removed from the group")
+                        .await;
+                    match remove_sync_group_from_device(state, app, &group_id, None).await {
+                        Ok(()) => {
+                            if let Err(e) = state.store.mark_seen_message(&manifest.msg_id, o.ts) {
+                                eprintln!(
+                                    "group removal notice replay-cache update failed after removal: {e}"
+                                );
+                            }
+                            let _ = app.emit("sync-group-removed", group_name);
+                        }
+                        Err(e) => eprintln!("group removal notice failed: {e}"),
+                    }
+                    return;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    eprintln!("group removal notice decode failed: {e}");
+                    return;
+                }
+            }
             if let Err(e) = state.store.mark_seen_message(&manifest.msg_id, o.ts) {
                 eprintln!("clip open failed: replay cache update failed: {e}");
                 return;
             }
             match decode_file_signal(&o.plaintext) {
                 Ok(Some(signal)) => {
-                    handle_file_signal(state, app, o.sender_id.clone(), signal).await;
+                    let network_id = match current_sync_group_id(state).await {
+                        Ok(network_id) => network_id,
+                        Err(_) => return,
+                    };
+                    let runtime_topic = state
+                        .roster
+                        .lock()
+                        .await
+                        .as_ref()
+                        .map(|verified| verified.topic().to_string());
+                    if runtime_topic.as_deref() != Some(current_topic.as_str()) {
+                        eprintln!("file signal ignored: active group changed while opening it");
+                        return;
+                    }
+                    let transfer_timeout_minutes =
+                        state.settings.lock().await.transfer_timeout_minutes;
+                    if !file_signal_is_fresh(o.ts, now_unix(), transfer_timeout_minutes) {
+                        eprintln!("file signal ignored: transfer window expired");
+                        return;
+                    }
+                    handle_file_signal(state, app, network_id, o.sender_id.clone(), signal).await;
                     return;
                 }
                 Ok(None) => {}
@@ -843,6 +969,20 @@ fn preview(s: &str) -> String {
     }
 }
 
+pub(super) fn encode_group_removal_notice() -> String {
+    GROUP_REMOVAL_NOTICE_MARKER.to_string()
+}
+
+fn decode_group_removal_notice(text: &str) -> Result<bool, String> {
+    if text == GROUP_REMOVAL_NOTICE_MARKER {
+        return Ok(true);
+    }
+    if text.starts_with(GROUP_REMOVAL_NOTICE_MARKER) {
+        return Err("malformed group removal notice".to_string());
+    }
+    Ok(false)
+}
+
 pub(super) fn encode_roster_move(entry: &roster::RosterEntry) -> Result<String, String> {
     let bytes = postcard::to_allocvec(entry).map_err(|e| e.to_string())?;
     Ok(format!(
@@ -907,6 +1047,21 @@ pub(super) fn parse_device_id(device_id: &str) -> Result<crypto::Ed25519PubKey, 
 mod tests {
     use super::*;
 
+    fn invitation(
+        network_id: &str,
+        expires_at: Option<u64>,
+        revoked_at: Option<u64>,
+    ) -> InvitationRecord {
+        InvitationRecord {
+            id: "invite-id".to_string(),
+            network_id: network_id.to_string(),
+            secret: [1; 32],
+            created_at: 1,
+            expires_at,
+            revoked_at,
+        }
+    }
+
     fn chunk(index: u32, fill: u8) -> crypto::Chunk {
         crypto::Chunk {
             msg_id: [7; 16],
@@ -947,5 +1102,59 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(encode_attachment_chunks(&chunks).unwrap().len() <= ntfy::MAX_ATTACHMENT_BYTES);
+    }
+
+    #[test]
+    fn group_removal_notice_roundtrips() {
+        let encoded = encode_group_removal_notice();
+
+        assert!(decode_group_removal_notice(&encoded).unwrap());
+        assert!(!decode_group_removal_notice("ordinary clip").unwrap());
+    }
+
+    #[test]
+    fn group_removal_notice_rejects_suffixes() {
+        assert!(decode_group_removal_notice(&format!("{GROUP_REMOVAL_NOTICE_MARKER}:")).is_err());
+        assert!(
+            decode_group_removal_notice(&format!("{GROUP_REMOVAL_NOTICE_MARKER}extra")).is_err()
+        );
+    }
+
+    #[test]
+    fn invitation_subscription_accepts_active_invites_for_any_local_group() {
+        let local_group_ids = HashSet::from(["active".to_string(), "inactive".to_string()]);
+
+        assert!(invitation_is_subscribable(
+            &invitation("active", None, None),
+            &local_group_ids,
+            100
+        ));
+        assert!(invitation_is_subscribable(
+            &invitation("inactive", Some(101), None),
+            &local_group_ids,
+            100
+        ));
+        assert!(!invitation_is_subscribable(
+            &invitation("missing", None, None),
+            &local_group_ids,
+            100
+        ));
+        assert!(!invitation_is_subscribable(
+            &invitation("inactive", Some(100), None),
+            &local_group_ids,
+            100
+        ));
+        assert!(!invitation_is_subscribable(
+            &invitation("inactive", None, Some(99)),
+            &local_group_ids,
+            100
+        ));
+    }
+
+    #[test]
+    fn cached_file_signals_respect_the_transfer_window() {
+        assert!(file_signal_is_fresh(1_000, 1_060, 1));
+        assert!(!file_signal_is_fresh(1_000, 1_061, 1));
+        assert!(file_signal_is_fresh(1_060, 1_000, 1));
     }
 }
