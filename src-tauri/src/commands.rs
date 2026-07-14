@@ -41,7 +41,9 @@ use relay::{
     encode_roster_move, parse_device_id, publish_sealed_clip, publish_sealed_clip_attachment,
     publish_wire, start_auxiliary_subscriber, stop_auxiliary_subscriber,
 };
-pub use relay::{handle_relay_message, start_invitation_subscribers, start_subscriber};
+pub use relay::{
+    handle_relay_message, restart_subscribers, start_invitation_subscribers, start_subscriber,
+};
 pub mod history_commands;
 
 pub use history_commands::{
@@ -75,8 +77,8 @@ use tauri_plugin_notification::NotificationExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 pub use transfer::{
-    accept_file_transfer, cancel_file_transfer, grant_dropped_file, reject_file_transfer,
-    reveal_received_file, start_file_send,
+    accept_file_transfer, cancel_file_transfer, grant_dropped_file, pending_file_offers,
+    reject_file_transfer, reveal_received_file, start_file_send,
 };
 use transfer::{
     cancel_transfers_not_in_roster, decode_file_signal, handle_file_signal,
@@ -359,13 +361,24 @@ pub async fn send_clip(
 }
 
 pub fn reveal_main_window(app: &tauri::AppHandle) -> Result<(), String> {
-    let win = app
-        .get_webview_window("main")
-        .ok_or_else(|| "main window not found".to_string())?;
+    #[cfg(desktop)]
+    {
+        let win = app
+            .get_webview_window("main")
+            .ok_or_else(|| "main window not found".to_string())?;
 
-    let _ = win.unminimize();
-    win.show().map_err(|e| e.to_string())?;
-    win.set_focus().map_err(|e| e.to_string())
+        let _ = win.unminimize();
+        win.show().map_err(|e| e.to_string())?;
+        win.set_focus().map_err(|e| e.to_string())
+    }
+
+    // Mobile owns its normal activity/window lifecycle. In particular, do
+    // not force a show or focus when a file offer arrives.
+    #[cfg(mobile)]
+    {
+        let _ = app;
+        Ok(())
+    }
 }
 
 #[tauri::command]

@@ -1,7 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
-  "identifier": "default",
-  "description": "Capability for the main Fwoosh popup window",
+  "identifier": "desktop",
+  "description": "Desktop capability for the Fwoosh tray popup",
+  "platforms": ["windows", "macOS", "linux"],
   "windows": ["main"],
   "permissions": [
     "core:default",

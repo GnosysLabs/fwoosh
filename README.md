@@ -1,7 +1,7 @@
 # Fwoosh
 
 A free, open-source, **end-to-end-encrypted clipboard sync and P2P file
-sharing** app for Windows, macOS, and Linux (planned). Pop a small text box
+sharing** app for Windows, macOS, Android, and iOS (Linux planned). Pop a small text box
 out of the tray/dock with `Ctrl/Cmd+Shift+V`, paste, and it becomes available
 on all your paired devices, instantly, using the free public
 [ntfy.sh](https://ntfy.sh) relay. **No servers to set up.**
@@ -50,9 +50,9 @@ with encrypted topic-rotation notice. Multiple named Sync Groups keep
 membership, relay topics, and history separate, with an active-group switcher
 for deliberate sends.
 
-**Planned for release:** mobile companion app, Linux support, QR scanning,
-custom relay settings UI, pause sync, full room-repair UX, signed and notarized
-installer releases, and a cross-device installed-app smoke test.
+**Planned for release:** Linux support, custom relay settings UI, pause sync,
+full room-repair UX, signed and notarized installer releases, mobile device
+validation, and a cross-device installed-app smoke test.
 
 | Area | State |
 |---|---|
@@ -65,6 +65,7 @@ installer releases, and a cross-device installed-app smoke test.
 | Sync Groups | Named groups, isolated roster files/history, legacy-room migration, active-group switching |
 | P2P file transfer (`commands/transfer/`) | WebRTC data channels; streamed encrypted chunks; configurable timeout |
 | Desktop shell (tray, hotkey, popup UI) | ✅ builds |
+| Mobile shell (Android / iOS) | Shared protocol core; responsive shell, QR scan, secure storage, file picker streaming, and target CI are wired |
 | CI / release pipeline | Tests plus cargo/npm audit in CI; Windows NSIS/MSI and unsigned macOS app/DMG publishing are wired, signing remains before public release |
 
 ## Threat model (honest)
@@ -133,6 +134,13 @@ npm run build:macos
 
 This creates an unsigned `.app` bundle and `.dmg` installer under
 `src-tauri/target/<your-target>/release/bundle/`.
+
+### Build Android and iOS
+
+See [mobile development](docs/mobile.md) for the Android and iOS prerequisites,
+development commands, and lifecycle behavior. Android builds can run on
+Windows, macOS, or Linux after the SDK/NDK is installed; iOS builds require
+macOS with full Xcode and CocoaPods.
 
 ### Run the test suite
 ```bash

@@ -3,7 +3,15 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import {
+    Format,
+    checkPermissions as checkCameraPermissions,
+    requestPermissions as requestCameraPermissions,
+    scan,
+  } from "@tauri-apps/plugin-barcode-scanner";
+  import { confirm } from "@tauri-apps/plugin-dialog";
   import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
+  import { platform } from "@tauri-apps/plugin-os";
   import QRCode from "qrcode";
   import { APP_VERSION } from "$lib/version";
 
@@ -52,6 +60,11 @@
   let stunServersText = $state("");
   let transferTimeoutMinutes = $state(60);
   let savingNetwork = $state(false);
+  let isMobile = $state(false);
+  let scanningPairingCode = $state(false);
+  let scanFeedback = $state("");
+  let scanFeedbackTarget = $state<"join" | "new-group" | null>(null);
+  let scanFeedbackIsError = $state(false);
   let fileHover = $state(false);
   let pendingFile = $state<DroppedFile | null>(null);
   let sendingFile = $state(false);
@@ -181,6 +194,12 @@
   let unlisteners: Array<() => void | Promise<void>> = [];
 
   onMount(() => {
+    const currentPlatform = platform();
+    isMobile = currentPlatform === "android" || currentPlatform === "ios";
+    const refreshPendingOffersOnVisible = () => {
+      if (!document.hidden) void refreshPendingFileOffer();
+    };
+    document.addEventListener("visibilitychange", refreshPendingOffersOnVisible);
     pairingTickTimer = setInterval(() => {
       nowSeconds = Math.floor(Date.now() / 1000);
     }, 1000);
@@ -234,21 +253,23 @@
           void handleIncomingClip(e.payload as ToastInfo);
         })
       );
-      unlisteners.push(
-        await getCurrentWindow().onDragDropEvent((event) => {
-          const payload = event.payload as
-            | { type: "over"; position: { x: number; y: number } }
-            | { type: "drop"; paths: string[]; position: { x: number; y: number } }
-            | { type: "cancel" };
-          if (payload.type === "over") {
-            fileHover = true;
-          } else if (payload.type === "drop") {
-            fileHover = false;
-          } else {
-            fileHover = false;
-          }
-        })
-      );
+      if (!isMobile) {
+        unlisteners.push(
+          await getCurrentWindow().onDragDropEvent((event) => {
+            const payload = event.payload as
+              | { type: "over"; position: { x: number; y: number } }
+              | { type: "drop"; paths: string[]; position: { x: number; y: number } }
+              | { type: "cancel" };
+            if (payload.type === "over") {
+              fileHover = true;
+            } else if (payload.type === "drop") {
+              fileHover = false;
+            } else {
+              fileHover = false;
+            }
+          })
+        );
+      }
       unlisteners.push(
         await listen("file-drop-granted", (e) => {
           void handleDroppedFile(e.payload as FileDropGrantDto);
@@ -289,6 +310,7 @@
           query = "";
           transfers = {};
           dismissedTransferIds = new Set();
+          await refreshPendingFileOffer();
         })
       );
       unlisteners.push(
@@ -310,7 +332,7 @@
       );
       unlisteners.push(
         await listen("file-offer-received", (e) => {
-          incomingFileOffer = e.payload as FileOfferDto;
+          if (!incomingFileOffer) incomingFileOffer = e.payload as FileOfferDto;
         })
       );
       unlisteners.push(
@@ -333,6 +355,7 @@
           failTransfer(e.payload as FileTransferProgressDto);
         })
       );
+      await refreshPendingFileOffer();
     })();
 
     return () => {
@@ -342,6 +365,7 @@
       }
       clearStatusTimer();
       clearConfettiTimer();
+      document.removeEventListener("visibilitychange", refreshPendingOffersOnVisible);
       unlisteners.forEach((u) => void u());
     };
   });
@@ -527,6 +551,7 @@
       };
       incomingFileOffer = null;
       activeView = "files";
+      void refreshPendingFileOffer();
     } catch (e) {
       if (String(e) !== "Save cancelled") {
         showStatus("err", String(e));
@@ -544,6 +569,21 @@
       await invoke("reject_file_transfer", { sessionId: offer.session_id });
     } catch {
       /* best effort */
+    } finally {
+      void refreshPendingFileOffer();
+    }
+  }
+
+  async function refreshPendingFileOffer() {
+    try {
+      const offers = await invoke<FileOfferDto[]>("pending_file_offers");
+      const currentSessionId = incomingFileOffer?.session_id;
+      incomingFileOffer =
+        (currentSessionId ? offers.find((offer) => offer.session_id === currentSessionId) : undefined) ??
+        offers[0] ??
+        null;
+    } catch {
+      /* the transfer layer may not be ready during startup */
     }
   }
 
@@ -625,17 +665,18 @@
     const sessionId = String(payload.session_id ?? "");
     if (!sessionId || dismissedTransferIds.has(sessionId)) return;
     const existing = transfers[sessionId];
+    const direction = String(payload.direction ?? existing?.direction ?? "transfer");
     transfers = {
       ...transfers,
       [sessionId]: {
         session_id: sessionId,
         file_name: String(payload.file_name ?? existing?.file_name ?? "File"),
         peer_label: existing?.peer_label ?? "",
-        direction: String(payload.direction ?? existing?.direction ?? "transfer"),
+        direction,
         transferred: Number(payload.size ?? existing?.total ?? 0),
         total: Number(payload.size ?? existing?.total ?? 0),
         status: "complete",
-        message: "Complete",
+        message: isMobile && direction === "incoming" ? "Saved to selected location" : "Complete",
         path:
           typeof payload.path === "string" && payload.path.length > 0
             ? payload.path
@@ -645,7 +686,10 @@
   }
 
   function failTransfer(p: FileTransferProgressDto) {
-    if (incomingFileOffer?.session_id === p.session_id) incomingFileOffer = null;
+    if (incomingFileOffer?.session_id === p.session_id) {
+      incomingFileOffer = null;
+      void refreshPendingFileOffer();
+    }
     if (dismissedTransferIds.has(p.session_id)) return;
     const existing = transfers[p.session_id];
     if (existing?.status === "complete") return;
@@ -784,7 +828,7 @@
   }
 
   async function rotatePairingCode() {
-    if (!confirm("Revoke the permanent invitation and create a new one? Existing devices stay paired.")) return;
+    if (!(await confirm("Revoke the permanent invitation and create a new one? Existing devices stay paired."))) return;
     pairingRefreshing = true;
     try {
       const code = await invoke<PairingCodeDto>("rotate_pairing_code");
@@ -797,7 +841,7 @@
   }
 
   async function revokeVisiblePairingCode() {
-    if (!pairingInviteId || !confirm("Revoke this invitation? Existing devices stay paired.")) return;
+    if (!pairingInviteId || !(await confirm("Revoke this invitation? Existing devices stay paired."))) return;
     try {
       await invoke("revoke_pairing_code", { inviteId: pairingInviteId });
       clearPairingCode();
@@ -809,6 +853,7 @@
 
   async function hidePopup() {
     settingsOpen = false;
+    if (isMobile) return;
     await getCurrentWindow().hide();
   }
 
@@ -819,7 +864,7 @@
   }
 
   function startLogoDrag(e: MouseEvent) {
-    if (e.button !== 0 || !/^Mac/.test(navigator.platform)) return;
+    if (isMobile || e.button !== 0 || !/^Mac/.test(navigator.platform)) return;
     e.preventDefault();
     void getCurrentWindow().startDragging();
   }
@@ -894,7 +939,7 @@
 
   async function removeActiveSyncGroup() {
     if (!activeSyncGroup) return;
-    if (!confirm(`Remove “${activeSyncGroup.name}” from this device?`)) return;
+    if (!(await confirm(`Remove “${activeSyncGroup.name}” from this device?`))) return;
     try {
       await invoke("leave_room");
       clearPairingCode();
@@ -1096,6 +1141,7 @@
   }
 
   async function windowAttentionState() {
+    if (isMobile) return { notify: true, revealForCopy: false };
     try {
       const win = getCurrentWindow();
       const [visible, minimized, focused] = await Promise.all([
@@ -1113,6 +1159,7 @@
   }
 
   async function showMainWindow() {
+    if (isMobile) return;
     try {
       await invoke("show_main_window");
     } catch {
@@ -1176,7 +1223,7 @@
         showPairing = false;
         return;
       }
-      void hidePopup();
+      if (!isMobile) void hidePopup();
     }
   }
 
@@ -1215,12 +1262,59 @@
     }
   }
 
+  async function scanPairingCode(target: "join" | "new-group") {
+    if (!isMobile || scanningPairingCode) return;
+    scanningPairingCode = true;
+    scanFeedback = "";
+    scanFeedbackTarget = target;
+    scanFeedbackIsError = false;
+    try {
+      let permission = await checkCameraPermissions();
+      if (permission !== "granted") permission = await requestCameraPermissions();
+      if (permission !== "granted") {
+        const message = "Camera access is needed to scan a pairing code";
+        scanFeedback = message;
+        scanFeedbackIsError = true;
+        showStatus("err", message);
+        return;
+      }
+      const result = await scan({
+        cameraDirection: "back",
+        formats: [Format.QRCode],
+      });
+      const scanned = result.content.trim();
+      if (!scanned.startsWith("fwoosh://pair")) {
+        const message = "That QR code is not a Fwoosh pairing invitation";
+        scanFeedback = message;
+        scanFeedbackIsError = true;
+        showStatus("err", message);
+        return;
+      }
+      if (target === "join") {
+        joinUri = scanned;
+      } else {
+        newSyncGroupCode = scanned;
+      }
+      scanFeedback = "Pairing invitation scanned";
+      showStatus("ok", scanFeedback);
+    } catch (e) {
+      // Native scanners reject their promise when dismissed; treating that as
+      // an error would make a deliberate cancel feel like a failed pairing.
+      if (String(e).toLowerCase().includes("cancel")) return;
+      scanFeedback = `Could not scan pairing code: ${String(e)}`;
+      scanFeedbackIsError = true;
+      showStatus("err", scanFeedback);
+    } finally {
+      scanningPairingCode = false;
+    }
+  }
+
   async function createPairingCode() {
     await refreshPairingCode();
   }
 
   async function revokeDevice(id: string) {
-    if (!confirm("Revoke this device from the room?")) return;
+    if (!(await confirm("Revoke this device from the room?"))) return;
     try {
       await invoke("revoke_device", { deviceId: id });
       await refreshRoom();
@@ -1232,9 +1326,9 @@
 
 <svelte:window on:keydown={onKeydown} on:click={closeSettingsOnOutsideClick} />
 
-<div class="card" class:file-hover={fileHover} data-tauri-drag-region>
-  <header class="header" data-tauri-drag-region>
-    <div class="title" role="presentation" data-tauri-drag-region onmousedown={startLogoDrag}>
+<div class="card" class:mobile={isMobile} class:file-hover={fileHover}>
+  <header class="header">
+    <div class="title" role="presentation" onmousedown={startLogoDrag}>
       <img
         class="brand-logo"
         src={logoSrc}
@@ -1242,7 +1336,6 @@
         width="112"
         height="32"
         draggable="false"
-        data-tauri-drag-region
       />
     </div>
     <div class="tabs">
@@ -1278,14 +1371,22 @@
           />
         </svg>
       </button>
-      <button class="icon-btn close-btn" aria-label="Hide Fwoosh" title="Hide Fwoosh" onclick={hidePopup}>
-        <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
-          <path d="M6 6l12 12" />
-          <path d="M18 6 6 18" />
-        </svg>
-      </button>
+      {#if !isMobile}
+        <button class="icon-btn close-btn" aria-label="Hide Fwoosh" title="Hide Fwoosh" onclick={hidePopup}>
+          <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M6 6l12 12" />
+            <path d="M18 6 6 18" />
+          </svg>
+        </button>
+      {/if}
       {#if settingsOpen}
         <div bind:this={settingsMenu} class="settings-menu" data-tauri-drag-region="false">
+          {#if isMobile}
+            <div class="mobile-settings-header">
+              <div class="mobile-settings-title">Settings</div>
+              <button class="mobile-settings-done" onclick={() => (settingsOpen = false)}>Done</button>
+            </div>
+          {/if}
           <div class="settings-section">
             <div class="settings-title">Sync group</div>
             <div class="group-picker-row">
@@ -1500,7 +1601,21 @@
             autocomplete="off"
             spellcheck="false"
             onkeydown={(e) => e.key === "Enter" && joinRoom()} />
-          <button class="ghost" onclick={joinRoom} disabled={!joinUri.trim()}>Request to join</button>
+          <div class="pair-join-actions">
+            {#if isMobile}
+              <button
+                class="ghost scan-pair-btn"
+                onclick={() => void scanPairingCode("join")}
+                disabled={scanningPairingCode}
+              >{scanningPairingCode ? "Opening camera…" : "Scan QR"}</button>
+              {#if scanFeedbackTarget === "join" && scanFeedback}
+                <p class="scan-feedback" class:err={scanFeedbackIsError} role="status" aria-live="polite">
+                  {scanFeedback}
+                </p>
+              {/if}
+            {/if}
+            <button class="ghost" onclick={joinRoom} disabled={!joinUri.trim()}>Request to join</button>
+          </div>
         </div>
       {:else}
         {#if devicesExpanded}
@@ -1597,7 +1712,7 @@
                   {/if}
                 </span>
                 <div class="transfer-actions">
-                  {#if t.status === "complete" && t.direction === "incoming" && t.path}
+                  {#if !isMobile && t.status === "complete" && t.direction === "incoming" && t.path}
                     <button
                       class="transfer-reveal"
                       aria-label={`Show ${t.file_name} in file manager`}
@@ -1756,6 +1871,18 @@
           placeholder="Paste a pairing code to join…"
           bind:value={newSyncGroupCode}
         ></textarea>
+        {#if isMobile}
+          <button
+            class="ghost scan-pair-btn"
+            onclick={() => void scanPairingCode("new-group")}
+            disabled={scanningPairingCode}
+          >{scanningPairingCode ? "Opening camera…" : "Scan pairing QR"}</button>
+          {#if scanFeedbackTarget === "new-group" && scanFeedback}
+            <p class="scan-feedback" class:err={scanFeedbackIsError} role="status" aria-live="polite">
+              {scanFeedback}
+            </p>
+          {/if}
+        {/if}
         <div class="dialog-actions">
           <button class="ghost" onclick={() => (newSyncGroupOpen = false)} disabled={creatingSyncGroup}>
             Cancel
@@ -1989,7 +2116,7 @@
     </div>
   {/if}
 
-  {#if fileHover}
+  {#if fileHover && !isMobile}
     <div class="drop-overlay" aria-hidden="true">
       <div class="drop-target">Drop file</div>
     </div>
@@ -2061,6 +2188,7 @@
             <path d="M6.5 3.5h7l4 4v13h-11z" />
             <path d="M13.5 3.5v4h4" />
           </svg>
+          {#if isMobile}<span>Attach</span>{/if}
         </button>
         <label class="private-toggle" class:active={privateSend} title="Send privately">
           <input
@@ -2096,6 +2224,36 @@
       ></span>
     </div>
   </div>
+  {#if isMobile}
+    <nav class="mobile-nav" aria-label="Primary navigation">
+      <button
+        class:active={activeView === "compose" && !devicesExpanded}
+        aria-current={activeView === "compose" && !devicesExpanded ? "page" : undefined}
+        onclick={() => {
+          activeView = "compose";
+          devicesExpanded = false;
+        }}
+      >Send</button>
+      <button
+        class:active={activeView === "history"}
+        aria-current={activeView === "history" ? "page" : undefined}
+        onclick={() => (activeView = "history")}
+      >History</button>
+      <button
+        class:active={activeView === "files"}
+        aria-current={activeView === "files" ? "page" : undefined}
+        onclick={() => (activeView = "files")}
+      >Files</button>
+      <button
+        class:active={activeView === "compose" && devicesExpanded}
+        aria-current={activeView === "compose" && devicesExpanded ? "page" : undefined}
+        onclick={() => {
+          activeView = "compose";
+          devicesExpanded = true;
+        }}
+      >Devices</button>
+    </nav>
+  {/if}
 </div>
 
 <style>
@@ -5062,6 +5220,247 @@
       grid-template-columns: 1fr auto;
     }
     .tabs {
+      display: none;
+    }
+  }
+
+  .pair-join-actions {
+    display: flex;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  /* The mobile shell deliberately reuses the same theme tokens and feature
+     views as the tray popup. Only the viewport, touch targets, and navigation
+     change, keeping Fwoosh recognisable across every platform. */
+  .card.mobile {
+    --window-radius: 0;
+    --window-stroke-inset: 0;
+    --footer-safe: 132px;
+    width: 100vw;
+    min-height: 100dvh;
+    height: 100dvh;
+    border-radius: 0;
+    background: var(--shell-bg);
+  }
+  .card.mobile::before {
+    display: none;
+  }
+  .card.mobile .header {
+    grid-template-columns: minmax(0, 1fr) auto;
+    min-height: 64px;
+    padding: calc(10px + env(safe-area-inset-top)) 18px 10px;
+  }
+  .card.mobile .title {
+    -webkit-app-region: no-drag;
+  }
+  .card.mobile .tabs,
+  .card.mobile .close-btn {
+    display: none;
+  }
+  .card.mobile .window-actions {
+    gap: 0;
+  }
+  .card.mobile .icon-btn {
+    width: 44px;
+    height: 44px;
+  }
+  .card.mobile .settings-menu {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    width: auto;
+    max-width: none;
+    max-height: none;
+    margin: 0;
+    padding: calc(24px + env(safe-area-inset-top)) 20px
+      calc(96px + env(safe-area-inset-bottom));
+    border: 0;
+    border-radius: 0;
+    overflow-y: auto;
+    background: var(--panel);
+  }
+  .card.mobile .mobile-settings-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    min-height: 44px;
+    margin: 0 0 20px;
+  }
+  .card.mobile .mobile-settings-title {
+    color: var(--text);
+    font-size: 18px;
+    font-weight: 700;
+    letter-spacing: 0.01em;
+  }
+  .card.mobile .mobile-settings-done {
+    min-width: 64px;
+    min-height: 44px;
+    padding: 0 14px;
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    color: var(--accent);
+    background: transparent;
+    font: inherit;
+    font-weight: 700;
+  }
+  .card.mobile .settings-section {
+    gap: 12px;
+  }
+  .card.mobile .compose,
+  .card.mobile .history,
+  .card.mobile .files {
+    min-height: 0;
+    padding: 16px 18px calc(110px + env(safe-area-inset-bottom));
+  }
+  .card.mobile .compose {
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+  .card.mobile .box {
+    min-height: max(220px, 42dvh);
+    flex: 0 0 auto;
+    padding: 16px;
+    font-size: 16px;
+  }
+  .card.mobile .compose-controls {
+    flex-wrap: wrap;
+    min-height: 50px;
+  }
+  .card.mobile .send-btn,
+  .card.mobile .ghost,
+  .card.mobile .pair-btn,
+  .card.mobile .device-toggle,
+  .card.mobile .revoke-btn,
+  .card.mobile .unpair-btn,
+  .card.mobile .mini-action,
+  .card.mobile .danger-icon-btn,
+  .card.mobile .transfer-cancel,
+  .card.mobile .transfer-reveal,
+  .card.mobile .recipient-button {
+    min-height: 44px;
+  }
+  .card.mobile .send-btn {
+    min-width: 112px;
+  }
+  .card.mobile .join-input {
+    min-height: 44px;
+    font-size: 16px;
+  }
+  .card.mobile .scan-pair-btn {
+    min-width: 122px;
+  }
+  .card.mobile .scan-feedback {
+    width: 100%;
+    margin: 4px 0 0;
+    color: var(--accent);
+    font-size: 13px;
+    line-height: 1.35;
+  }
+  .card.mobile .scan-feedback.err {
+    color: var(--danger);
+  }
+  .card.mobile .history,
+  .card.mobile .files {
+    overflow: hidden;
+  }
+  .card.mobile .clip-list,
+  .card.mobile .transfer-list {
+    min-height: 0;
+    max-height: none;
+    flex: 1;
+  }
+  .card.mobile .clip-body,
+  .card.mobile .clip-del {
+    min-height: 48px;
+  }
+  .card.mobile .utility-footer {
+    left: 16px;
+    right: 16px;
+    bottom: calc(66px + env(safe-area-inset-bottom));
+    min-height: 44px;
+  }
+  .card.mobile .footer-tool,
+  .card.mobile .footer-tools .private-toggle {
+    width: auto;
+    min-width: 44px;
+    height: 44px;
+    padding: 0 12px;
+    gap: 7px;
+    border: 1px solid var(--line-soft);
+    border-radius: 999px;
+    background: var(--panel-raised);
+    color: var(--text);
+    font-size: 12px;
+    font-weight: 800;
+  }
+  .card.mobile .footer-tool .icon-svg,
+  .card.mobile .footer-tools .private-toggle > .icon-svg {
+    width: 18px;
+    height: 18px;
+  }
+  .card.mobile .footer-security {
+    min-height: 44px;
+  }
+  .mobile-nav {
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 20;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 5px;
+    box-sizing: border-box;
+    min-height: calc(64px + env(safe-area-inset-bottom));
+    padding: 8px 12px calc(8px + env(safe-area-inset-bottom));
+    border-top: 1px solid var(--line);
+    background: var(--panel);
+    box-shadow: 0 -12px 28px rgba(0, 0, 0, 0.16);
+  }
+  .mobile-nav button {
+    min-height: 44px;
+    border: 1px solid transparent;
+    border-radius: 14px;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-size: 11px;
+    font-weight: 800;
+  }
+  .mobile-nav button.active {
+    border-color: var(--line-strong);
+    background: var(--mint-panel);
+    color: var(--accent);
+  }
+  .card.mobile .pairing-overlay,
+  .card.mobile .modal-overlay {
+    align-items: flex-end;
+    padding-bottom: env(safe-area-inset-bottom);
+    box-sizing: border-box;
+  }
+  .card.mobile .pairing-card,
+  .card.mobile .confirm-dialog,
+  .card.mobile .transfer-dialog {
+    width: 100%;
+    max-width: none;
+    max-height: calc(100dvh - env(safe-area-inset-top) - 12px);
+    margin: 0;
+    padding: 22px 20px;
+    border-right: 0;
+    border-bottom: 0;
+    border-left: 0;
+    border-radius: 26px 26px 0 0;
+    overflow-y: auto;
+  }
+  .card.mobile .pairing-card .send-btn,
+  .card.mobile .dialog-actions .send-btn {
+    min-height: 44px;
+  }
+
+  @media (hover: none) {
+    .card.mobile .private-tooltip {
       display: none;
     }
   }
