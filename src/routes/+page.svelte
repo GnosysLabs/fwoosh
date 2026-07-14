@@ -33,7 +33,7 @@
   let networkName = $state("Personal");
   let toast = $state<ToastInfo | null>(null);
   let privateSend = $state(false);
-  let activeView = $state<"compose" | "history" | "files">("compose");
+  let activeView = $state<"compose" | "history" | "files" | "devices">("compose");
   let devices = $state<DeviceDto[]>([]);
   let theme = $state<Theme>("hacker");
   let settingsOpen = $state(false);
@@ -45,7 +45,6 @@
   let newSyncGroupName = $state("");
   let newSyncGroupCode = $state("");
   let creatingSyncGroup = $state(false);
-  let devicesExpanded = $state(false);
   let confirmDeleteAllOpen = $state(false);
   let deletingAll = $state(false);
   let deletingClipId = $state<number | null>(null);
@@ -68,6 +67,8 @@
   let confettiPieces = $state<ConfettiPiece[]>([]);
   let settingsMenu = $state<HTMLDivElement | null>(null);
   let settingsButton = $state<HTMLButtonElement | null>(null);
+  let devicesButton = $state<HTMLButtonElement | null>(null);
+  let devicesBackButton = $state<HTMLButtonElement | null>(null);
   let pendingJoins = $state<PendingJoinDto[]>([]);
   let resolvingJoinId = $state("");
   let resolvingJoinAction = $state<"approve" | "reject" | "">("");
@@ -318,7 +319,7 @@
       unlisteners.push(
         await listen("roster-updated", async () => {
           const previousPeerIds = new Set(peerDevices.map((device) => device.id));
-          await refreshRoom(true);
+          await refreshRoom();
           await refreshSyncGroups();
           const pairedDevice = peerDevices.find((device) => !previousPeerIds.has(device.id));
           if (pairedDevice) {
@@ -343,7 +344,7 @@
           incomingFileOffer = null;
           clearPairingCode();
           await refreshSyncGroups();
-          await refreshRoom(true);
+          await refreshRoom();
           await refreshRecentClips();
           query = "";
           transfers = {};
@@ -382,7 +383,7 @@
       );
       unlisteners.push(
         await listen("join-approved", async () => {
-          await refreshRoom(true);
+          await refreshRoom();
           await refreshSyncGroups();
           showStatus("ok", "Admin approved this device", 5000);
         })
@@ -1034,6 +1035,19 @@
     await getCurrentWindow().hide();
   }
 
+  function openDevicesView() {
+    if (groupTransitionBusy || !activeSyncGroup) return;
+    settingsOpen = false;
+    activeView = "devices";
+    void refreshPendingJoins();
+    requestAnimationFrame(() => devicesBackButton?.focus());
+  }
+
+  function closeDevicesView() {
+    activeView = "compose";
+    requestAnimationFrame(() => devicesButton?.focus());
+  }
+
   function closeSettingsOnOutsideClick(event: MouseEvent) {
     if (!settingsOpen || !(event.target instanceof Node)) return;
     if (settingsMenu?.contains(event.target) || settingsButton?.contains(event.target)) return;
@@ -1046,9 +1060,8 @@
     void getCurrentWindow().startDragging();
   }
 
-  async function refreshRoom(collapseDevices = false) {
+  async function refreshRoom() {
     try {
-      const wasInRoom = inRoom;
       const rs = await invoke<{
         in_room: boolean;
         member_count: number;
@@ -1059,10 +1072,8 @@
       inRoom = rs.in_room;
       networkName = rs.network_name || "Personal";
       devices = inRoom ? await invoke<DeviceDto[]>("roster_devices") : [];
-      if (!inRoom || collapseDevices || !wasInRoom) devicesExpanded = false;
     } catch {
       devices = [];
-      devicesExpanded = false;
     }
   }
 
@@ -1070,9 +1081,11 @@
     try {
       syncGroups = await invoke<SyncGroupDto[]>("sync_groups");
       syncGroupNameDraft = syncGroups.find((group) => group.active)?.name ?? "";
+      if (syncGroups.length === 0 && activeView === "devices") activeView = "compose";
     } catch {
       syncGroups = [];
       syncGroupNameDraft = "";
+      if (activeView === "devices") activeView = "compose";
     }
   }
 
@@ -1089,7 +1102,7 @@
       incomingFileOffer = null;
       clearPairingCode();
       await refreshSyncGroups();
-      await refreshRoom(true);
+      await refreshRoom();
       await refreshRecentClips();
       query = "";
       transfers = {};
@@ -1187,7 +1200,7 @@
       await invoke("leave_room", { groupId });
       clearPairingCode();
       await refreshSyncGroups();
-      await refreshRoom(true);
+      await refreshRoom();
       await refreshRecentClips();
       query = "";
       transfers = {};
@@ -1213,7 +1226,7 @@
     incomingFileOffer = null;
     clearPairingCode();
     await refreshSyncGroups();
-    await refreshRoom(true);
+    await refreshRoom();
     await refreshPendingJoins();
     await refreshRecentClips();
     query = "";
@@ -1277,7 +1290,7 @@
       }
       newSyncGroupOpen = false;
       await refreshSyncGroups();
-      await refreshRoom(true);
+      await refreshRoom();
       await refreshRecentClips();
       query = "";
       transfers = {};
@@ -1353,7 +1366,7 @@
 
   async function send() {
     const targetGroupId = activeSyncGroup?.id;
-    if (!text.trim() || groupTransitionBusy || !targetGroupId) return;
+    if (!inRoom || !text.trim() || groupTransitionBusy || !targetGroupId) return;
     sending = true;
     clearStatus();
     try {
@@ -1453,7 +1466,7 @@
       const code = await invoke<PairingCodeDto>("create_room", { label: preferredDeviceLabel() });
       inRoom = true;
       await refreshSyncGroups();
-      await refreshRoom(true);
+      await refreshRoom();
       applyPairingCode(code);
     } catch (e) {
       showStatus("err", String(e));
@@ -1519,7 +1532,7 @@
   }
 
   function onKeydown(e: KeyboardEvent) {
-    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+    if (activeView === "compose" && e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       send();
     }
@@ -1550,6 +1563,10 @@
       }
       if (showPairing) {
         closePairingDialog();
+        return;
+      }
+      if (activeView === "devices") {
+        closeDevicesView();
         return;
       }
       void hidePopup();
@@ -1628,7 +1645,7 @@
       <button
         class="icon-btn settings-button"
         bind:this={settingsButton}
-        aria-label={`Settings${pendingJoins.length > 0 ? `, ${pendingJoins.length} device ${pendingJoins.length === 1 ? "request" : "requests"} waiting for approval` : ""}`}
+        aria-label="Settings"
         title="Settings"
         aria-expanded={settingsOpen}
         disabled={groupTransitionBusy}
@@ -1640,9 +1657,6 @@
             d="M19.4 15a1.8 1.8 0 0 0 .36 1.98l.04.04a2.1 2.1 0 0 1-2.98 2.98l-.04-.04A1.8 1.8 0 0 0 14.8 19.6a1.8 1.8 0 0 0-1.08 1.65V21.3a2.1 2.1 0 0 1-4.2 0v-.05A1.8 1.8 0 0 0 8.45 19.6a1.8 1.8 0 0 0-1.98.36l-.04.04a2.1 2.1 0 0 1-2.98-2.98l.04-.04A1.8 1.8 0 0 0 3.85 15a1.8 1.8 0 0 0-1.65-1.08H2.1a2.1 2.1 0 0 1 0-4.2h.1a1.8 1.8 0 0 0 1.65-1.08 1.8 1.8 0 0 0-.36-1.98l-.04-.04a2.1 2.1 0 0 1 2.98-2.98l.04.04a1.8 1.8 0 0 0 1.98.36A1.8 1.8 0 0 0 9.52 2.4V2.1a2.1 2.1 0 0 1 4.2 0v.3a1.8 1.8 0 0 0 1.08 1.65 1.8 1.8 0 0 0 1.98-.36l.04-.04a2.1 2.1 0 0 1 2.98 2.98l-.04.04A1.8 1.8 0 0 0 19.4 8.65a1.8 1.8 0 0 0 1.65 1.08h.25a2.1 2.1 0 0 1 0 4.2h-.25A1.8 1.8 0 0 0 19.4 15Z"
           />
         </svg>
-        {#if pendingJoins.length > 0}
-          <span class="settings-pending-count" aria-hidden="true">{pendingJoins.length}</span>
-        {/if}
       </button>
       <button class="icon-btn close-btn" aria-label="Hide Fwoosh" title="Hide Fwoosh" onclick={hidePopup}>
         <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
@@ -1652,147 +1666,6 @@
       </button>
       {#if settingsOpen}
         <div bind:this={settingsMenu} class="settings-menu" data-tauri-drag-region="false">
-          <div class="settings-section">
-            <div class="settings-title">Current destination</div>
-            <div class="group-picker-row">
-              <select
-                class="settings-select"
-                aria-label="Current send destination"
-                value={activeSyncGroup?.id ?? ""}
-                disabled={groupTransitionBusy || syncGroups.length === 0}
-                onchange={(event) => void switchSyncGroup(event.currentTarget.value)}
-              >
-                {#if syncGroups.length === 0}
-                  <option value="">No groups yet</option>
-                {:else}
-                  {#each syncGroups as group (group.id)}
-                    <option value={group.id}>
-                      {group.name}{group.is_default ? " · Default" : ""}{pendingJoinCount(group.id) > 0
-                        ? ` · ${pendingJoinCount(group.id)} waiting`
-                        : ""} · {group.member_count} {group.member_count === 1 ? "device" : "devices"}
-                    </option>
-                  {/each}
-                {/if}
-              </select>
-              <button
-                class="mini-action group-add"
-                onclick={openNewSyncGroup}
-                disabled={groupTransitionBusy}>New</button
-              >
-            </div>
-            <p class="group-picker-help">
-              This selection is where you send now. The default group is selected when Fwoosh starts.
-            </p>
-            {#if activeSyncGroup}
-              <div class="settings-row">
-                <input
-                  id="sync-group-name"
-                  name="sync-group-name"
-                  class="settings-input"
-                  maxlength="48"
-                  autocomplete="off"
-                  aria-label="Sync group name"
-                  bind:value={syncGroupNameDraft}
-                  onkeydown={(event) => {
-                    event.stopPropagation();
-                    if (event.key === "Enter") void saveSyncGroupName();
-                  }}
-                />
-                <button
-                  class="mini-action"
-                  onclick={saveSyncGroupName}
-                  disabled={groupTransitionBusy || !syncGroupNameDraft.trim()}
-                >
-                  {savingSyncGroupName ? "Saving…" : "Rename"}
-                </button>
-              </div>
-              <div class="group-default-setting" class:is-default={activeSyncGroup.is_default}>
-                <div>
-                  <strong>{activeSyncGroup.is_default ? "Default group" : "Startup group"}</strong>
-                  <span>
-                    {activeSyncGroup.is_default
-                      ? "Fwoosh selects this destination when it starts."
-                      : !activeSyncGroup.connected
-                        ? "Finish joining this group before using it as your startup group."
-                        : "Changing the current destination does not change your startup group."}
-                  </span>
-                </div>
-                {#if activeSyncGroup.is_default}
-                  <span class="default-state" aria-label="This is the default group">Default</span>
-                {:else}
-                  <button
-                    class="group-default-action"
-                    onclick={setActiveSyncGroupAsDefault}
-                    disabled={groupTransitionBusy || !activeSyncGroup.connected}
-                  >
-                    {settingDefaultGroup
-                      ? "Saving…"
-                      : activeSyncGroup.connected
-                        ? "Make default"
-                        : "Waiting for approval"}
-                  </button>
-                {/if}
-              </div>
-              {#if isGroupAdmin}
-                <div class="group-invitation-setting">
-                  <div>
-                    <strong>Reusable invitation</strong>
-                    <span>Stop new pairing requests without removing devices already in this group.</span>
-                  </div>
-                  <button
-                    class="group-invitation-revoke"
-                    onclick={revokeReusableInvitation}
-                    disabled={groupTransitionBusy}
-                  >
-                    {revokingReusableInvitation ? "Revoking…" : "Revoke"}
-                  </button>
-                </div>
-              {/if}
-              {#if isGroupAdmin && otherGroupDeviceCount > 0}
-                <p class="group-remove-guidance" role="note">
-                  Remove the other {otherGroupDeviceCount === 1 ? "device" : `${otherGroupDeviceCount} devices`} first. This prevents them from being left in a group with no admin.
-                </p>
-              {/if}
-              <button
-                class="group-remove"
-                onclick={removeActiveSyncGroup}
-                disabled={groupTransitionBusy || (isGroupAdmin && otherGroupDeviceCount > 0)}
-                title={isGroupAdmin && otherGroupDeviceCount > 0
-                  ? "Remove the other devices first"
-                  : undefined}
-              >
-                {removingSyncGroup
-                  ? "Removing…"
-                  : isGroupAdmin
-                    ? "Delete group from this device"
-                    : "Leave group on this device"}
-              </button>
-            {/if}
-          </div>
-          <div class="settings-section">
-            <label class="settings-title" for="device-name">Device name</label>
-            <div class="settings-row">
-              <input
-                id="device-name"
-                name="device-name"
-                class="settings-input"
-                maxlength="48"
-                autocomplete="off"
-                bind:value={deviceLabelDraft}
-                onkeydown={(e) => {
-                  e.stopPropagation();
-                  if (e.key === "Enter") void saveDeviceLabel();
-                }}
-              />
-              <button
-                class="mini-action"
-                onclick={saveDeviceLabel}
-                disabled={savingDeviceLabel || !deviceLabelDraft.trim()}
-              >
-                {savingDeviceLabel ? "..." : "Save"}
-              </button>
-            </div>
-          </div>
           <div class="settings-section">
             <div class="settings-title">Color scheme</div>
             <div class="scheme-toggle" role="radiogroup" aria-label="Color scheme">
@@ -1847,7 +1720,7 @@
               onkeydown={(e) => e.stopPropagation()}
             />
             <button class="mini-action full" onclick={saveNetworkSettings} disabled={savingNetwork}>
-              {savingNetwork ? "Saving..." : "Save group settings"}
+              {savingNetwork ? "Saving..." : "Save connection settings"}
             </button>
           </div>
         </div>
@@ -1856,60 +1729,51 @@
   </header>
 
   {#if activeView === "compose"}
-    <div class="compose" class:devices-open={inRoom && devicesExpanded}>
-      <textarea
-        id="clip-text"
-        name="clip-text"
-        bind:value={text}
-        aria-label="Message to send"
-        placeholder="Paste or type a message, or drag and drop a file to securely transfer it."
-        class="box"
-        autocomplete="off"
-        data-tauri-drag-region="false"></textarea>
+    <div class="compose" class:onboarding={!activeSyncGroup}>
+      {#if activeSyncGroup}
+        <textarea
+          id="clip-text"
+          name="clip-text"
+          bind:value={text}
+          aria-label="Message to send"
+          placeholder="Paste or type a message, or drag and drop a file to securely transfer it."
+          class="box"
+          autocomplete="off"
+          data-tauri-drag-region="false"></textarea>
 
-      <div class="compose-controls">
-        {#if inRoom}
-          <span class="network-target" title="Current send destination">
-            To: <strong>{networkName}</strong>
+        <div class="compose-controls">
+          <button
+            class="network-target"
+            bind:this={devicesButton}
+            aria-label={`Manage ${activeSyncGroup.name}${pendingJoins.length > 0 ? `, ${pendingJoins.length} device ${pendingJoins.length === 1 ? "request" : "requests"} waiting for approval` : ""}`}
+            title="Manage groups and devices"
+            disabled={groupTransitionBusy}
+            onclick={openDevicesView}
+          >
+            <span class="network-target-prefix">To:</span>
+            <strong>{activeSyncGroup.name}</strong>
             {#if activeSyncGroup?.is_default}
               <span class="target-default-badge">Default</span>
             {/if}
-          </span>
-          <div class="devices-panel" class:expanded={devicesExpanded}>
-            <div class="devices-compact">
-              <button
-                class="device-toggle"
-                aria-label={`${devicesExpanded ? "Collapse" : "Expand"} devices${activeGroupPendingJoins.length > 0 ? `, ${activeGroupPendingJoins.length} waiting for approval` : ""}`}
-                aria-expanded={devicesExpanded}
-                title={devicesExpanded ? "Collapse devices" : "Expand devices"}
-                onclick={() => (devicesExpanded = !devicesExpanded)}
-              >
-                <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
-                  {#if devicesExpanded}
-                    <path d="M5 12h14" />
-                  {:else}
-                    <path d="M12 5v14" />
-                    <path d="M5 12h14" />
-                  {/if}
-                </svg>
-                <span>Devices</span>
-                {#if activeGroupPendingJoins.length > 0}
-                  <span class="pending-count" aria-hidden="true">{activeGroupPendingJoins.length}</span>
-                {/if}
-              </button>
-            </div>
-          </div>
-        {:else}
-          <span class="compose-control-spacer" aria-hidden="true"></span>
-        {/if}
-        <button
-          class="send-btn"
-          onclick={send}
-          disabled={groupTransitionBusy || !activeSyncGroup || !text.trim()}
-        >
-          {sending ? "Sending..." : "Send"}
-        </button>
-      </div>
+            {#if !activeSyncGroup.connected}
+              <span class="target-waiting-badge">Waiting</span>
+            {/if}
+            {#if pendingJoins.length > 0}
+              <span class="pending-count" aria-hidden="true">{pendingJoins.length}</span>
+            {/if}
+            <svg class="network-target-chevron" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="m9 6 6 6-6 6" />
+            </svg>
+          </button>
+          <button
+            class="send-btn"
+            onclick={send}
+            disabled={groupTransitionBusy || !inRoom || !text.trim()}
+          >
+            {sending ? "Sending..." : "Send"}
+          </button>
+        </div>
+      {/if}
 
       {#if status !== "idle"}
         <div
@@ -1924,34 +1788,153 @@
       {/if}
 
       {#if !inRoom}
-        <div class="room-empty">
-          <p class="muted">Not connected to a group yet.</p>
+        <div class="room-empty" class:initial-setup={!activeSyncGroup}>
+          {#if !activeSyncGroup}
+            <div class="onboarding-intro">
+              <svg class="onboarding-network" viewBox="0 0 220 88" aria-hidden="true">
+                <path class="onboarding-link" d="M51 56C69 56 77 29 96 29" />
+                <path class="onboarding-link" d="M124 29c19 0 27 27 45 27" />
+                <path class="onboarding-link onboarding-link-low" d="M55 62c31 20 79 20 110 0" />
+                <circle class="onboarding-signal" cx="110" cy="29" r="12" />
+                <g class="onboarding-node" transform="translate(24 42)">
+                  <rect width="34" height="26" rx="7" />
+                  <path d="M11 31h12M17 26v5" />
+                </g>
+                <g class="onboarding-node onboarding-node-primary" transform="translate(93 14)">
+                  <rect width="34" height="26" rx="7" />
+                  <path d="M11 31h12M17 26v5" />
+                </g>
+                <g class="onboarding-node" transform="translate(162 42)">
+                  <rect width="34" height="26" rx="7" />
+                  <path d="M11 31h12M17 26v5" />
+                </g>
+              </svg>
+              <span class="onboarding-eyebrow">FIRST CONNECTION</span>
+              <h2>Bring your devices together</h2>
+              <p>Create a private group for your own devices, or join one with an invitation.</p>
+            </div>
+          {:else}
+            <p class="muted">Not connected to a group yet.</p>
+          {/if}
           <div class="room-actions">
-            <button class="ghost" onclick={createRoom}>Create a group</button>
+            <button
+              class="ghost"
+              class:onboarding-create={!activeSyncGroup}
+              onclick={createRoom}>Create a group</button
+            >
           </div>
-          <div class="divider"><span>or</span></div>
-          <input
-            id="pairing-code"
-            name="pairing-code"
-            class="join-input"
-            aria-label="Pairing code"
-            placeholder="Paste a pairing code..."
-            bind:value={joinUri}
-            autocomplete="off"
-            spellcheck="false"
-            onkeydown={(e) => e.key === "Enter" && joinRoom()} />
-          <button class="ghost" onclick={joinRoom} disabled={!joinUri.trim()}>Request to join</button>
+          <div class="divider">
+            <span>{activeSyncGroup ? "or" : "or join with an invitation"}</span>
+          </div>
+          <div class="onboarding-join-row" class:initial={!activeSyncGroup}>
+            <input
+              id="pairing-code"
+              name="pairing-code"
+              class="join-input"
+              aria-label="Pairing code"
+              placeholder="Paste a pairing code..."
+              bind:value={joinUri}
+              autocomplete="off"
+              spellcheck="false"
+              onkeydown={(e) => e.key === "Enter" && joinRoom()} />
+            <button class="ghost" onclick={joinRoom} disabled={!joinUri.trim()}>Request to join</button>
+          </div>
         </div>
-      {:else}
-        {#if devicesExpanded}
-          <div class="roster">
-            {#if isGroupAdmin}
-              <button
-                class="pair-btn"
-                onclick={openPairingCreator}
-                disabled={groupTransitionBusy}>Add a device</button
-              >
+      {/if}
+    </div>
+  {:else if activeView === "devices"}
+    <main class="devices-view" aria-labelledby="devices-view-title">
+      <div class="devices-view-scroll">
+        <div class="devices-view-heading">
+          <button
+            class="devices-back"
+            bind:this={devicesBackButton}
+            aria-label="Back to Send"
+            title="Back to Send"
+            onclick={closeDevicesView}
+          >
+            <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="m15 18-6-6 6-6" />
+            </svg>
+          </button>
+          <div class="devices-heading-copy">
+            <span class="devices-eyebrow">MANAGE CONNECTIONS</span>
+            <h2 id="devices-view-title">Devices</h2>
+            <p>Choose a group, approve requests, and manage who is connected.</p>
+          </div>
+        </div>
+
+        {#if status !== "idle"}
+          <div
+            class="status"
+            class:ok={status === "ok"}
+            class:err={status === "err"}
+            role="status"
+            aria-live="polite"
+          >
+            {statusMsg}
+          </div>
+        {/if}
+
+        <section class="devices-section devices-group-section" aria-labelledby="devices-group-title">
+          <div class="devices-section-heading">
+            <div>
+              <h3 id="devices-group-title">Current group</h3>
+              <p>This is also the destination used by Send.</p>
+            </div>
+            <button
+              class="mini-action group-add"
+              onclick={openNewSyncGroup}
+              disabled={groupTransitionBusy}>New group</button
+            >
+          </div>
+          <select
+            class="settings-select devices-group-select"
+            aria-label="Current send destination"
+            value={activeSyncGroup?.id ?? ""}
+            disabled={groupTransitionBusy || syncGroups.length === 0}
+            onchange={(event) => void switchSyncGroup(event.currentTarget.value)}
+          >
+            {#if syncGroups.length === 0}
+              <option value="">No groups yet</option>
+            {:else}
+              {#each syncGroups as group (group.id)}
+                <option value={group.id}>
+                  {group.name}{group.is_default ? " · Default" : ""}{pendingJoinCount(group.id) > 0
+                    ? ` · ${pendingJoinCount(group.id)} waiting`
+                    : ""} · {group.member_count} {group.member_count === 1 ? "device" : "devices"}
+                </option>
+              {/each}
             {/if}
+          </select>
+        </section>
+
+        {#if activeSyncGroup}
+          <section class="devices-section" aria-labelledby="group-devices-title">
+            <div class="devices-section-heading devices-member-heading">
+              <div>
+                <h3 id="group-devices-title">In {activeSyncGroup.name}</h3>
+                <p>
+                  {activeSyncGroup.connected
+                    ? `${activeSyncGroup.member_count} ${activeSyncGroup.member_count === 1 ? "device" : "devices"} connected`
+                    : "Waiting for this device to be approved"}
+                </p>
+              </div>
+              {#if isGroupAdmin && activeSyncGroup.connected}
+                <button
+                  class="devices-add-action"
+                  onclick={openPairingCreator}
+                  disabled={groupTransitionBusy}
+                >
+                  <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
+                    <path d="M12 5v14" />
+                    <path d="M5 12h14" />
+                  </svg>
+                  Add device
+                </button>
+              {/if}
+            </div>
+
             {#if activeGroupPendingJoins.length > 0}
               <div class="pending-joins">
                 <span class="recipient-section-title">WAITING FOR APPROVAL</span>
@@ -1959,45 +1942,194 @@
                   <div class="pending-join-row">
                     <div class="device-main">
                       <span class="device-label">{request.label}</span>
-                      <span class="device-meta">key {request.fingerprint}</span>
+                      <span class="device-meta">
+                        Key {request.fingerprint} · requested {timeAgo(request.received_at)} ago
+                      </span>
                     </div>
                     <div class="pending-join-actions">
                       <button
                         class="ghost"
                         disabled={groupTransitionBusy}
-                        onclick={() => rejectJoin(request)}>{resolvingJoinId === request.request_id && resolvingJoinAction === "reject" ? "Rejecting…" : "Reject"}</button
-                      >
+                        onclick={() => rejectJoin(request)}
+                      >{resolvingJoinId === request.request_id && resolvingJoinAction === "reject" ? "Rejecting…" : "Reject"}</button>
                       <button
                         class="send-btn"
                         disabled={groupTransitionBusy}
-                        onclick={() => approveJoin(request)}>{resolvingJoinId === request.request_id && resolvingJoinAction === "approve" ? "Adding…" : "Add device"}</button
-                      >
+                        onclick={() => approveJoin(request)}
+                      >{resolvingJoinId === request.request_id && resolvingJoinAction === "approve" ? "Adding…" : "Approve"}</button>
                     </div>
                   </div>
                 {/each}
               </div>
             {/if}
-            {#each devices as d (d.id)}
-              <div class="device-row">
-                <div class="device-main">
-                  <span class="device-label">{d.label}</span>
-                  <span class="device-meta">
-                    {d.is_self ? "this device" : d.id.slice(0, 8)}{d.is_admin ? " - admin" : ""}
-                  </span>
-                </div>
-                {#if d.can_revoke}
-                  <button
-                    class="revoke-btn"
-                    onclick={() => revokeDevice(d.id)}
-                    disabled={groupTransitionBusy}
-                  >{removingDeviceId === d.id ? "Removing…" : "Remove device"}</button>
-                {/if}
+
+            {#if inRoom && devices.length > 0}
+              <div class="device-management-list">
+                {#each devices as d (d.id)}
+                  <div class="device-row">
+                    <span class="device-avatar" aria-hidden="true">
+                      <svg class="icon-svg" viewBox="0 0 24 24">
+                        <rect x="4" y="5" width="16" height="11" rx="2" />
+                        <path d="M9 20h6" />
+                        <path d="M12 16v4" />
+                      </svg>
+                    </span>
+                    <div class="device-main">
+                      <span class="device-label">{d.label}</span>
+                      <span class="device-meta">{d.is_self ? "This device" : `Key ${d.id.slice(0, 8)}`}</span>
+                    </div>
+                    <div class="device-row-actions">
+                      {#if d.is_admin}
+                        <span class="device-role">Admin</span>
+                      {/if}
+                      {#if d.can_revoke}
+                        <button
+                          class="revoke-btn"
+                          onclick={() => revokeDevice(d.id)}
+                          disabled={groupTransitionBusy}
+                        >{removingDeviceId === d.id ? "Removing…" : "Remove"}</button>
+                      {/if}
+                    </div>
+                  </div>
+                {/each}
               </div>
-            {/each}
-          </div>
+            {:else if activeSyncGroup.connected}
+              <div class="devices-empty-state">Refreshing the devices in this group…</div>
+            {:else}
+              <div class="devices-empty-state">
+                Once the group admin approves this device, the connected devices will appear here.
+              </div>
+            {/if}
+          </section>
+
+          <section class="devices-section" aria-labelledby="this-device-title">
+            <div class="devices-section-heading">
+              <div>
+                <h3 id="this-device-title">This device</h3>
+                <p>The name other people see in pairing requests and device lists.</p>
+              </div>
+            </div>
+            <div class="settings-row">
+              <input
+                id="device-name"
+                name="device-name"
+                class="settings-input"
+                maxlength="48"
+                autocomplete="off"
+                aria-label="Device name"
+                bind:value={deviceLabelDraft}
+                onkeydown={(event) => {
+                  event.stopPropagation();
+                  if (event.key === "Enter") void saveDeviceLabel();
+                }}
+              />
+              <button
+                class="mini-action"
+                onclick={saveDeviceLabel}
+                disabled={savingDeviceLabel || !deviceLabelDraft.trim()}
+              >
+                {savingDeviceLabel ? "Saving…" : "Save"}
+              </button>
+            </div>
+          </section>
+
+          <section class="devices-section devices-group-management" aria-labelledby="group-details-title">
+            <div class="devices-section-heading">
+              <div>
+                <h3 id="group-details-title">Group details</h3>
+                <p>Rename this group, choose its startup behavior, or disconnect it.</p>
+              </div>
+            </div>
+            <label class="settings-title" for="sync-group-name">Group name</label>
+            <div class="settings-row">
+              <input
+                id="sync-group-name"
+                name="sync-group-name"
+                class="settings-input"
+                maxlength="48"
+                autocomplete="off"
+                bind:value={syncGroupNameDraft}
+                onkeydown={(event) => {
+                  event.stopPropagation();
+                  if (event.key === "Enter") void saveSyncGroupName();
+                }}
+              />
+              <button
+                class="mini-action"
+                onclick={saveSyncGroupName}
+                disabled={groupTransitionBusy || !syncGroupNameDraft.trim()}
+              >
+                {savingSyncGroupName ? "Saving…" : "Rename"}
+              </button>
+            </div>
+
+            <div class="group-default-setting" class:is-default={activeSyncGroup.is_default}>
+              <div>
+                <strong>{activeSyncGroup.is_default ? "Default group" : "Startup group"}</strong>
+                <span>
+                  {activeSyncGroup.is_default
+                    ? "Fwoosh selects this destination when it starts."
+                    : !activeSyncGroup.connected
+                      ? "Finish joining this group before using it as your startup group."
+                      : "Changing the current destination does not change your startup group."}
+                </span>
+              </div>
+              {#if activeSyncGroup.is_default}
+                <span class="default-state" aria-label="This is the default group">Default</span>
+              {:else}
+                <button
+                  class="group-default-action"
+                  onclick={setActiveSyncGroupAsDefault}
+                  disabled={groupTransitionBusy || !activeSyncGroup.connected}
+                >
+                  {settingDefaultGroup
+                    ? "Saving…"
+                    : activeSyncGroup.connected
+                      ? "Make default"
+                      : "Waiting for approval"}
+                </button>
+              {/if}
+            </div>
+
+            {#if isGroupAdmin}
+              <div class="group-invitation-setting">
+                <div>
+                  <strong>Reusable invitation</strong>
+                  <span>Invalidate the current code. Existing devices stay connected; create a new invitation to add more.</span>
+                </div>
+                <button
+                  class="group-invitation-revoke"
+                  onclick={revokeReusableInvitation}
+                  disabled={groupTransitionBusy}
+                >
+                  {revokingReusableInvitation ? "Revoking…" : "Revoke code"}
+                </button>
+              </div>
+            {/if}
+
+            {#if isGroupAdmin && otherGroupDeviceCount > 0}
+              <p class="group-remove-guidance" role="note">
+                Remove the other {otherGroupDeviceCount === 1 ? "device" : `${otherGroupDeviceCount} devices`} first. This prevents them from being left in a group with no admin.
+              </p>
+            {/if}
+            <button
+              class="group-remove"
+              onclick={removeActiveSyncGroup}
+              disabled={groupTransitionBusy || (isGroupAdmin && otherGroupDeviceCount > 0)}
+              title={isGroupAdmin && otherGroupDeviceCount > 0
+                ? "Remove the other devices first"
+                : undefined}
+            >
+              {removingSyncGroup
+                ? "Removing…"
+                : isGroupAdmin
+                  ? "Delete group from this device"
+                  : "Leave group on this device"}
+            </button>
+          </section>
         {/if}
-      {/if}
-    </div>
+      </div>
+    </main>
   {:else if activeView === "files"}
     <div class="files">
       <div class="files-toolbar">
@@ -2708,29 +2840,6 @@
   {/if}
 
   <div class="utility-footer" data-tauri-drag-region="false">
-    {#if activeSyncGroup}
-      <button
-        class="group-chip"
-        aria-label={`Current destination: ${activeSyncGroup.name}${activeSyncGroup.is_default ? ", default group" : ""}${activeGroupPendingJoins.length > 0 ? `, ${activeGroupPendingJoins.length} waiting for approval` : ""}`}
-        title="Switch destination group"
-        disabled={groupTransitionBusy}
-        onclick={(event) => {
-          event.stopPropagation();
-          settingsOpen = true;
-        }}
-      >
-        <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
-          <circle cx="8" cy="9" r="3" />
-          <circle cx="17" cy="8" r="2.5" />
-          <path d="M3.5 19c.7-3.2 2.2-4.8 4.5-4.8s3.8 1.6 4.5 4.8" />
-          <path d="M14 13.2c2.8-.4 4.8 1.3 5.5 4.2" />
-        </svg>
-        <span class="group-chip-name">{activeSyncGroup.name}</span>
-        {#if activeGroupPendingJoins.length > 0}
-          <span class="pending-count" aria-hidden="true">{activeGroupPendingJoins.length}</span>
-        {/if}
-      </button>
-    {/if}
     {#if activeView === "compose" && inRoom}
       <div class="footer-tools" data-tauri-drag-region="false">
         <button
@@ -3011,46 +3120,6 @@
   .tab.active {
     background: #2a2a32;
     color: #e4e4e7;
-  }
-  .devices-panel {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 8px;
-  }
-  .devices-panel.expanded {
-    align-items: stretch;
-  }
-  .devices-compact {
-    display: flex;
-    align-items: center;
-    gap: 7px;
-  }
-  .device-toggle {
-    min-width: 28px;
-    height: 28px;
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    background: #23232b;
-    border: 1px solid #343440;
-    color: #d4d4d8;
-    border-radius: 7px;
-    cursor: pointer;
-    padding: 0 9px;
-    font-size: 12px;
-    font-weight: 600;
-  }
-  .device-toggle:hover,
-  .device-toggle:focus-visible {
-    background: #2a2a32;
-    border-color: #4b4b58;
-    outline: none;
-  }
-  .roster {
-    border: 1px solid #2a2a32;
-    border-radius: 8px;
-    overflow: hidden;
   }
   .pair-btn {
     width: 100%;
@@ -4192,9 +4261,6 @@
   :global(html[data-theme="light"]) .device-row {
     border-color: #dce6f1;
   }
-  :global(html[data-theme="light"]) .roster {
-    border-color: #c9d6e6;
-  }
   :global(html[data-theme="light"]) .transfer-track {
     background: #d8e2ef;
   }
@@ -4227,16 +4293,6 @@
   }
   :global(html[data-theme="light"]) .revoke-btn:hover {
     border-color: #b42318;
-  }
-  :global(html[data-theme="light"]) .device-toggle {
-    background: #edf4fb;
-    border-color: #c6d3e3;
-    color: #102033;
-  }
-  :global(html[data-theme="light"]) .device-toggle:hover,
-  :global(html[data-theme="light"]) .device-toggle:focus-visible {
-    background: #e2edf8;
-    border-color: #9fb7d1;
   }
   :global(html[data-theme="light"]) .danger-icon-btn {
     border-color: #d7b9b8;
@@ -4676,7 +4732,6 @@
   :global(html[data-theme="onyx"]) .mini-action,
   :global(html[data-theme="onyx"]) .ghost,
   :global(html[data-theme="onyx"]) .send-btn,
-  :global(html[data-theme="onyx"]) .device-toggle,
   :global(html[data-theme="onyx"]) .pair-btn,
   :global(html[data-theme="onyx"]) .icon-btn,
   :global(html[data-theme="onyx"]) .tab.active,
@@ -4699,8 +4754,6 @@
   :global(html[data-theme="onyx"]) .mini-action:hover:not(:disabled),
   :global(html[data-theme="onyx"]) .ghost:hover,
   :global(html[data-theme="onyx"]) .send-btn:hover:not(:disabled),
-  :global(html[data-theme="onyx"]) .device-toggle:hover,
-  :global(html[data-theme="onyx"]) .device-toggle:focus-visible,
   :global(html[data-theme="onyx"]) .pair-btn:hover,
   :global(html[data-theme="onyx"]) .icon-btn:hover,
   :global(html[data-theme="onyx"]) .icon-btn:focus-visible,
@@ -4759,8 +4812,6 @@
   }
   :global(html[data-theme="melanzana"]) .mini-action:hover:not(:disabled),
   :global(html[data-theme="melanzana"]) .ghost:hover,
-  :global(html[data-theme="melanzana"]) .device-toggle:hover,
-  :global(html[data-theme="melanzana"]) .device-toggle:focus-visible,
   :global(html[data-theme="melanzana"]) .pair-btn:hover,
   :global(html[data-theme="melanzana"]) .icon-btn:hover,
   :global(html[data-theme="melanzana"]) .icon-btn:focus-visible,
@@ -4849,64 +4900,6 @@
     font-size: 14px;
   }
 
-  .devices-panel {
-    gap: 10px;
-  }
-  .device-toggle {
-    height: 48px;
-    min-width: 126px;
-    padding: 0 20px;
-    gap: 9px;
-    border: 1px solid rgba(199, 255, 0, 0.48);
-    border-radius: 999px;
-    background: rgba(199, 255, 0, 0.1);
-    color: var(--accent);
-    font-size: 17px;
-    font-weight: 900;
-  }
-  .device-toggle .icon-svg {
-    width: 18px;
-    height: 18px;
-    stroke-width: 3;
-  }
-  .device-toggle:hover,
-  .device-toggle:focus-visible {
-    background: rgba(199, 255, 0, 0.16);
-    border-color: var(--accent);
-    color: var(--accent);
-  }
-  :global(html[data-theme="light"]) .device-toggle {
-    border-color: rgba(11, 95, 211, 0.32);
-    background: rgba(11, 95, 211, 0.08);
-    color: var(--accent);
-  }
-  :global(html[data-theme="onyx"]) .device-toggle {
-    border-color: rgba(255, 255, 255, 0.32);
-    color: #ffffff;
-  }
-  :global(html[data-theme="onyx"]) .device-toggle:hover,
-  :global(html[data-theme="onyx"]) .device-toggle:focus-visible {
-    border-color: rgba(255, 255, 255, 0.56);
-    color: #ffffff;
-  }
-  :global(html[data-theme="melanzana"]) .device-toggle {
-    border-color: rgba(255, 155, 216, 0.38);
-    background: rgba(255, 155, 216, 0.08);
-    color: var(--accent);
-  }
-  :global(html[data-theme="melanzana"]) .device-toggle:hover,
-  :global(html[data-theme="melanzana"]) .device-toggle:focus-visible {
-    border-color: rgba(255, 178, 230, 0.62);
-    color: var(--text-strong);
-  }
-  .roster {
-    display: flex;
-    flex-direction: column;
-    gap: 9px;
-    border: none;
-    border-radius: 0;
-    overflow: visible;
-  }
   .pair-btn,
   .device-row,
   .transfer-item,
@@ -5194,7 +5187,6 @@
   }
   .tab,
   .send-btn,
-  .device-toggle,
   .pair-btn,
   .mini-action,
   .ghost,
@@ -5282,9 +5274,6 @@
     padding: 14px 18px calc(12px + var(--footer-safe));
     gap: 8px;
   }
-  .compose.devices-open {
-    gap: 7px;
-  }
   .box {
     flex: 1 1 112px;
     min-height: 104px;
@@ -5293,20 +5282,10 @@
     font-size: 15px;
     line-height: 1.42;
   }
-  .compose.devices-open .box {
-    flex: 0 1 84px;
-    min-height: 84px;
-    padding-block: 12px;
-  }
   .compose-controls {
     justify-content: space-between;
     min-height: 40px;
     gap: 12px;
-  }
-  .compose-control-spacer {
-    flex: 1;
-    min-width: 1px;
-    height: 1px;
   }
   .send-btn {
     min-width: 96px;
@@ -5322,50 +5301,6 @@
     font-size: 13px;
   }
 
-  .devices-panel {
-    margin: 0;
-    align-self: center;
-  }
-  .devices-compact {
-    display: flex;
-  }
-  .device-toggle {
-    height: 40px;
-    min-width: 108px;
-    padding: 0 16px;
-    gap: 7px;
-    font-size: 14px;
-  }
-  .device-toggle .icon-svg {
-    width: 16px;
-    height: 16px;
-    stroke-width: 2.5;
-  }
-  .roster {
-    max-height: 122px;
-    overflow-y: auto;
-    gap: 0;
-    padding: 2px 4px 2px 0;
-    border-top: 1px solid var(--line-soft);
-    border-bottom: 1px solid var(--line-soft);
-    scrollbar-width: thin;
-    scrollbar-color: var(--line-strong) transparent;
-  }
-  .compose.devices-open .roster {
-    max-height: 178px;
-  }
-  .roster::-webkit-scrollbar {
-    width: 8px;
-  }
-  .roster::-webkit-scrollbar-track {
-    background: transparent;
-  }
-  .roster::-webkit-scrollbar-thumb {
-    background: var(--line-strong);
-    border: 2px solid transparent;
-    border-radius: 999px;
-    background-clip: padding-box;
-  }
   .pair-btn {
     width: auto;
     align-self: flex-start;
@@ -5725,43 +5660,6 @@
     bottom: auto;
     margin-left: auto;
   }
-  .group-chip {
-    min-width: 0;
-    max-width: 126px;
-    height: 24px;
-    margin-right: 6px;
-    padding: 0 8px 0 6px;
-    display: inline-flex;
-    align-items: center;
-    gap: 5px;
-    border: 1px solid var(--line-soft);
-    border-radius: 999px;
-    background: var(--field);
-    color: var(--muted);
-    pointer-events: auto;
-    cursor: pointer;
-  }
-  .group-chip:hover,
-  .group-chip:focus-visible {
-    border-color: var(--line-strong);
-    color: var(--accent);
-    outline: none;
-    box-shadow: 0 0 0 2px var(--focus);
-  }
-  .group-chip .icon-svg {
-    width: 13px;
-    height: 13px;
-    flex: 0 0 13px;
-    stroke-width: 1.8;
-  }
-  .group-chip-name {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: 12px;
-    font-weight: 800;
-  }
   .pending-count {
     display: inline-grid;
     place-items: center;
@@ -5771,7 +5669,7 @@
     flex: 0 0 auto;
     border-radius: 999px;
     background: var(--accent);
-    color: var(--accent-text);
+    color: var(--shell-bg);
     font-size: 10px;
     font-weight: 900;
     line-height: 1;
@@ -5779,38 +5677,15 @@
   .settings-button {
     position: relative;
   }
-  .settings-button:disabled,
-  .group-chip:disabled {
+  .settings-button:disabled {
     opacity: 0.55;
     cursor: default;
     transform: none;
-  }
-  .settings-pending-count {
-    position: absolute;
-    top: -5px;
-    right: -5px;
-    display: grid;
-    place-items: center;
-    min-width: 17px;
-    height: 17px;
-    padding: 0 4px;
-    border: 2px solid var(--panel);
-    border-radius: 999px;
-    background: var(--accent);
-    color: var(--accent-text);
-    font-size: 9px;
-    font-weight: 900;
-    line-height: 1;
   }
   .settings-menu {
     max-height: calc(100vh - 76px);
     overflow-y: auto;
     overscroll-behavior: contain;
-  }
-  .group-picker-row {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    gap: 6px;
   }
   .settings-select {
     min-width: 0;
@@ -5908,12 +5783,6 @@
     word-break: break-all;
   }
 
-  .group-picker-help {
-    margin: -2px 2px 1px;
-    color: var(--muted);
-    font-size: 11px;
-    line-height: 1.35;
-  }
   .group-default-setting {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
@@ -5998,9 +5867,39 @@
   }
 
   .network-target {
+    min-width: 0;
+    max-width: calc(100% - 112px);
+    height: 40px;
+    padding: 0 7px 0 1px;
     display: inline-flex;
     align-items: center;
-    gap: 4px;
+    gap: 5px;
+    border: 0;
+    border-radius: 10px;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    transition:
+      color 180ms cubic-bezier(0.32, 0.72, 0, 1),
+      background 180ms cubic-bezier(0.32, 0.72, 0, 1);
+  }
+  .network-target:hover:not(:disabled),
+  .network-target:focus-visible {
+    background: var(--field-strong);
+    color: var(--text);
+    outline: none;
+  }
+  .network-target:focus-visible {
+    box-shadow: 0 0 0 2px var(--focus);
+  }
+  .network-target:disabled {
+    opacity: 0.58;
+    cursor: default;
+  }
+  .network-target-prefix {
+    flex: 0 0 auto;
   }
   .network-target strong {
     min-width: 0;
@@ -6008,6 +5907,33 @@
     color: var(--text-strong);
     font-weight: 800;
     text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .network-target-chevron {
+    width: 13px;
+    height: 13px;
+    flex: 0 0 13px;
+    fill: none;
+    stroke: var(--muted-soft);
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    stroke-width: 2;
+  }
+  .network-target:hover:not(:disabled) .network-target-chevron,
+  .network-target:focus-visible .network-target-chevron {
+    stroke: var(--accent);
+  }
+  .target-waiting-badge {
+    flex: 0 0 auto;
+    padding: 2px 6px;
+    border: 1px solid var(--line-soft);
+    border-radius: 999px;
+    color: var(--muted);
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 0.03em;
+    line-height: 1.2;
+    text-transform: uppercase;
   }
   .target-default-badge {
     flex: 0 0 auto;
@@ -6015,6 +5941,270 @@
     font-size: 9px;
     line-height: 1.2;
     text-transform: uppercase;
+  }
+
+  .devices-view {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .devices-view-scroll {
+    height: 100%;
+    padding: 15px 18px calc(20px + var(--footer-safe));
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    box-sizing: border-box;
+    scrollbar-color: var(--line-strong) transparent;
+    scrollbar-width: thin;
+    animation: devices-view-enter 220ms cubic-bezier(0.32, 0.72, 0, 1) both;
+  }
+  .devices-view-scroll::-webkit-scrollbar {
+    width: 8px;
+  }
+  .devices-view-scroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .devices-view-scroll::-webkit-scrollbar-thumb {
+    border: 2px solid transparent;
+    border-radius: 999px;
+    background: var(--line-strong);
+    background-clip: padding-box;
+  }
+  @keyframes devices-view-enter {
+    from {
+      opacity: 0;
+      transform: translateX(8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateX(0);
+    }
+  }
+  .devices-view-heading {
+    display: grid;
+    grid-template-columns: 32px minmax(0, 1fr);
+    align-items: start;
+    gap: 10px;
+    padding-bottom: 13px;
+  }
+  .devices-back {
+    width: 32px;
+    height: 32px;
+    display: grid;
+    place-items: center;
+    margin-top: 1px;
+    padding: 0;
+    border: 1px solid var(--line-soft);
+    border-radius: 11px;
+    background: var(--field);
+    color: var(--muted);
+    cursor: pointer;
+  }
+  .devices-back:hover,
+  .devices-back:focus-visible {
+    border-color: var(--line-strong);
+    color: var(--accent);
+    outline: none;
+    box-shadow: 0 0 0 2px var(--focus);
+  }
+  .devices-back .icon-svg {
+    width: 15px;
+    height: 15px;
+  }
+  .devices-heading-copy {
+    min-width: 0;
+  }
+  .devices-eyebrow {
+    display: block;
+    margin-bottom: 1px;
+    color: var(--accent);
+    font-size: 9px;
+    font-weight: 900;
+    letter-spacing: 0.13em;
+  }
+  .devices-heading-copy h2 {
+    margin: 0;
+    color: var(--text-strong);
+    font-size: 20px;
+    font-weight: 750;
+    letter-spacing: -0.025em;
+    line-height: 1.1;
+  }
+  .devices-heading-copy p {
+    margin: 4px 0 0;
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.35;
+  }
+  .devices-view-scroll > .status {
+    margin: 0 0 8px;
+  }
+  .devices-section {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px 0;
+    border-top: 1px solid var(--line-soft);
+  }
+  .devices-group-section {
+    padding: 11px 12px 12px;
+    border: 1px solid var(--line-soft);
+    border-radius: 16px;
+    background: color-mix(in srgb, var(--field) 78%, transparent);
+  }
+  .devices-section + .devices-section {
+    margin-top: 2px;
+  }
+  .devices-section-heading {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .devices-section-heading > div {
+    min-width: 0;
+  }
+  .devices-section-heading h3 {
+    margin: 0;
+    overflow: hidden;
+    color: var(--text-strong);
+    font-size: 13px;
+    font-weight: 750;
+    line-height: 1.25;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .devices-section-heading p {
+    margin: 2px 0 0;
+    color: var(--muted);
+    font-size: 10.5px;
+    line-height: 1.3;
+  }
+  .devices-group-select {
+    height: 38px;
+    padding-block: 0;
+  }
+  .devices-add-action {
+    min-height: 31px;
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 5px;
+    padding: 0 10px;
+    border: 1px solid var(--line-strong);
+    border-radius: 999px;
+    background: var(--accent);
+    color: var(--shell-bg);
+    font: inherit;
+    font-size: 11px;
+    font-weight: 850;
+    cursor: pointer;
+  }
+  .devices-add-action:hover:not(:disabled),
+  .devices-add-action:focus-visible {
+    background: var(--accent-hover);
+    outline: none;
+    box-shadow: 0 0 0 2px var(--focus);
+  }
+  .devices-add-action:disabled {
+    opacity: 0.55;
+    cursor: default;
+  }
+  .devices-add-action .icon-svg {
+    width: 13px;
+    height: 13px;
+    stroke-width: 2.4;
+  }
+  .device-management-list {
+    overflow: hidden;
+    border: 1px solid var(--line-soft);
+    border-radius: 15px;
+    background: var(--field);
+  }
+  .device-management-list .device-row {
+    display: grid;
+    grid-template-columns: 30px minmax(0, 1fr) auto;
+    gap: 9px;
+    min-height: 48px;
+    padding: 8px 9px;
+    border: 0;
+    border-bottom: 1px solid var(--line-soft);
+    border-radius: 0;
+    box-sizing: border-box;
+  }
+  .device-management-list .device-row:last-child {
+    border-bottom: 0;
+  }
+  .device-avatar {
+    width: 30px;
+    height: 30px;
+    display: grid;
+    place-items: center;
+    border: 1px solid var(--line-soft);
+    border-radius: 10px;
+    background: var(--field-strong);
+    color: var(--accent);
+  }
+  .device-avatar .icon-svg {
+    width: 15px;
+    height: 15px;
+    stroke-width: 1.7;
+  }
+  .device-management-list .device-label {
+    color: var(--text-strong);
+    font-size: 12.5px;
+    font-weight: 700;
+  }
+  .device-row-actions {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+  }
+  .device-role {
+    padding: 2px 6px;
+    border: 1px solid var(--line-soft);
+    border-radius: 999px;
+    background: var(--mint-panel);
+    color: var(--mint);
+    font-size: 9px;
+    font-weight: 850;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+  }
+  .device-management-list .revoke-btn {
+    padding: 4px 6px;
+    border: 0;
+    color: var(--danger);
+    font-size: 11px;
+    font-weight: 650;
+  }
+  .device-management-list .revoke-btn:hover,
+  .device-management-list .revoke-btn:focus-visible {
+    background: var(--danger-panel);
+    outline: none;
+  }
+  .devices-empty-state {
+    padding: 12px;
+    border: 1px dashed var(--line-strong);
+    border-radius: 13px;
+    background: var(--field);
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.4;
+  }
+  .devices-group-management {
+    gap: 9px;
+    padding-bottom: 8px;
+  }
+  .devices-view .pending-joins {
+    margin: 0;
+  }
+  .devices-view .pending-join-row {
+    align-items: flex-start;
+  }
+  .devices-view .pending-join-actions {
+    align-self: center;
   }
 
   .pairing-approval-region {
@@ -6292,6 +6482,168 @@
     outline: none;
   }
 
+  .compose.onboarding {
+    position: relative;
+  }
+  .room-empty.initial-setup {
+    position: relative;
+    width: 100%;
+    max-width: 374px;
+    margin: auto;
+    padding: 15px 17px 17px;
+    overflow: hidden;
+    border: 1px solid var(--line-soft);
+    border-radius: 24px;
+    background:
+      linear-gradient(160deg, color-mix(in srgb, var(--panel-raised) 78%, transparent), transparent 66%),
+      var(--field);
+    box-shadow:
+      inset 0 1px 0 color-mix(in srgb, var(--text-strong) 8%, transparent),
+      0 18px 42px rgba(0, 0, 0, 0.16);
+    text-align: left;
+    box-sizing: border-box;
+    isolation: isolate;
+  }
+  .room-empty.initial-setup::before {
+    content: "";
+    position: absolute;
+    z-index: -1;
+    inset: -80px -40px auto;
+    height: 220px;
+    background: radial-gradient(circle at 50% 46%, var(--focus), transparent 63%);
+    pointer-events: none;
+  }
+  .onboarding-intro {
+    text-align: center;
+  }
+  .onboarding-network {
+    display: block;
+    width: 218px;
+    height: 82px;
+    margin: -5px auto 1px;
+    overflow: visible;
+  }
+  .onboarding-link {
+    fill: none;
+    stroke: var(--line-strong);
+    stroke-dasharray: 3 4;
+    stroke-linecap: round;
+    stroke-width: 1.25;
+    opacity: 0.72;
+  }
+  .onboarding-link-low {
+    opacity: 0.32;
+  }
+  .onboarding-signal {
+    fill: var(--accent);
+    opacity: 0.12;
+    transform-box: fill-box;
+    transform-origin: center;
+    animation: onboarding-signal 2.5s ease-out infinite;
+  }
+  .onboarding-node rect {
+    fill: var(--field-strong);
+    stroke: var(--line-strong);
+    stroke-width: 1.25;
+  }
+  .onboarding-node path {
+    fill: none;
+    stroke: var(--muted);
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    stroke-width: 1.4;
+  }
+  .onboarding-node-primary rect {
+    fill: var(--mint-panel);
+    stroke: var(--accent);
+  }
+  .onboarding-node-primary path {
+    stroke: var(--accent);
+  }
+  @keyframes onboarding-signal {
+    0% {
+      opacity: 0.18;
+      transform: scale(0.72);
+    }
+    68%,
+    100% {
+      opacity: 0;
+      transform: scale(1.85);
+    }
+  }
+  .onboarding-eyebrow {
+    display: block;
+    margin-top: -1px;
+    color: var(--accent);
+    font-size: 9px;
+    font-weight: 900;
+    letter-spacing: 0.14em;
+  }
+  .onboarding-intro h2 {
+    margin: 4px 0 0;
+    color: var(--text-strong);
+    font-size: 19px;
+    font-weight: 760;
+    letter-spacing: -0.025em;
+    line-height: 1.15;
+  }
+  .onboarding-intro p {
+    max-width: 312px;
+    margin: 8px auto 0;
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.5;
+  }
+  .initial-setup .room-actions {
+    margin-top: 18px;
+  }
+  .initial-setup .ghost.onboarding-create {
+    width: 100%;
+    min-height: 41px;
+    border-color: var(--accent);
+    border-radius: 14px;
+    background: var(--accent);
+    color: var(--shell-bg);
+    font-size: 12px;
+    font-weight: 850;
+    box-shadow: 0 8px 24px color-mix(in srgb, var(--accent) 10%, transparent);
+  }
+  .initial-setup .ghost.onboarding-create:hover,
+  .initial-setup .ghost.onboarding-create:focus-visible {
+    border-color: var(--accent-hover);
+    background: var(--accent-hover);
+    color: var(--shell-bg);
+    outline: none;
+    box-shadow: 0 0 0 3px var(--focus);
+  }
+  .initial-setup .divider {
+    gap: 12px;
+    margin: 16px 0 12px;
+    color: var(--muted);
+    font-size: 9px;
+    font-weight: 750;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+  .onboarding-join-row.initial {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 9px;
+  }
+  .onboarding-join-row.initial .join-input {
+    width: 100%;
+    min-width: 0;
+    height: 39px;
+    box-sizing: border-box;
+  }
+  .onboarding-join-row.initial .ghost {
+    min-height: 39px;
+    padding-inline: 11px;
+    border-radius: 13px;
+    font-size: 11px;
+    white-space: nowrap;
+  }
+
   .confetti-layer {
     position: absolute;
     inset: 0;
@@ -6348,6 +6700,12 @@
   }
 
   @media (prefers-reduced-motion: reduce) {
+    .devices-view-scroll {
+      animation: none;
+    }
+    .onboarding-signal {
+      animation: none;
+    }
     .confetti-layer {
       display: none;
     }
