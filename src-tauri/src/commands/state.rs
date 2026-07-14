@@ -89,6 +89,11 @@ pub struct AppSettings {
     pub sync_groups: Vec<SyncGroupConfig>,
     #[serde(default)]
     pub active_sync_group_id: Option<String>,
+    /// The group selected automatically as the initial send destination on
+    /// startup. This is intentionally independent from the group currently
+    /// active in the UI.
+    #[serde(default)]
+    pub default_sync_group_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -105,6 +110,7 @@ impl Default for AppSettings {
             transfer_timeout_minutes: DEFAULT_FILE_TRANSFER_TIMEOUT_MINUTES,
             sync_groups: Vec::new(),
             active_sync_group_id: None,
+            default_sync_group_id: None,
         }
     }
 }
@@ -114,6 +120,7 @@ pub struct SyncGroupDto {
     pub id: String,
     pub name: String,
     pub active: bool,
+    pub is_default: bool,
     pub connected: bool,
     pub member_count: usize,
 }
@@ -136,6 +143,10 @@ pub struct PairingCodeDto {
 #[derive(Clone)]
 pub struct PendingJoinRecord {
     pub request_id: String,
+    /// Stable, domain-separated replay key for this exact request. It is also
+    /// used as the frontend request id so requests from one device to
+    /// different groups cannot overwrite each other.
+    pub request_key: [u8; 16],
     pub network_id: String,
     pub rendezvous_topic: String,
     pub request: crate::pairing::NetworkJoinRequest,
@@ -188,6 +199,7 @@ pub enum TransferRecord {
 
 #[derive(Clone)]
 pub struct PendingIncomingTransfer {
+    pub(crate) network_id: String,
     pub(crate) sender_id: crypto::Ed25519PubKey,
     pub(crate) file_name: String,
     pub(crate) size: u64,
@@ -223,6 +235,7 @@ pub struct TransferDto {
 #[derive(Clone, Serialize)]
 pub struct FileOfferDto {
     pub session_id: String,
+    pub network_id: String,
     pub sender_id: String,
     pub sender_label: String,
     pub file_name: String,

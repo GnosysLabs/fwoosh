@@ -701,6 +701,31 @@ pub(crate) async fn cancel_transfers_not_in_roster(
     }
 }
 
+pub(crate) async fn cancel_all_transfers(
+    state: &Arc<AppState>,
+    app: &tauri::AppHandle,
+    message: &str,
+) {
+    let active = {
+        let mut transfers = state.file_transfers.lock().await;
+        transfers.drain().collect::<Vec<_>>()
+    };
+
+    for (session_id, record) in active {
+        cleanup_transfer_record(Some(record)).await;
+        let _ = app.emit(
+            "file-transfer-cancelled",
+            FileTransferProgressDto {
+                session_id,
+                transferred: 0,
+                total: 0,
+                status: "cancelled".to_string(),
+                message: message.to_string(),
+            },
+        );
+    }
+}
+
 pub(crate) fn transfer_is_stale_for_roster(
     record: &TransferRecord,
     roster: &VerifiedRoster,

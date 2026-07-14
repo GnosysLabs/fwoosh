@@ -17,20 +17,21 @@ pub mod sync_groups;
 pub use pairing_commands::{
     approve_join_request, create_temporary_pairing_code, join_room, join_sync_group,
     load_invitations_from_keychain, new_pairing_code, pending_join_requests, reject_join_request,
-    revoke_pairing_code, rotate_pairing_code,
+    revoke_pairing_code, revoke_permanent_pairing_code, rotate_pairing_code,
 };
-use pairing_commands::{current_network_identity, issue_pairing_code, persist_invitations};
+use pairing_commands::{issue_pairing_code, persist_invitations};
 use sync_groups::{
-    activate_sync_group, broadcast_roster, current_sync_group_id, decode_persisted_roster_entries,
-    detected_device_label, ensure_active_sync_group, normalize_stun_servers, persist_roster,
-    persist_settings, remove_sync_group_from_device, sanitize_device_label,
-    sanitize_sync_group_name, verify_persisted_roster_entries,
+    activate_sync_group, add_sync_group_config, broadcast_roster, current_sync_group_id,
+    decode_persisted_roster_entries, detected_device_label, ensure_active_sync_group,
+    ensure_expected_active_group, load_sync_group_roster, normalize_stun_servers, persist_roster,
+    persist_settings, persist_sync_group_roster_checked, remove_sync_group_from_device,
+    sanitize_device_label, sanitize_sync_group_name, verify_persisted_roster_entries,
 };
 pub use sync_groups::{
     create_room, create_sync_group, leave_room, load_persisted_roster, load_settings,
     network_settings, prepare_sync_groups, rename_device, rename_sync_group, revoke_device,
-    room_state, roster_devices, save_settings, set_network_settings, suggest_device_label,
-    switch_sync_group, sync_groups,
+    room_state, roster_devices, save_settings, set_default_sync_group, set_network_settings,
+    suggest_device_label, switch_sync_group, sync_groups,
 };
 pub mod state;
 
@@ -38,8 +39,9 @@ pub use state::*;
 mod relay;
 
 use relay::{
-    encode_roster_move, parse_device_id, publish_sealed_clip, publish_sealed_clip_attachment,
-    publish_wire, start_auxiliary_subscriber, stop_auxiliary_subscriber,
+    encode_group_removal_notice, encode_roster_move, parse_device_id, publish_sealed_clip,
+    publish_sealed_clip_attachment, publish_wire, start_auxiliary_subscriber,
+    stop_auxiliary_subscriber,
 };
 pub use relay::{
     handle_relay_message, restart_subscribers, start_invitation_subscribers, start_subscriber,
@@ -81,7 +83,7 @@ pub use transfer::{
     reject_file_transfer, reveal_received_file, start_file_send,
 };
 use transfer::{
-    cancel_transfers_not_in_roster, decode_file_signal, handle_file_signal,
+    cancel_all_transfers, cancel_transfers_not_in_roster, decode_file_signal, handle_file_signal,
     normalize_transfer_timeout_minutes,
 };
 #[cfg(test)]
@@ -115,9 +117,9 @@ async fn require_admin_roster(
         .lock()
         .await
         .clone()
-        .ok_or_else(|| "not in a network".to_string())?;
+        .ok_or_else(|| "not in a group".to_string())?;
     if state.device.signing_pub != verified.entry.admin_id {
-        return Err(format!("only the network admin can {action}"));
+        return Err(format!("only the group admin can {action}"));
     }
     Ok(verified)
 }
@@ -278,18 +280,18 @@ pub async fn send_clip(
     private: bool,
     network_id: Option<String>,
 ) -> Result<(), String> {
-    let default_network_id = state
+    let active_group_id = state
         .settings
         .lock()
         .await
         .active_sync_group_id
         .clone()
-        .ok_or_else(|| "no default Network is configured".to_string())?;
+        .ok_or_else(|| "no sync group is active".to_string())?;
     if network_id
         .as_ref()
-        .is_some_and(|requested| requested != &default_network_id)
+        .is_some_and(|requested| requested != &active_group_id)
     {
-        return Err("selected Network is not available".to_string());
+        return Err("selected group is not available".to_string());
     }
     let guard = state.roster.lock().await;
     let verified = guard.as_ref().ok_or("not in a room")?;
