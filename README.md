@@ -65,7 +65,7 @@ installer releases, and a cross-device installed-app smoke test.
 | Sync Groups | Named groups, isolated roster files/history, legacy-room migration, active-group switching |
 | P2P file transfer (`commands/transfer/`) | WebRTC data channels; streamed encrypted chunks; configurable timeout |
 | Desktop shell (tray, hotkey, popup UI) | ✅ builds |
-| CI / release pipeline | Tests plus cargo/npm audit in CI; Windows NSIS/MSI installer publishing is wired, signing remains before public release |
+| CI / release pipeline | Tests plus cargo/npm audit in CI; Windows NSIS/MSI and unsigned macOS app/DMG publishing are wired, signing remains before public release |
 
 ## Threat model (honest)
 
@@ -121,6 +121,18 @@ npm run build:windows
 
 The NSIS setup executable and MSI installer are written to
 `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/`.
+
+### Build macOS testing artifacts
+
+On macOS, with Xcode command-line tools installed:
+
+```bash
+npm ci
+npm run build:macos
+```
+
+This creates an unsigned `.app` bundle and `.dmg` installer under
+`src-tauri/target/<your-target>/release/bundle/`.
 
 ### Run the test suite
 ```bash

@@ -9,6 +9,7 @@ This project uses SemVer. Release tags should use the form `vX.Y.Z`.
 - Add a visible app version sourced from the synchronized SemVer metadata.
 - Add a local Windows release command and CI packaging for NSIS and MSI
   installers instead of a raw executable ZIP.
+- Add unsigned macOS `.app` and `.dmg` test builds for Apple Silicon and Intel.
 - Split the oversized Tauri command implementation into focused state, Sync
   Group, pairing, relay, history, and file-transfer modules without changing
   the IPC contract.

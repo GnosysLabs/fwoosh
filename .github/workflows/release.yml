@@ -50,10 +50,9 @@ jobs:
         if: runner.os == 'macOS'
         run: npm run build
 
-      - name: Build macOS app
+      - name: Build macOS app and installers
         if: runner.os == 'macOS'
-        working-directory: src-tauri
-        run: cargo build --release --target ${{ matrix.target }}
+        run: npm run tauri -- build --target ${{ matrix.target }} --bundles app dmg --ci --no-sign
         env:
           CARGO_NET_OFFLINE: "false"
 
@@ -83,16 +82,26 @@ jobs:
           }
           $checksums | Set-Content -Path dist/fwoosh-windows.sha256 -Encoding ascii
 
-      - name: Package macOS
+      - name: Package macOS bundles
         if: runner.os == 'macOS'
         run: |
-          mkdir -p dist
-          tar czf "dist/${{ matrix.artifact }}.tar.gz" -C "src-tauri/target/${{ matrix.target }}/release" fwoosh
+          set -euo pipefail
+          bundle_root="src-tauri/target/${{ matrix.target }}/release/bundle"
+          app_path="$(find "$bundle_root/macos" -type d -name '*.app' -prune -print -quit)"
+          dmg_path="$(find "$bundle_root/dmg" -type f -name '*.dmg' -print -quit)"
+          if [ -z "$app_path" ] || [ -z "$dmg_path" ]; then
+            echo "Expected both a macOS app bundle and DMG installer."
+            exit 1
+          fi
 
-      - name: Generate macOS SHA-256 checksum
+          mkdir -p dist
+          cp "$dmg_path" dist/
+          ditto -c -k --sequesterRsrc --keepParent "$app_path" "dist/${{ matrix.artifact }}.app.zip"
+
+      - name: Generate macOS SHA-256 checksums
         if: runner.os == 'macOS'
         shell: bash
-        run: shasum -a 256 "dist/${{ matrix.artifact }}.tar.gz" > "dist/${{ matrix.artifact }}.sha256"
+        run: shasum -a 256 dist/*.dmg dist/*.app.zip > "dist/${{ matrix.artifact }}.sha256"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
