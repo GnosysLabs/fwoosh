@@ -239,13 +239,17 @@
   }
   interface ConfettiPiece {
     id: number;
-    x: number;
+    originX: number;
+    burstX: number;
+    burstY: number;
     drift: number;
     delay: number;
     duration: number;
     rotation: number;
+    midRotation: number;
     color: string;
-    round: boolean;
+    shape: "ribbon" | "dot" | "spark" | "star";
+    scale: number;
   }
 
   // ---- Load recent clips on mount + listen for events ----
@@ -485,22 +489,39 @@
       return;
     }
 
-    const palette = ["var(--accent)", "var(--mint)", "var(--text-strong)"];
+    const palette = [
+      "var(--accent)",
+      "var(--mint)",
+      "var(--text-strong)",
+      "#ffd166",
+      "#ff6b8a",
+      "#65d8ff",
+    ];
+    const shapes: ConfettiPiece["shape"][] = ["ribbon", "dot", "spark", "star"];
     const run = Date.now();
-    confettiPieces = Array.from({ length: 36 }, (_, index) => ({
-      id: run + index,
-      x: 5 + ((index * 37) % 90),
-      drift: -54 + ((index * 29) % 109),
-      delay: (index % 9) * 32,
-      duration: 1040 + ((index * 47) % 520),
-      rotation: 280 + ((index * 83) % 520),
-      color: palette[index % palette.length],
-      round: index % 5 === 0,
-    }));
+    confettiPieces = Array.from({ length: 64 }, (_, index) => {
+      const fromLeft = index % 2 === 0;
+      const direction = fromLeft ? 1 : -1;
+      const random = () => Math.random();
+      return {
+        id: run + index,
+        originX: fromLeft ? 7 + random() * 8 : 85 + random() * 8,
+        burstX: direction * (42 + random() * 150),
+        burstY: -(150 + random() * 260),
+        drift: direction * (-40 + random() * 130),
+        delay: random() * 180,
+        duration: 1500 + random() * 900,
+        rotation: direction * (420 + random() * 920),
+        midRotation: direction * (175 + random() * 390),
+        color: palette[Math.floor(random() * palette.length)],
+        shape: shapes[Math.floor(random() * shapes.length)],
+        scale: 0.7 + random() * 0.8,
+      };
+    });
     confettiTimer = setTimeout(() => {
       confettiPieces = [];
       confettiTimer = null;
-    }, 1900);
+    }, 2800);
   }
 
   function showStatus(next: "ok" | "err", message: string, durationMs = next === "err" ? 10000 : 2000) {
@@ -1085,10 +1106,10 @@
     await copyText(pairingUri, "Pairing code copied");
   }
 
-  async function hidePopup() {
+  async function minimizePopup() {
     settingsOpen = false;
     if (isMobile) return;
-    await getCurrentWindow().hide();
+    await invoke("dismiss_main_window");
   }
 
   function openDevicesView() {
@@ -1627,7 +1648,7 @@
         closeDevicesView();
         return;
       }
-      if (!isMobile) void hidePopup();
+      if (!isMobile) void minimizePopup();
     }
   }
 
@@ -1764,10 +1785,9 @@
         </svg>
       </button>
       {#if !isMobile}
-        <button class="icon-btn close-btn" aria-label="Hide Fwoosh" title="Hide Fwoosh" onclick={hidePopup}>
+        <button class="icon-btn minimize-btn" aria-label="Minimize Fwoosh" title="Minimize Fwoosh" onclick={minimizePopup}>
           <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M6 6l12 12" />
-            <path d="M18 6 6 18" />
+            <path d="M6 12h12" />
           </svg>
         </button>
       {/if}
@@ -2980,9 +3000,8 @@
     <div class="confetti-layer" aria-hidden="true">
       {#each confettiPieces as piece (piece.id)}
         <span
-          class="confetti-piece"
-          class:round={piece.round}
-          style={`--confetti-x: ${piece.x}%; --confetti-drift: ${piece.drift}px; --confetti-delay: ${piece.delay}ms; --confetti-duration: ${piece.duration}ms; --confetti-rotation: ${piece.rotation}deg; --confetti-color: ${piece.color};`}
+          class="confetti-piece {piece.shape}"
+          style={`--confetti-origin-x: ${piece.originX}%; --confetti-burst-x: ${piece.burstX}px; --confetti-burst-y: ${piece.burstY}px; --confetti-drift: ${piece.drift}px; --confetti-delay: ${piece.delay}ms; --confetti-duration: ${piece.duration}ms; --confetti-mid-rotation: ${piece.midRotation}deg; --confetti-rotation: ${piece.rotation}deg; --confetti-color: ${piece.color}; --confetti-scale: ${piece.scale};`}
         ></span>
       {/each}
     </div>
@@ -3122,7 +3141,7 @@
     color: #f4f4f5;
     outline: none;
   }
-  .close-btn {
+  .minimize-btn {
     color: #c4c4cc;
   }
   .icon-svg {
@@ -4748,15 +4767,15 @@
     outline: none;
     transform: translateY(-1px);
   }
-  .close-btn {
-    background: var(--danger-panel);
-    border-color: var(--danger-line);
-    color: var(--danger);
+  .minimize-btn {
+    background: var(--field-strong);
+    border-color: var(--line);
+    color: var(--muted);
   }
-  .close-btn:hover,
-  .close-btn:focus-visible {
-    border-color: var(--danger);
-    color: var(--danger);
+  .minimize-btn:hover,
+  .minimize-btn:focus-visible {
+    border-color: var(--line-strong);
+    color: var(--text-strong);
   }
 
   .settings-menu {
@@ -6802,41 +6821,63 @@
   }
   .confetti-piece {
     position: absolute;
-    top: -14px;
-    left: var(--confetti-x);
-    width: 5px;
-    height: 9px;
-    border-radius: 1px;
+    top: 88%;
+    left: var(--confetti-origin-x);
+    width: 6px;
+    height: 12px;
+    border-radius: 2px;
     background: var(--confetti-color);
     opacity: 0;
-    animation: confetti-fall var(--confetti-duration)
-      cubic-bezier(0.22, 0.74, 0.23, 1) var(--confetti-delay) both;
+    box-shadow: 0 0 8px color-mix(in srgb, var(--confetti-color) 42%, transparent);
+    animation: confetti-burst var(--confetti-duration)
+      cubic-bezier(0.16, 0.76, 0.34, 1) var(--confetti-delay) both;
     will-change: transform, opacity;
   }
-  .confetti-piece.round {
-    width: 6px;
-    height: 6px;
+  .confetti-piece.dot {
+    width: 7px;
+    height: 7px;
     border-radius: 50%;
   }
-  @keyframes confetti-fall {
+  .confetti-piece.spark {
+    width: 3px;
+    height: 15px;
+    border-radius: 999px;
+  }
+  .confetti-piece.star {
+    width: 11px;
+    height: 11px;
+    clip-path: polygon(50% 0, 61% 35%, 100% 50%, 63% 63%, 50% 100%, 37% 63%, 0 50%, 35% 37%);
+  }
+  @keyframes confetti-burst {
     0% {
       opacity: 0;
-      transform: translate3d(-50%, -14px, 0) rotate(0deg);
+      transform: translate3d(-50%, 18px, 0) rotate(0deg) scale(0.2);
     }
-    10% {
+    8% {
       opacity: 1;
     }
-    82% {
+    38% {
+      opacity: 1;
+      transform: translate3d(
+          calc(-50% + var(--confetti-burst-x)),
+          var(--confetti-burst-y),
+          0
+        )
+        rotate(var(--confetti-mid-rotation))
+        scale(var(--confetti-scale)) scaleX(-0.55);
+    }
+    72% {
       opacity: 1;
     }
     100% {
       opacity: 0;
       transform: translate3d(
-          calc(-50% + var(--confetti-drift)),
-          calc(100vh + 28px),
+          calc(-50% + var(--confetti-burst-x) + var(--confetti-drift)),
+          22vh,
           0
         )
-        rotate(var(--confetti-rotation));
+        rotate(var(--confetti-rotation))
+        scale(var(--confetti-scale)) scaleX(0.35);
     }
   }
 
@@ -6904,7 +6945,7 @@
     -webkit-app-region: no-drag;
   }
   .card.mobile .tabs,
-  .card.mobile .close-btn {
+  .card.mobile .minimize-btn {
     display: none;
   }
   .card.mobile .window-actions {

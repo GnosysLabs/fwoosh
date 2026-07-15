@@ -13,17 +13,18 @@ use tauri::{Emitter, Manager};
 
 #[cfg(desktop)]
 use std::path::PathBuf;
-#[cfg(desktop)]
+#[cfg(all(desktop, not(target_os = "macos")))]
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    DragDropEvent, WebviewEvent, WindowEvent,
 };
+#[cfg(desktop)]
+use tauri::{DragDropEvent, WebviewEvent, WindowEvent};
 #[cfg(desktop)]
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
 
 #[cfg(desktop)]
-/// Toggle the popup window: show + focus, or hide if already visible.
+/// Toggle the popup window: show + focus, or dismiss if already visible.
 fn toggle_popup(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         let visible = win.is_visible().unwrap_or(false);
@@ -31,7 +32,7 @@ fn toggle_popup(app: &tauri::AppHandle) {
         let focused = win.is_focused().unwrap_or(false);
 
         if visible && !minimized && focused {
-            let _ = win.hide();
+            let _ = commands::dismiss_main_window(app.clone());
         } else {
             let _ = commands::reveal_main_window(app);
         }
@@ -42,14 +43,6 @@ fn toggle_popup(app: &tauri::AppHandle) {
 /// Show and focus the popup window.
 fn show_popup(app: &tauri::AppHandle) {
     let _ = commands::reveal_main_window(app);
-}
-
-#[cfg(desktop)]
-/// Hide the popup window.
-fn hide_popup(app: &tauri::AppHandle) {
-    if let Some(win) = app.get_webview_window("main") {
-        let _ = win.hide();
-    }
 }
 
 #[cfg(desktop)]
@@ -178,7 +171,7 @@ pub fn run() {
             // push provider or a second backend.
             restart_relay_subscribers(app.handle());
 
-            #[cfg(desktop)]
+            #[cfg(all(desktop, not(target_os = "macos")))]
             {
                 // --- Tray icon + menu ---
                 let show_item = MenuItem::with_id(app, "show", "Show Fwoosh", true, None::<&str>)?;
@@ -221,10 +214,11 @@ pub fn run() {
         .on_window_event(|window, event| {
             #[cfg(desktop)]
             {
-                // Hide instead of close so the app keeps running in the tray.
+                // Keep the process alive: macOS minimizes to its Dock, while
+                // tray-oriented desktop platforms hide the popup.
                 if let WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
-                    hide_popup(window.app_handle());
+                    let _ = commands::dismiss_main_window(window.app_handle().clone());
                 }
                 if let WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. }) = event {
                     grant_dropped_paths(window.app_handle().clone(), paths);
@@ -280,6 +274,7 @@ pub fn run() {
             commands::history_commands::delete_clip,
             commands::history_commands::delete_all_clips,
             commands::history_commands::copy_to_clipboard,
+            commands::dismiss_main_window,
             commands::show_main_window,
             commands::notify_incoming_clip,
         ])
@@ -291,8 +286,7 @@ pub fn run() {
                 restart_relay_subscribers(app);
             }
 
-            // macOS emits this when the user clicks the Dock icon while every
-            // app window is hidden. Restore our tray-style popup in response.
+            // Restore the window when the macOS Dock icon is clicked.
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = event {
                 show_popup(app);

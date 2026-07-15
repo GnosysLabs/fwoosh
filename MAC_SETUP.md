@@ -36,8 +36,8 @@ npm run tauri dev     # builds + launches the native Mac app
 ```
 
 The first build compiles the Rust core (~3-5 min). A native window appears and
-a **Fwoosh icon shows in the menu bar** (top-right). Hit
-**`Cmd+Shift+V`** anywhere to pop the text box.
+Fwoosh stays available from the Dock without adding a menu-bar status icon.
+Hit **`Cmd+Shift+V`** anywhere to bring the text box forward.
 
 > **No `dev.cmd` on Mac** — that file is Windows-only (it loads the MSVC build
 > env). On Mac, just `npm run tauri dev` directly.
@@ -69,7 +69,7 @@ Subsequent builds are incremental (~10s).
 Accessibility permissions (System Settings → Privacy & Security → Accessibility,
 enable Terminal/iTerm). Global shortcuts need it.
 
-**App crashes / no tray icon** — check the Terminal output. Fwoosh expects
+**App crashes / no Dock window** — check the Terminal output. Fwoosh expects
 macOS Keychain to be available. A raw file fallback is only for development or
 tests with `FWOOSH_ALLOW_FILE_KEY_FALLBACK=1`.
 

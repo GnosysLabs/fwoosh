@@ -384,6 +384,28 @@ pub fn reveal_main_window(app: &tauri::AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn dismiss_main_window(app: tauri::AppHandle) -> Result<(), String> {
+    #[cfg(desktop)]
+    {
+        let win = app
+            .get_webview_window("main")
+            .ok_or_else(|| "main window not found".to_string())?;
+
+        #[cfg(target_os = "macos")]
+        return win.minimize().map_err(|e| e.to_string());
+
+        #[cfg(not(target_os = "macos"))]
+        return win.hide().map_err(|e| e.to_string());
+    }
+
+    #[cfg(mobile)]
+    {
+        let _ = app;
+        Ok(())
+    }
+}
+
+#[tauri::command]
 pub fn show_main_window(app: tauri::AppHandle) -> Result<(), String> {
     reveal_main_window(&app)
 }

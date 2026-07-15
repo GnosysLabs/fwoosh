@@ -196,7 +196,7 @@ src-tauri/src/
       mod.rs             file-transfer commands and signaling state machine
       webrtc.rs          WebRTC channels, framing, finalization, and cleanup
     tests.rs             cross-module command regression tests
-  lib.rs       tray icon, global hotkey, popup window, plugin setup
+  lib.rs       desktop lifecycle, tray/Dock behavior, global hotkey, plugin setup
 src/routes/+page.svelte   the popup UI (Svelte + Tailwind)
 .github/workflows/        Release build/checksum workflow
 ```
