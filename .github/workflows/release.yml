@@ -59,7 +59,7 @@ jobs:
 
       - name: Package Windows installers
         if: runner.os == 'Windows'
-        shell: pwsh
+        shell: powershell
         run: |
           $bundleRoot = "src-tauri/target/${{ matrix.target }}/release/bundle"
           $installers = Get-ChildItem -Path $bundleRoot -Recurse -File -ErrorAction Stop |
