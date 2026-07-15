@@ -132,8 +132,10 @@ npm ci
 npm run build:macos
 ```
 
-This creates an unsigned `.app` bundle and `.dmg` installer under
-`src-tauri/target/<your-target>/release/bundle/`.
+This creates an ad-hoc-signed `.app` bundle and `.dmg` installer under
+`src-tauri/target/<your-target>/release/bundle/`. Ad-hoc signing makes the app
+structurally runnable on Apple Silicon, but it is not notarization: a Mac that
+downloads the app must still approve its first launch in Privacy & Security.
 
 ### Build Android and iOS
 

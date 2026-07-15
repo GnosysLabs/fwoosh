@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite dev",
     "build": "npm run version:check && vite build",
-    "build:macos": "npm run tauri -- build --bundles app dmg --ci --no-sign",
+    "build:macos": "npm run tauri -- build --bundles app dmg --ci",
     "build:windows": "cmd /c scripts\\build-windows.cmd",
     "mobile:android:init": "npm run tauri -- android init --ci",
     "mobile:android:dev": "npm run tauri -- android dev",

@@ -49,9 +49,22 @@ jobs:
 
       - name: Build macOS app and installers
         if: runner.os == 'macOS'
-        run: npm run tauri -- build --target ${{ matrix.target }} --bundles app dmg --ci --no-sign
+        run: npm run tauri -- build --target ${{ matrix.target }} --bundles app dmg --ci
         env:
           CARGO_NET_OFFLINE: "false"
+
+      - name: Verify macOS app signature
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_path="$(find "src-tauri/target/${{ matrix.target }}/release/bundle/macos" -type d -name '*.app' -prune -print -quit)"
+          if [ -z "$app_path" ]; then
+            echo "Expected a macOS app bundle to verify."
+            exit 1
+          fi
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          codesign --display --verbose=2 "$app_path"
 
       - name: Build Windows installers
         if: runner.os == 'Windows'
