@@ -8,6 +8,7 @@
     "build": "npm run version:check && vite build",
     "build:macos": "npm run tauri -- build --bundles app dmg --ci",
     "build:windows": "cmd /c scripts\\build-windows.cmd",
+    "build:windows:store": "cmd /c scripts\\build-windows-store.cmd",
     "mobile:android:init": "npm run tauri -- android init --ci",
     "mobile:android:dev": "npm run tauri -- android dev",
     "mobile:android:build": "npm run tauri -- android build",

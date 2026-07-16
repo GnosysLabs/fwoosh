@@ -123,6 +123,22 @@ npm run build:windows
 The NSIS setup executable and MSI installer are written to
 `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/`.
 
+### Build for Microsoft Store
+
+The Store requires a standalone installer that does not download WebView2
+during installation. Build the Store-specific NSIS package with:
+
+```cmd
+npm ci
+npm run build:windows:store
+```
+
+The installer is written under
+`src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/`. It must be code
+signed with a publicly trusted code-signing certificate and hosted at an
+immutable, versioned HTTPS URL before Partner Center submission. Configure the
+package as x64 and use `/S` as its silent install parameter.
+
 ### Build macOS testing artifacts
 
 On macOS, with Xcode command-line tools installed:
