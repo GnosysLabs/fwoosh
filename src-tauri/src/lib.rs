@@ -126,6 +126,8 @@ pub fn run() {
             let legacy_roster_path = app_data.join("roster.bin");
             let groups_dir = app_data.join("groups");
             let settings_path = app_data.join("settings.json");
+            #[cfg(target_os = "windows")]
+            let is_first_launch = !settings_path.exists();
             if let Ok(mut gd) = state.groups_dir.try_lock() {
                 *gd = Some(groups_dir.clone());
             }
@@ -201,10 +203,22 @@ pub fn run() {
                     })
                     .build(app)?;
 
-                // Hide the window on startup; it lives in the tray.
+                // Windows hides newly installed tray icons in the overflow
+                // area by default. Make the first successful launch visible
+                // so Store users know Fwoosh opened; later launches retain the
+                // tray-first behavior.
                 if let Some(win) = app.get_webview_window("main") {
                     #[cfg(target_os = "windows")]
                     let _ = win.set_shadow(false);
+
+                    #[cfg(target_os = "windows")]
+                    if is_first_launch {
+                        show_popup(app.handle());
+                    } else {
+                        let _ = win.hide();
+                    }
+
+                    #[cfg(not(target_os = "windows"))]
                     let _ = win.hide();
                 }
             }
