@@ -12,10 +12,25 @@
   import { confirm } from "@tauri-apps/plugin-dialog";
   import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
   import { platform } from "@tauri-apps/plugin-os";
+  import { marked } from "marked";
   import QRCode from "qrcode";
+  import privacyPolicyMarkdown from "../../docs/privacy-policy.md?raw";
+  import termsOfUseMarkdown from "../../docs/terms-of-use.md?raw";
   import { APP_VERSION } from "$lib/version";
 
   type Theme = "hacker" | "light" | "onyx" | "melanzana";
+  type LegalDocument = "terms" | "privacy";
+
+  const legalDocuments = {
+    terms: {
+      title: "Terms of Use",
+      html: marked.parse(termsOfUseMarkdown, { async: false }) as string,
+    },
+    privacy: {
+      title: "Privacy Policy",
+      html: marked.parse(privacyPolicyMarkdown, { async: false }) as string,
+    },
+  } as const;
 
   // ---- State ----
   let text = $state("");
@@ -46,6 +61,7 @@
   let devices = $state<DeviceDto[]>([]);
   let theme = $state<Theme>("hacker");
   let settingsOpen = $state(false);
+  let legalDocument = $state<LegalDocument | null>(null);
   let syncGroups = $state<SyncGroupDto[]>([]);
   let switchingGroup = $state(false);
   let syncGroupNameDraft = $state("");
@@ -108,6 +124,7 @@
       savingNetwork ||
       creatingSyncGroup
   );
+  let activeLegalDocument = $derived(legalDocument ? legalDocuments[legalDocument] : null);
   let logoSrc = $derived(
     theme === "light"
       ? "/fwoosh_dark.webp"
@@ -1131,6 +1148,15 @@
     settingsOpen = false;
   }
 
+  function openLegalDocument(document: LegalDocument) {
+    settingsOpen = false;
+    legalDocument = document;
+  }
+
+  function closeLegalDocument() {
+    legalDocument = null;
+  }
+
   function startLogoDrag(e: MouseEvent) {
     if (isMobile || e.button !== 0 || !/^Mac/.test(navigator.platform)) return;
     e.preventDefault();
@@ -1616,6 +1642,10 @@
       send();
     }
     if (e.key === "Escape") {
+      if (legalDocument) {
+        closeLegalDocument();
+        return;
+      }
       if (settingsOpen) {
         settingsOpen = false;
         return;
@@ -1856,9 +1886,14 @@
               {savingNetwork ? "Saving..." : "Save connection settings"}
             </button>
           </div>
-          {#if isMobile}
-            <div class="settings-version">Fwoosh {APP_VERSION}</div>
-          {/if}
+          <div class="settings-section">
+            <div class="settings-title">Legal</div>
+            <div class="settings-legal-actions">
+              <button class="mini-action full" onclick={() => openLegalDocument("terms")}>Terms of Use</button>
+              <button class="mini-action full" onclick={() => openLegalDocument("privacy")}>Privacy Policy</button>
+            </div>
+          </div>
+          <div class="settings-version">Fwoosh {APP_VERSION}</div>
         </div>
       {/if}
     </div>
@@ -2520,6 +2555,38 @@
         onclick={openDevicesView}>Devices</button
       >
     </nav>
+  {/if}
+
+  {#if activeLegalDocument}
+    <div
+      class="modal-overlay"
+      role="presentation"
+      onclick={closeLegalDocument}
+      onkeydown={(event) => {
+        if (event.key === "Escape") closeLegalDocument();
+      }}
+    >
+      <div
+        class="legal-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="legal-dialog-title"
+        tabindex="-1"
+        onclick={(event) => event.stopPropagation()}
+        onkeydown={(event) => event.stopPropagation()}
+      >
+        <header class="legal-dialog-header">
+          <h3 id="legal-dialog-title">{activeLegalDocument.title}</h3>
+          <button class="icon-btn" aria-label="Close legal document" title="Close" onclick={closeLegalDocument}>
+            <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M6 6l12 12" />
+              <path d="M18 6 6 18" />
+            </svg>
+          </button>
+        </header>
+        <div class="legal-content">{@html activeLegalDocument.html}</div>
+      </div>
+    </div>
   {/if}
 
   {#if newSyncGroupOpen}
@@ -7169,6 +7236,89 @@
   .card.mobile .pairing-card .send-btn,
   .card.mobile .dialog-actions .send-btn {
     min-height: 44px;
+  }
+  .settings-legal-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+  }
+  .legal-dialog {
+    width: min(390px, calc(100% - 28px));
+    max-height: calc(100% - 28px);
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--panel);
+    color: var(--text);
+    box-shadow: 0 24px 54px rgba(0, 0, 0, 0.46);
+  }
+  .legal-dialog-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    min-height: 48px;
+    padding: 6px 8px 6px 16px;
+    border-bottom: 1px solid var(--line);
+  }
+  .legal-dialog-header h3 {
+    margin: 0;
+    color: var(--text-strong);
+    font-size: 15px;
+  }
+  .legal-content {
+    min-height: 0;
+    padding: 4px 18px 20px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    font-size: 12px;
+    line-height: 1.55;
+  }
+  .legal-content :global(h1) {
+    margin: 16px 0 8px;
+    color: var(--text-strong);
+    font-size: 18px;
+  }
+  .legal-content :global(h2) {
+    margin: 18px 0 6px;
+    color: var(--text-strong);
+    font-size: 14px;
+  }
+  .legal-content :global(p),
+  .legal-content :global(ul) {
+    margin: 7px 0;
+  }
+  .legal-content :global(ul) {
+    padding-left: 18px;
+  }
+  .legal-content :global(a) {
+    color: var(--accent);
+  }
+  .legal-content :global(blockquote) {
+    margin: 10px 0;
+    padding: 1px 10px;
+    border-left: 3px solid var(--line-strong);
+    color: var(--muted);
+  }
+  :global(html[data-theme="light"]) .legal-dialog {
+    border-color: #cbd8e8;
+    background: #ffffff;
+    box-shadow: 0 18px 40px rgba(30, 41, 59, 0.2);
+  }
+  :global(html[data-theme="light"]) .legal-dialog-header {
+    border-bottom-color: #d8e2ef;
+  }
+  .card.mobile .legal-dialog {
+    width: 100%;
+    max-height: calc(100dvh - env(safe-area-inset-top) - 12px);
+    border-right: 0;
+    border-bottom: 0;
+    border-left: 0;
+    border-radius: 26px 26px 0 0;
   }
   @media (hover: none) {
     .card.mobile .private-tooltip {

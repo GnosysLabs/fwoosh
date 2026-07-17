@@ -8,7 +8,7 @@
     "build": "npm run version:check && vite build",
     "build:macos": "npm run tauri -- build --bundles app dmg --ci",
     "build:windows": "cmd /c scripts\\build-windows.cmd",
-    "build:windows:store": "cmd /c scripts\\build-windows-store.cmd",
+    "build:windows:msix": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\build-windows-msix.ps1",
     "mobile:android:init": "npm run tauri -- android init --ci",
     "mobile:android:dev": "npm run tauri -- android dev",
     "mobile:android:build": "npm run tauri -- android build",
@@ -31,6 +31,7 @@
     "@tauri-apps/plugin-fs": "^2.5.1",
     "@tauri-apps/plugin-notification": "^2.3.3",
     "@tauri-apps/plugin-os": "^2",
+    "marked": "^16.4.2",
     "qrcode": "^1.5.4"
   },
   "devDependencies": {

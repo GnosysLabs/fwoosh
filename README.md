@@ -125,19 +125,24 @@ The NSIS setup executable and MSI installer are written to
 
 ### Build for Microsoft Store
 
-The Store requires a standalone installer that does not download WebView2
-during installation. Build the Store-specific NSIS package with:
+Fwoosh is packaged as MSIX for Microsoft Store distribution. The package
+contains the application, Store assets, Terms of Use, and Privacy Policy, and
+declares the Evergreen WebView2 runtime as an installation dependency.
+
+Export the package identity values shown in Partner Center, then build with:
 
 ```cmd
 npm ci
-npm run build:windows:store
+set FWOOSH_MSIX_IDENTITY_NAME=<Package/Identity/Name>
+set FWOOSH_MSIX_PUBLISHER=<Package/Identity/Publisher>
+set FWOOSH_MSIX_PUBLISHER_DISPLAY_NAME=<Publisher display name>
+npm run build:windows:msix
 ```
 
-The installer is written under
-`src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/`. It must be code
-signed with a publicly trusted code-signing certificate and hosted at an
-immutable, versioned HTTPS URL before Partner Center submission. Configure the
-package as x64 and use `/S` as its silent install parameter.
+The Store-ready `.msixupload`, raw `.msix`, symbols, and SHA-256 checksums are
+written under `artifacts/msix/`. For local package-structure testing without a
+Store identity, run `powershell -File scripts/build-windows-msix.ps1 -Development`.
+Microsoft signs the production package after Store certification.
 
 ### Build macOS testing artifacts
 
