@@ -1,13 +1,10 @@
 # Fwoosh Terms of Use
 
-**Last updated:** July 12, 2026  
-**Effective date:** July 12, 2026
+**Last updated:** July 16, 2026
 
-> Before publishing these Terms, replace the bracketed placeholders with the
-> correct legal entity, notice address, governing law, and contact details.
-> This document is a product-specific starting point, not legal advice.
+**Effective date:** July 16, 2026
 
-These Terms of Use (the "Terms") govern your use of the Fwoosh application and related official distribution channels (collectively, the "App") provided by **[LEGAL ENTITY / FWOOSH MAINTAINERS]** ("Fwoosh," "we," "us," or "our"). By downloading, installing, or using the App, you agree to these Terms. If you do not agree, do not use the App.
+These Terms of Use (the "Terms") govern your use of the Fwoosh application and related official distribution channels (collectively, the "App") provided by **Gnosys Labs** ("Fwoosh," "we," "us," or "our"). By downloading, installing, or using the App, you agree to these Terms. If you do not agree, do not use the App.
 
 ## 1. What Fwoosh does
 
@@ -84,7 +81,7 @@ FWOOSH DOES NOT WARRANT THAT THE APP WILL PROTECT ALL CONTENT, PREVENT UNAUTHORI
 
 TO THE MAXIMUM EXTENT PERMITTED BY LAW, FWOOSH AND ITS CONTRIBUTORS WILL NOT BE LIABLE FOR INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, EXEMPLARY, OR PUNITIVE DAMAGES, OR FOR LOSS OF DATA, CONTENT, PROFITS, REVENUE, BUSINESS, GOODWILL, OR USE, ARISING FROM OR RELATED TO THE APP, THESE TERMS, THIRD-PARTY SERVICES, OR YOUR INABILITY TO USE THE APP.
 
-TO THE MAXIMUM EXTENT PERMITTED BY LAW, FWOOSH'S TOTAL LIABILITY FOR ALL CLAIMS ARISING FROM OR RELATED TO THE APP OR THESE TERMS WILL NOT EXCEED THE GREATER OF (A) THE AMOUNT YOU PAID FWOOSH FOR THE APP IN THE 12 MONTHS BEFORE THE EVENT GIVING RISE TO THE CLAIM, OR (B) CAD $100. Nothing in these Terms excludes or limits liability that cannot legally be excluded or limited.
+TO THE MAXIMUM EXTENT PERMITTED BY LAW, FWOOSH'S TOTAL LIABILITY FOR ALL CLAIMS ARISING FROM OR RELATED TO THE APP OR THESE TERMS WILL NOT EXCEED THE GREATER OF (A) THE AMOUNT YOU PAID FWOOSH FOR THE APP IN THE 12 MONTHS BEFORE THE EVENT GIVING RISE TO THE CLAIM, OR (B) USD $100. Nothing in these Terms excludes or limits liability that cannot legally be excluded or limited.
 
 ## 12. Indemnity
 
@@ -96,7 +93,7 @@ We may update these Terms when the App, its infrastructure, or applicable law ch
 
 ## 14. Governing law and disputes
 
-These Terms are governed by the laws of **[PROVINCE / STATE AND COUNTRY]**, without regard to conflict-of-law rules. The courts located in **[CITY, PROVINCE / STATE AND COUNTRY]** will have exclusive jurisdiction, unless applicable law gives you a non-waivable right to bring a claim elsewhere.
+These Terms are governed by the laws of the **State of California and applicable federal laws of the United States**, without regard to conflict-of-law rules. The state and federal courts serving **Newark, California, United States** will have exclusive jurisdiction, unless applicable law gives you a non-waivable right to bring a claim elsewhere.
 
 ## 15. General terms
 
@@ -104,6 +101,6 @@ If a provision of these Terms is held unenforceable, the remaining provisions re
 
 ## 16. Contact
 
-**[LEGAL ENTITY / FWOOSH MAINTAINERS]**  
-**[MAILING ADDRESS OR BUSINESS ADDRESS]**  
-**Contact:** [GENERAL CONTACT EMAIL]
+**Gnosys Labs**
+
+**Contact:** [admin@gnosyslabs.xyz](mailto:admin@gnosyslabs.xyz)

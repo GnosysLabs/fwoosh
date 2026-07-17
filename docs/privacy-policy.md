@@ -1,13 +1,10 @@
 # Fwoosh Privacy Policy
 
-**Last updated:** July 12, 2026  
-**Effective date:** July 12, 2026
+**Last updated:** July 16, 2026
 
-> Before publishing this policy, replace the bracketed placeholders with the
-> correct legal entity, address, and privacy contact. This document is a
-> product-specific starting point, not legal advice.
+**Effective date:** July 16, 2026
 
-This Privacy Policy explains how **[LEGAL ENTITY / FWOOSH MAINTAINERS]** ("Fwoosh," "we," "us," or "our") handles information in connection with the Fwoosh desktop and mobile applications, related relay services, and official distribution channels, as made available from time to time (collectively, the "App" and "Services").
+This Privacy Policy explains how **Gnosys Labs** ("Fwoosh," "we," "us," or "our") handles information in connection with the Fwoosh desktop and mobile applications, related relay services, and official distribution channels, as made available from time to time (collectively, the "App" and "Services").
 
 Fwoosh is designed as a peer-to-peer clipboard and file-sharing application. The App can use a public ntfy.sh relay, a relay selected by the customer, or—if offered as part of a paid plan—a relay operated by Fwoosh and its infrastructure partners. We do not operate a central plaintext content database or central plaintext file-storage service.
 
@@ -120,7 +117,7 @@ You can generally:
 
 Depending on where you live, you may have rights to access, correct, delete, restrict, object to, or obtain a copy of personal information, or to complain to a privacy regulator. Some requests may need to be directed to the relay, STUN provider, operating-system provider, or paired-device owner because Fwoosh may not possess the relevant information.
 
-To make a privacy request about information we control, contact **[PRIVACY CONTACT EMAIL]**. We may need enough information to verify and respond to the request. You may also have the right to contact the privacy regulator in your jurisdiction.
+To make a privacy request about information we control, contact **[admin@gnosyslabs.xyz](mailto:admin@gnosyslabs.xyz)**. We may need enough information to verify and respond to the request. You may also have the right to contact the privacy regulator in your jurisdiction.
 
 ## 8. Children
 
@@ -136,6 +133,6 @@ We may update this policy when the App, its infrastructure, or applicable law ch
 
 ## 11. Contact
 
-**[LEGAL ENTITY / FWOOSH MAINTAINERS]**  
-**[MAILING ADDRESS OR BUSINESS ADDRESS]**  
-**Privacy contact:** [PRIVACY CONTACT EMAIL]
+**Gnosys Labs**
+
+**Privacy contact:** [admin@gnosyslabs.xyz](mailto:admin@gnosyslabs.xyz)
