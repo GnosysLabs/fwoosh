@@ -1,6 +1,6 @@
 [package]
 name = "fwoosh"
-version = "0.1.0"
+version = "0.1.1"
 description = "Fwoosh encrypted clipboard sync"
 authors = ["Fwoosh contributors"]
 edition = "2021"
