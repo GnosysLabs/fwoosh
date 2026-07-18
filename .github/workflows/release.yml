@@ -18,9 +18,6 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact: fwoosh-macos-arm64
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            artifact: fwoosh-macos-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -40,48 +37,87 @@ jobs:
         with:
           workspaces: src-tauri
 
-      - name: Install JS deps + build frontend
-        run: |
-          npm install
-          npm run version:check
-          npm run build
+      - name: Install JS deps
+        run: npm ci
 
-      - name: Build Tauri app
-        working-directory: src-tauri
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Check app version consistency
+        run: npm run version:check
+
+      - name: Build frontend
+        if: runner.os == 'macOS'
+        run: npm run build
+
+      - name: Build macOS app and installers
+        if: runner.os == 'macOS'
+        run: npm run tauri -- build --target ${{ matrix.target }} --bundles app dmg --ci
         env:
           CARGO_NET_OFFLINE: "false"
 
-      - name: Package Windows
-        if: runner.os == 'Windows'
-        run: |
-          mkdir -p out
-          cp src-tauri/target/x86_64-pc-windows-msvc/release/fwoosh.exe out/
-          cd out && 7z a ../${{ matrix.artifact }}.zip fwoosh.exe
-      - name: Package macOS
+      - name: Verify macOS app signature
         if: runner.os == 'macOS'
-        run: |
-          mkdir -p out
-          cp src-tauri/target/${{ matrix.target }}/release/fwoosh out/
-          cd out && tar czf ../${{ matrix.artifact }}.tar.gz fwoosh
-
-      - name: Generate SHA-256 checksum
         shell: bash
         run: |
-          if [ -f "${{ matrix.artifact }}.zip" ]; then
-            sha256sum ${{ matrix.artifact }}.zip > ${{ matrix.artifact }}.sha256
-          else
-            shasum -a 256 ${{ matrix.artifact }}.tar.gz > ${{ matrix.artifact }}.sha256
+          set -euo pipefail
+          app_path="$(find "src-tauri/target/${{ matrix.target }}/release/bundle/macos" -type d -name '*.app' -prune -print -quit)"
+          if [ -z "$app_path" ]; then
+            echo "Expected a macOS app bundle to verify."
+            exit 1
+          fi
+          codesign --verify --deep --strict --verbose=2 "$app_path"
+          codesign --display --verbose=2 "$app_path"
+
+      - name: Build Windows installers
+        if: runner.os == 'Windows'
+        run: npm run build:windows
+
+      - name: Package Windows installers
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $bundleRoot = "src-tauri/target/${{ matrix.target }}/release/bundle"
+          $installers = Get-ChildItem -Path $bundleRoot -Recurse -File -ErrorAction Stop |
+            Where-Object { $_.Extension -eq '.msi' -or $_.Name -like '*-setup.exe' }
+          if ($installers.Count -ne 2) {
+            throw "Expected one MSI and one NSIS installer, found $($installers.Count)."
+          }
+
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          foreach ($installer in $installers) {
+            Copy-Item -LiteralPath $installer.FullName -Destination dist
+          }
+
+          $checksums = foreach ($installer in Get-ChildItem dist -File) {
+            $hash = (Get-FileHash $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash *$($installer.Name)"
+          }
+          $checksums | Set-Content -Path dist/fwoosh-windows.sha256 -Encoding ascii
+
+      - name: Package macOS bundles
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          bundle_root="src-tauri/target/${{ matrix.target }}/release/bundle"
+          app_path="$(find "$bundle_root/macos" -type d -name '*.app' -prune -print -quit)"
+          dmg_path="$(find "$bundle_root/dmg" -type f -name '*.dmg' -print -quit)"
+          if [ -z "$app_path" ] || [ -z "$dmg_path" ]; then
+            echo "Expected both a macOS app bundle and DMG installer."
+            exit 1
           fi
 
+          mkdir -p dist
+          cp "$dmg_path" dist/
+          ditto -c -k --sequesterRsrc --keepParent "$app_path" "dist/${{ matrix.artifact }}.app.zip"
+
+      - name: Generate macOS SHA-256 checksums
+        if: runner.os == 'macOS'
+        shell: bash
+        run: shasum -a 256 dist/*.dmg dist/*.app.zip > "dist/${{ matrix.artifact }}.sha256"
+
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: ${{ matrix.artifact }}
-          path: |
-            ${{ matrix.artifact }}.zip
-            ${{ matrix.artifact }}.tar.gz
-            ${{ matrix.artifact }}.sha256
+          path: dist/*
 
   release:
     name: Publish release
@@ -91,14 +127,13 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v3
         with:
           path: artifacts
-          merge-multiple: true
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*
+          files: artifacts/**/*
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

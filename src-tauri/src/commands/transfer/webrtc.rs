@@ -1,6 +1,7 @@
 //! WebRTC setup, data-channel framing, file finalization, and transfer cleanup.
 
 use super::*;
+use tauri_plugin_fs::{FsExt, OpenOptions};
 
 pub(crate) async fn new_peer_connection(
     stun_servers: Vec<String>,
@@ -124,9 +125,15 @@ pub(crate) async fn send_file_over_channel(
     session_id: String,
     payload: OutgoingFilePayload,
 ) -> Result<(), String> {
-    let mut file = tokio::fs::File::open(&payload.path)
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    let source = app
+        .fs()
+        .open(payload.path.clone(), options)
+        .map_err(|e| format!("Could not open source file: {e}"))?;
+    #[cfg(target_os = "ios")]
+    let _source_security_scope = IosSecurityScope::after_open(&app, payload.path.clone());
+    let mut file = tokio::fs::File::from_std(source);
     let cipher = XChaCha20Poly1305::new(&payload.content_key.into());
     let mut buf = vec![0u8; FILE_CHUNK_SIZE];
     let mut index = 0u64;
@@ -261,7 +268,7 @@ pub(crate) async fn handle_file_frame(
             Ok(())
         }
         FileFrame::Finish { sha256: expected } => {
-            let (session_id, final_path, part_path, file_name, total, computed) = {
+            let (session_id, final_path, final_destination, part_path, file_name, total, computed) = {
                 let mut guard = write_state.lock().await;
                 if guard.done {
                     return Ok(());
@@ -281,6 +288,7 @@ pub(crate) async fn handle_file_frame(
                 (
                     guard.session_id.clone(),
                     guard.final_path.clone(),
+                    guard.final_destination.clone(),
                     guard.part_path.clone(),
                     guard.file_name.clone(),
                     guard.total,
@@ -291,9 +299,20 @@ pub(crate) async fn handle_file_frame(
                 let _ = tokio::fs::remove_file(&part_path).await;
                 return Err("received file checksum did not match".to_string());
             }
-            finalize_received_file_no_overwrite(&part_path, &final_path).await?;
+            let completed_path = finalize_received_file(
+                &app,
+                &part_path,
+                final_path.as_deref(),
+                final_destination.as_ref(),
+            )
+            .await?;
             state.file_transfers.lock().await.remove(&session_id);
-            remember_completed_received_file(&state, &session_id, final_path.clone()).await;
+            if let Some(path) = completed_path.as_ref() {
+                remember_completed_received_file(&state, &session_id, path.clone()).await;
+            }
+            let completed_path = completed_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned());
             let _ = app.emit(
                 "file-transfer-complete",
                 serde_json::json!({
@@ -301,7 +320,7 @@ pub(crate) async fn handle_file_frame(
                     "file_name": file_name,
                     "size": total,
                     "sha256": hex::encode(expected),
-                    "path": final_path.to_string_lossy(),
+                    "path": completed_path,
                     "direction": "incoming"
                 }),
             );
@@ -401,6 +420,53 @@ pub(crate) async fn finalize_received_file_no_overwrite(
     tokio::fs::remove_file(part_path)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Finalize a verified download. Desktop keeps its atomic local-file save
+/// semantics. Mobile copies only verified bytes to the URI granted by the
+/// native save picker, so Android content providers and iOS document URLs
+/// work without changing the WebRTC/file-signal layer.
+pub(crate) async fn finalize_received_file(
+    app: &tauri::AppHandle,
+    part_path: &Path,
+    final_path: Option<&Path>,
+    final_destination: Option<&tauri_plugin_fs::FilePath>,
+) -> Result<Option<PathBuf>, String> {
+    match (final_path, final_destination) {
+        (Some(final_path), None) => {
+            finalize_received_file_no_overwrite(part_path, final_path).await?;
+            Ok(Some(final_path.to_path_buf()))
+        }
+        (None, Some(destination)) => {
+            let mut source = tokio::fs::File::open(part_path)
+                .await
+                .map_err(|e| e.to_string())?;
+            let mut options = OpenOptions::new();
+            options.read(false).write(true).truncate(true).create(true);
+            let destination_file = app
+                .fs()
+                .open(destination.clone(), options)
+                .map_err(|e| format!("Could not save received file: {e}"))?;
+            #[cfg(target_os = "ios")]
+            let _destination_security_scope =
+                IosSecurityScope::after_open(app, destination.clone());
+            let mut destination_file = tokio::fs::File::from_std(destination_file);
+            tokio::io::copy(&mut source, &mut destination_file)
+                .await
+                .map_err(|e| format!("Could not save received file: {e}"))?;
+            destination_file
+                .flush()
+                .await
+                .map_err(|e| format!("Could not save received file: {e}"))?;
+            drop(destination_file);
+            drop(source);
+            tokio::fs::remove_file(part_path)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(None)
+        }
+        _ => Err("received file has an invalid destination".to_string()),
+    }
 }
 
 pub(crate) fn spawn_transfer_timeout(

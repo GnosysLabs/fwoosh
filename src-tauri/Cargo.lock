@@ -78,6 +78,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "android-native-keyring-store"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48c6349ddff23194f8fdce2ea8849380f5a4868c1648965b70e801e104cba9b3"
+dependencies = [
+ "base64 0.22.1",
+ "jni 0.21.1",
+ "keyring-core",
+ "log",
+ "ndk-context",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1821,8 +1839,9 @@ dependencies = [
 
 [[package]]
 name = "fwoosh"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
+ "android-native-keyring-store",
  "apple-native-keyring-store",
  "base64 0.22.1",
  "bytes",
@@ -1833,7 +1852,7 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "hpke",
- "keyring",
+ "jni 0.21.1",
  "keyring-core",
  "postcard",
  "rand",
@@ -1845,10 +1864,13 @@ dependencies = [
  "sha2 0.11.0",
  "tauri",
  "tauri-build",
+ "tauri-plugin-barcode-scanner",
  "tauri-plugin-clipboard-manager",
  "tauri-plugin-dialog",
+ "tauri-plugin-fs",
  "tauri-plugin-global-shortcut",
  "tauri-plugin-notification",
+ "tauri-plugin-os",
  "tempfile",
  "tokio",
  "tokio-tungstenite",
@@ -2883,18 +2905,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "keyring"
-version = "4.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1daef93704e6f6506d5b273175189bf8a5e00371930387fb77fd871e15c0d94"
-dependencies = [
- "apple-native-keyring-store",
- "keyring-core",
- "windows-native-keyring-store",
- "zbus-secret-service-keyring-store",
-]
-
-[[package]]
 name = "keyring-core"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3170,6 +3180,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "ndk-context"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
+
+[[package]]
 name = "ndk-sys"
 version = "0.6.0+11769913"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3195,6 +3211,18 @@ dependencies = [
  "libc",
  "memoffset 0.7.1",
  "pin-utils",
+]
+
+[[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags 2.13.0",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
 ]
 
 [[package]]
@@ -3578,6 +3606,22 @@ checksum = "9aa2b01e1d916879f73a53d01d1d6cee68adbb31d6d9177a8cfce093cced1d50"
 dependencies = [
  "futures-core",
  "pin-project-lite",
+]
+
+[[package]]
+name = "os_info"
+version = "3.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9cf20a545b305cf1da722b236b5155c9bb35f1d5ceb28c048bd96ca842f41b5b"
+dependencies = [
+ "android_system_properties",
+ "log",
+ "nix 0.31.3",
+ "objc2",
+ "objc2-foundation",
+ "objc2-ui-kit",
+ "serde",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5222,6 +5266,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sys-locale"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8eab9a99a024a169fe8a903cf9d4a3b3601109bcc13bd9e3c6fff259138626c4"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "system-configuration"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5443,6 +5496,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tauri-plugin-barcode-scanner"
+version = "2.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3b68f0e3782b61a6e16a67380be40226e2b7233f3e36dadf6e5d03f07d2e7b3"
+dependencies = [
+ "log",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-plugin",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "tauri-plugin-clipboard-manager"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5531,6 +5598,24 @@ dependencies = [
  "thiserror 2.0.18",
  "time",
  "url",
+]
+
+[[package]]
+name = "tauri-plugin-os"
+version = "2.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8f08346c8deb39e96f86973da0e2d76cbb933d7ac9b750f6dc4daf955a6f997"
+dependencies = [
+ "gethostname",
+ "log",
+ "os_info",
+ "serde",
+ "serde_json",
+ "serialize-to-javascript",
+ "sys-locale",
+ "tauri",
+ "tauri-plugin",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -6773,7 +6858,7 @@ dependencies = [
  "ipnet",
  "lazy_static",
  "log",
- "nix",
+ "nix 0.26.4",
  "portable-atomic",
  "rand",
  "thiserror 1.0.69",

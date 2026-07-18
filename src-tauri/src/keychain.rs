@@ -10,7 +10,7 @@
 //! the standard limitation of credential storage; see the threat model.
 
 use crate::crypto::DeviceKeypairs;
-use keyring::Entry;
+use keyring_core::{Entry, Error as KeyringError};
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -66,13 +66,26 @@ fn init_platform_store() -> Result<(), String> {
     let store = apple_native_keyring_store::keychain::Store::new().map_err(|e| e.to_string())?;
     #[cfg(target_os = "windows")]
     let store = windows_native_keyring_store::Store::new().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "ios")]
+    let store = apple_native_keyring_store::protected::Store::new().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "android")]
+    let store = android_native_keyring_store::Store::new().map_err(|e| e.to_string())?;
     #[cfg(all(
         unix,
         not(any(target_os = "macos", target_os = "ios", target_os = "android"))
     ))]
     let store = zbus_secret_service_keyring_store::Store::new().map_err(|e| e.to_string())?;
 
-    #[cfg(all(any(unix, windows), not(any(target_os = "ios", target_os = "android"))))]
+    #[cfg(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        all(
+            unix,
+            not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+        )
+    ))]
     keyring_core::set_default_store(store);
 
     Ok(())
@@ -118,7 +131,7 @@ fn get_secret(name: &str) -> Result<Vec<u8>, KeychainError> {
     match Entry::new(SERVICE, name) {
         Ok(entry) => match entry.get_secret() {
             Ok(blob) => Ok(blob),
-            Err(keyring::Error::NoEntry) => fallback_read(name),
+            Err(KeyringError::NoEntry) => fallback_read(name),
             Err(e) => {
                 // Keychain read failures fail closed unless the development
                 // file fallback is explicitly enabled.

@@ -3,10 +3,34 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import {
+    Format,
+    checkPermissions as checkCameraPermissions,
+    requestPermissions as requestCameraPermissions,
+    scan,
+  } from "@tauri-apps/plugin-barcode-scanner";
+  import { confirm } from "@tauri-apps/plugin-dialog";
   import { isPermissionGranted, requestPermission } from "@tauri-apps/plugin-notification";
+  import { platform } from "@tauri-apps/plugin-os";
+  import { marked } from "marked";
   import QRCode from "qrcode";
+  import privacyPolicyMarkdown from "../../docs/privacy-policy.md?raw";
+  import termsOfUseMarkdown from "../../docs/terms-of-use.md?raw";
+  import { APP_VERSION } from "$lib/version";
 
   type Theme = "hacker" | "light" | "onyx" | "melanzana";
+  type LegalDocument = "terms" | "privacy";
+
+  const legalDocuments = {
+    terms: {
+      title: "Terms of Use",
+      html: marked.parse(termsOfUseMarkdown, { async: false }) as string,
+    },
+    privacy: {
+      title: "Privacy Policy",
+      html: marked.parse(privacyPolicyMarkdown, { async: false }) as string,
+    },
+  } as const;
 
   // ---- State ----
   let text = $state("");
@@ -37,6 +61,7 @@
   let devices = $state<DeviceDto[]>([]);
   let theme = $state<Theme>("hacker");
   let settingsOpen = $state(false);
+  let legalDocument = $state<LegalDocument | null>(null);
   let syncGroups = $state<SyncGroupDto[]>([]);
   let switchingGroup = $state(false);
   let syncGroupNameDraft = $state("");
@@ -56,6 +81,11 @@
   let stunServersText = $state("");
   let transferTimeoutMinutes = $state(60);
   let savingNetwork = $state(false);
+  let isMobile = $state(false);
+  let scanningPairingCode = $state(false);
+  let scanFeedback = $state("");
+  let scanFeedbackTarget = $state<"join" | "new-group" | null>(null);
+  let scanFeedbackIsError = $state(false);
   let fileHover = $state(false);
   let pendingFile = $state<DroppedFile | null>(null);
   let sendingFile = $state(false);
@@ -94,6 +124,7 @@
       savingNetwork ||
       creatingSyncGroup
   );
+  let activeLegalDocument = $derived(legalDocument ? legalDocuments[legalDocument] : null);
   let logoSrc = $derived(
     theme === "light"
       ? "/fwoosh_dark.webp"
@@ -225,13 +256,17 @@
   }
   interface ConfettiPiece {
     id: number;
-    x: number;
+    originX: number;
+    burstX: number;
+    burstY: number;
     drift: number;
     delay: number;
     duration: number;
     rotation: number;
+    midRotation: number;
     color: string;
-    round: boolean;
+    shape: "ribbon" | "dot" | "spark" | "star";
+    scale: number;
   }
 
   // ---- Load recent clips on mount + listen for events ----
@@ -241,6 +276,12 @@
     pairingTickTimer = setInterval(() => {
       nowSeconds = Math.floor(Date.now() / 1000);
     }, 1000);
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void refreshPendingFileOffers();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
 
     const savedTheme = localStorage.getItem("fwoosh-theme");
     const preferredTheme =
@@ -257,6 +298,12 @@
     setTheme(preferredTheme);
 
     (async () => {
+      try {
+        const currentPlatform = await platform();
+        isMobile = currentPlatform === "android" || currentPlatform === "ios";
+      } catch {
+        isMobile = false;
+      }
       try {
         deviceLabel = await invoke<string>("suggest_device_label");
         deviceLabelDraft = deviceLabel;
@@ -286,21 +333,23 @@
           void handleIncomingClip(e.payload as ToastInfo);
         })
       );
-      unlisteners.push(
-        await getCurrentWindow().onDragDropEvent((event) => {
-          const payload = event.payload as
-            | { type: "over"; position: { x: number; y: number } }
-            | { type: "drop"; paths: string[]; position: { x: number; y: number } }
-            | { type: "cancel" };
-          if (payload.type === "over") {
-            fileHover = true;
-          } else if (payload.type === "drop") {
-            fileHover = false;
-          } else {
-            fileHover = false;
-          }
-        })
-      );
+      if (!isMobile) {
+        unlisteners.push(
+          await getCurrentWindow().onDragDropEvent((event) => {
+            const payload = event.payload as
+              | { type: "over"; position: { x: number; y: number } }
+              | { type: "drop"; paths: string[]; position: { x: number; y: number } }
+              | { type: "cancel" };
+            if (payload.type === "over") {
+              fileHover = true;
+            } else if (payload.type === "drop") {
+              fileHover = false;
+            } else {
+              fileHover = false;
+            }
+          })
+        );
+      }
       unlisteners.push(
         await listen("file-drop-granted", (e) => {
           void handleDroppedFile(e.payload as FileDropGrantDto);
@@ -350,6 +399,7 @@
           transfers = {};
           expandedTransferIds = new Set();
           dismissedTransferIds = new Set();
+          await refreshPendingFileOffers();
         })
       );
       unlisteners.push(
@@ -413,6 +463,7 @@
           failTransfer(e.payload as FileTransferProgressDto);
         })
       );
+      await refreshPendingFileOffers();
     })();
 
     return () => {
@@ -423,6 +474,7 @@
       stopPendingJoinPolling();
       clearStatusTimer();
       clearConfettiTimer();
+      document.removeEventListener("visibilitychange", onVisibilityChange);
       unlisteners.forEach((u) => void u());
     };
   });
@@ -454,22 +506,39 @@
       return;
     }
 
-    const palette = ["var(--accent)", "var(--mint)", "var(--text-strong)"];
+    const palette = [
+      "var(--accent)",
+      "var(--mint)",
+      "var(--text-strong)",
+      "#ffd166",
+      "#ff6b8a",
+      "#65d8ff",
+    ];
+    const shapes: ConfettiPiece["shape"][] = ["ribbon", "dot", "spark", "star"];
     const run = Date.now();
-    confettiPieces = Array.from({ length: 36 }, (_, index) => ({
-      id: run + index,
-      x: 5 + ((index * 37) % 90),
-      drift: -54 + ((index * 29) % 109),
-      delay: (index % 9) * 32,
-      duration: 1040 + ((index * 47) % 520),
-      rotation: 280 + ((index * 83) % 520),
-      color: palette[index % palette.length],
-      round: index % 5 === 0,
-    }));
+    confettiPieces = Array.from({ length: 64 }, (_, index) => {
+      const fromLeft = index % 2 === 0;
+      const direction = fromLeft ? 1 : -1;
+      const random = () => Math.random();
+      return {
+        id: run + index,
+        originX: fromLeft ? 7 + random() * 8 : 85 + random() * 8,
+        burstX: direction * (42 + random() * 150),
+        burstY: -(150 + random() * 260),
+        drift: direction * (-40 + random() * 130),
+        delay: random() * 180,
+        duration: 1500 + random() * 900,
+        rotation: direction * (420 + random() * 920),
+        midRotation: direction * (175 + random() * 390),
+        color: palette[Math.floor(random() * palette.length)],
+        shape: shapes[Math.floor(random() * shapes.length)],
+        scale: 0.7 + random() * 0.8,
+      };
+    });
     confettiTimer = setTimeout(() => {
       confettiPieces = [];
       confettiTimer = null;
-    }, 1900);
+    }, 2800);
   }
 
   function showStatus(next: "ok" | "err", message: string, durationMs = next === "err" ? 10000 : 2000) {
@@ -638,6 +707,7 @@
       }
     } finally {
       acceptingFile = false;
+      void refreshPendingFileOffers();
     }
   }
 
@@ -668,6 +738,22 @@
     };
   }
 
+  // Rehydrate pending offers after a mobile webview resumes. Offers remain
+  // bound to their sync group, so stale offers are declined rather than being
+  // shown in another group's UI.
+  async function refreshPendingFileOffers() {
+    try {
+      const offers = await invoke<FileOfferDto[]>("pending_file_offers");
+      const activeSession = incomingFileOffer?.session_id;
+      if (activeSession && !offers.some((offer) => offer.session_id === activeSession)) {
+        incomingFileOffer = null;
+      }
+      for (const offer of offers) trackIncomingFileOffer(offer);
+    } catch {
+      // The transfer layer can still be initialising on startup.
+    }
+  }
+
   async function rejectIncomingFile() {
     if (!incomingFileOffer) return;
     const offer = incomingFileOffer;
@@ -690,6 +776,8 @@
       await invoke("reject_file_transfer", { sessionId: offer.session_id });
     } catch {
       /* best effort */
+    } finally {
+      void refreshPendingFileOffers();
     }
   }
 
@@ -796,7 +884,12 @@
         transferred: Number(payload.size ?? existing?.total ?? 0),
         total: Number(payload.size ?? existing?.total ?? 0),
         status: "complete",
-        message: "Complete",
+        message:
+          isMobile &&
+          normalizeTransferDirection(String(payload.direction ?? existing?.direction ?? "unknown")) ===
+            "incoming"
+            ? "Saved to selected location"
+            : "Complete",
         path:
           typeof payload.path === "string" && payload.path.length > 0
             ? payload.path
@@ -1030,9 +1123,10 @@
     await copyText(pairingUri, "Pairing code copied");
   }
 
-  async function hidePopup() {
+  async function minimizePopup() {
     settingsOpen = false;
-    await getCurrentWindow().hide();
+    if (isMobile) return;
+    await invoke("dismiss_main_window");
   }
 
   function openDevicesView() {
@@ -1054,8 +1148,17 @@
     settingsOpen = false;
   }
 
+  function openLegalDocument(document: LegalDocument) {
+    settingsOpen = false;
+    legalDocument = document;
+  }
+
+  function closeLegalDocument() {
+    legalDocument = null;
+  }
+
   function startLogoDrag(e: MouseEvent) {
-    if (e.button !== 0 || !/^Mac/.test(navigator.platform)) return;
+    if (isMobile || e.button !== 0 || !/^Mac/.test(navigator.platform)) return;
     e.preventDefault();
     void getCurrentWindow().startDragging();
   }
@@ -1193,7 +1296,7 @@
     const detail = deletingAsAdmin
       ? "This deletes the group data stored on this device."
       : "This device will stop receiving anything sent to the group.";
-    if (!confirm(`${action} “${groupName}” on this device?\n\n${detail}`)) return;
+    if (!(await confirm(`${action} “${groupName}” on this device?\n\n${detail}`))) return;
     removingSyncGroup = true;
     settingsOpen = false;
     try {
@@ -1240,9 +1343,9 @@
     if (!activeSyncGroup || groupTransitionBusy) return;
     const groupId = activeSyncGroup.id;
     if (
-      !confirm(
+      !(await confirm(
         "Revoke the reusable invitation for this group? Paired devices stay connected. You can create a fresh invitation later."
-      )
+      ))
     ) {
       return;
     }
@@ -1485,6 +1588,7 @@
   }
 
   async function windowAttentionState() {
+    if (isMobile) return { notify: false, revealForCopy: false };
     try {
       const win = getCurrentWindow();
       const [visible, minimized, focused] = await Promise.all([
@@ -1502,6 +1606,7 @@
   }
 
   async function showMainWindow() {
+    if (isMobile) return;
     try {
       await invoke("show_main_window");
     } catch {
@@ -1537,6 +1642,10 @@
       send();
     }
     if (e.key === "Escape") {
+      if (legalDocument) {
+        closeLegalDocument();
+        return;
+      }
       if (settingsOpen) {
         settingsOpen = false;
         return;
@@ -1569,7 +1678,7 @@
         closeDevicesView();
         return;
       }
-      void hidePopup();
+      if (!isMobile) void minimizePopup();
     }
   }
 
@@ -1593,10 +1702,57 @@
     }
   }
 
+  async function scanPairingCode(target: "join" | "new-group") {
+    if (!isMobile || scanningPairingCode) return;
+    scanningPairingCode = true;
+    scanFeedback = "";
+    scanFeedbackTarget = target;
+    scanFeedbackIsError = false;
+    try {
+      let permission = await checkCameraPermissions();
+      if (permission !== "granted") permission = await requestCameraPermissions();
+      if (permission !== "granted") {
+        const message = "Camera access is needed to scan a pairing code";
+        scanFeedback = message;
+        scanFeedbackIsError = true;
+        showStatus("err", message);
+        return;
+      }
+      const result = await scan({
+        cameraDirection: "back",
+        formats: [Format.QRCode],
+      });
+      const scanned = result.content.trim();
+      if (!scanned.startsWith("fwoosh://pair")) {
+        const message = "That QR code is not a Fwoosh pairing invitation";
+        scanFeedback = message;
+        scanFeedbackIsError = true;
+        showStatus("err", message);
+        return;
+      }
+      if (target === "join") {
+        joinUri = scanned;
+      } else {
+        newSyncGroupCode = scanned;
+      }
+      scanFeedback = "Pairing invitation scanned";
+      showStatus("ok", scanFeedback);
+    } catch (e) {
+      // Native scanners reject when dismissed; a deliberate cancel should not
+      // be presented as a pairing failure.
+      if (String(e).toLowerCase().includes("cancel")) return;
+      scanFeedback = `Could not scan pairing code: ${String(e)}`;
+      scanFeedbackIsError = true;
+      showStatus("err", scanFeedback);
+    } finally {
+      scanningPairingCode = false;
+    }
+  }
+
   async function revokeDevice(id: string) {
     if (!activeSyncGroup || groupTransitionBusy) return;
     const groupId = activeSyncGroup.id;
-    if (!confirm("Remove this device from the group?")) return;
+    if (!(await confirm("Remove this device from the group?"))) return;
     removingDeviceId = id;
     try {
       await invoke("revoke_device", { deviceId: id, groupId });
@@ -1611,9 +1767,9 @@
 
 <svelte:window on:keydown={onKeydown} on:click={closeSettingsOnOutsideClick} />
 
-<div class="card" class:file-hover={fileHover} data-tauri-drag-region>
-  <header class="header" data-tauri-drag-region>
-    <div class="title" role="presentation" data-tauri-drag-region onmousedown={startLogoDrag}>
+<div class="card" class:mobile={isMobile} class:file-hover={fileHover} data-tauri-drag-region={isMobile ? undefined : ""}>
+  <header class="header" data-tauri-drag-region={isMobile ? undefined : ""}>
+    <div class="title" role="presentation" data-tauri-drag-region={isMobile ? undefined : ""} onmousedown={startLogoDrag}>
       <img
         class="brand-logo"
         src={logoSrc}
@@ -1621,7 +1777,7 @@
         width="112"
         height="32"
         draggable="false"
-        data-tauri-drag-region
+        data-tauri-drag-region={isMobile ? undefined : ""}
       />
     </div>
     <div class="tabs">
@@ -1658,14 +1814,21 @@
           />
         </svg>
       </button>
-      <button class="icon-btn close-btn" aria-label="Hide Fwoosh" title="Hide Fwoosh" onclick={hidePopup}>
-        <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
-          <path d="M6 6l12 12" />
-          <path d="M18 6 6 18" />
-        </svg>
-      </button>
+      {#if !isMobile}
+        <button class="icon-btn minimize-btn" aria-label="Minimize Fwoosh" title="Minimize Fwoosh" onclick={minimizePopup}>
+          <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M6 12h12" />
+          </svg>
+        </button>
+      {/if}
       {#if settingsOpen}
         <div bind:this={settingsMenu} class="settings-menu" data-tauri-drag-region="false">
+          {#if isMobile}
+            <div class="mobile-settings-header">
+              <span class="mobile-settings-title">Settings</span>
+              <button class="mobile-settings-done" onclick={() => (settingsOpen = false)}>Done</button>
+            </div>
+          {/if}
           <div class="settings-section">
             <div class="settings-title">Color scheme</div>
             <div class="scheme-toggle" role="radiogroup" aria-label="Color scheme">
@@ -1723,6 +1886,14 @@
               {savingNetwork ? "Saving..." : "Save connection settings"}
             </button>
           </div>
+          <div class="settings-section">
+            <div class="settings-title">Legal</div>
+            <div class="settings-legal-actions">
+              <button class="mini-action full" onclick={() => openLegalDocument("terms")}>Terms of Use</button>
+              <button class="mini-action full" onclick={() => openLegalDocument("privacy")}>Privacy Policy</button>
+            </div>
+          </div>
+          <div class="settings-version">Fwoosh {APP_VERSION}</div>
         </div>
       {/if}
     </div>
@@ -1837,8 +2008,18 @@
               autocomplete="off"
               spellcheck="false"
               onkeydown={(e) => e.key === "Enter" && joinRoom()} />
+            {#if isMobile}
+              <button
+                class="ghost scan-pair-btn"
+                onclick={() => void scanPairingCode("join")}
+                disabled={scanningPairingCode}
+              >{scanningPairingCode && scanFeedbackTarget === "join" ? "Scanning..." : "Scan QR"}</button>
+            {/if}
             <button class="ghost" onclick={joinRoom} disabled={!joinUri.trim()}>Request to join</button>
           </div>
+          {#if isMobile && scanFeedbackTarget === "join" && scanFeedback}
+            <p class="scan-feedback" class:err={scanFeedbackIsError} role="status">{scanFeedback}</p>
+          {/if}
         </div>
       {/if}
     </div>
@@ -2207,7 +2388,7 @@
                   {/if}
                 </span>
                 <div class="transfer-actions">
-                  {#if t.status === "complete" && t.direction === "incoming" && t.path}
+                  {#if !isMobile && t.status === "complete" && t.direction === "incoming" && t.path}
                     <button
                       class="transfer-reveal"
                       aria-label={`Show ${t.file_name} in file manager`}
@@ -2363,6 +2544,51 @@
     </div>
   {/if}
 
+  {#if isMobile}
+    <nav class="mobile-nav" aria-label="Main navigation">
+      <button class:active={activeView === "compose"} onclick={() => (activeView = "compose")}>Send</button>
+      <button class:active={activeView === "history"} onclick={() => (activeView = "history")}>History</button>
+      <button class:active={activeView === "files"} onclick={() => (activeView = "files")}>Files</button>
+      <button
+        class:active={activeView === "devices"}
+        disabled={!activeSyncGroup}
+        onclick={openDevicesView}>Devices</button
+      >
+    </nav>
+  {/if}
+
+  {#if activeLegalDocument}
+    <div
+      class="modal-overlay"
+      role="presentation"
+      onclick={closeLegalDocument}
+      onkeydown={(event) => {
+        if (event.key === "Escape") closeLegalDocument();
+      }}
+    >
+      <div
+        class="legal-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="legal-dialog-title"
+        tabindex="-1"
+        onclick={(event) => event.stopPropagation()}
+        onkeydown={(event) => event.stopPropagation()}
+      >
+        <header class="legal-dialog-header">
+          <h3 id="legal-dialog-title">{activeLegalDocument.title}</h3>
+          <button class="icon-btn" aria-label="Close legal document" title="Close" onclick={closeLegalDocument}>
+            <svg class="icon-svg" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M6 6l12 12" />
+              <path d="M18 6 6 18" />
+            </svg>
+          </button>
+        </header>
+        <div class="legal-content">{@html activeLegalDocument.html}</div>
+      </div>
+    </div>
+  {/if}
+
   {#if newSyncGroupOpen}
     <div
       class="modal-overlay"
@@ -2407,6 +2633,16 @@
           placeholder="Paste a pairing code to join…"
           bind:value={newSyncGroupCode}
         ></textarea>
+        {#if isMobile}
+          <button
+            class="ghost scan-pair-btn"
+            onclick={() => void scanPairingCode("new-group")}
+            disabled={scanningPairingCode}
+          >{scanningPairingCode && scanFeedbackTarget === "new-group" ? "Scanning..." : "Scan QR invitation"}</button>
+          {#if scanFeedbackTarget === "new-group" && scanFeedback}
+            <p class="scan-feedback" class:err={scanFeedbackIsError} role="status">{scanFeedback}</p>
+          {/if}
+        {/if}
         <div class="dialog-actions">
           <button class="ghost" onclick={() => (newSyncGroupOpen = false)} disabled={creatingSyncGroup}>
             Cancel
@@ -2831,9 +3067,8 @@
     <div class="confetti-layer" aria-hidden="true">
       {#each confettiPieces as piece (piece.id)}
         <span
-          class="confetti-piece"
-          class:round={piece.round}
-          style={`--confetti-x: ${piece.x}%; --confetti-drift: ${piece.drift}px; --confetti-delay: ${piece.delay}ms; --confetti-duration: ${piece.duration}ms; --confetti-rotation: ${piece.rotation}deg; --confetti-color: ${piece.color};`}
+          class="confetti-piece {piece.shape}"
+          style={`--confetti-origin-x: ${piece.originX}%; --confetti-burst-x: ${piece.burstX}px; --confetti-burst-y: ${piece.burstY}px; --confetti-drift: ${piece.drift}px; --confetti-delay: ${piece.delay}ms; --confetti-duration: ${piece.duration}ms; --confetti-mid-rotation: ${piece.midRotation}deg; --confetti-rotation: ${piece.rotation}deg; --confetti-color: ${piece.color}; --confetti-scale: ${piece.scale};`}
         ></span>
       {/each}
     </div>
@@ -2973,7 +3208,7 @@
     color: #f4f4f5;
     outline: none;
   }
-  .close-btn {
+  .minimize-btn {
     color: #c4c4cc;
   }
   .icon-svg {
@@ -4599,15 +4834,15 @@
     outline: none;
     transform: translateY(-1px);
   }
-  .close-btn {
-    background: var(--danger-panel);
-    border-color: var(--danger-line);
-    color: var(--danger);
+  .minimize-btn {
+    background: var(--field-strong);
+    border-color: var(--line);
+    color: var(--muted);
   }
-  .close-btn:hover,
-  .close-btn:focus-visible {
-    border-color: var(--danger);
-    color: var(--danger);
+  .minimize-btn:hover,
+  .minimize-btn:focus-visible {
+    border-color: var(--line-strong);
+    color: var(--text-strong);
   }
 
   .settings-menu {
@@ -6653,41 +6888,63 @@
   }
   .confetti-piece {
     position: absolute;
-    top: -14px;
-    left: var(--confetti-x);
-    width: 5px;
-    height: 9px;
-    border-radius: 1px;
+    top: 88%;
+    left: var(--confetti-origin-x);
+    width: 6px;
+    height: 12px;
+    border-radius: 2px;
     background: var(--confetti-color);
     opacity: 0;
-    animation: confetti-fall var(--confetti-duration)
-      cubic-bezier(0.22, 0.74, 0.23, 1) var(--confetti-delay) both;
+    box-shadow: 0 0 8px color-mix(in srgb, var(--confetti-color) 42%, transparent);
+    animation: confetti-burst var(--confetti-duration)
+      cubic-bezier(0.16, 0.76, 0.34, 1) var(--confetti-delay) both;
     will-change: transform, opacity;
   }
-  .confetti-piece.round {
-    width: 6px;
-    height: 6px;
+  .confetti-piece.dot {
+    width: 7px;
+    height: 7px;
     border-radius: 50%;
   }
-  @keyframes confetti-fall {
+  .confetti-piece.spark {
+    width: 3px;
+    height: 15px;
+    border-radius: 999px;
+  }
+  .confetti-piece.star {
+    width: 11px;
+    height: 11px;
+    clip-path: polygon(50% 0, 61% 35%, 100% 50%, 63% 63%, 50% 100%, 37% 63%, 0 50%, 35% 37%);
+  }
+  @keyframes confetti-burst {
     0% {
       opacity: 0;
-      transform: translate3d(-50%, -14px, 0) rotate(0deg);
+      transform: translate3d(-50%, 18px, 0) rotate(0deg) scale(0.2);
     }
-    10% {
+    8% {
       opacity: 1;
     }
-    82% {
+    38% {
+      opacity: 1;
+      transform: translate3d(
+          calc(-50% + var(--confetti-burst-x)),
+          var(--confetti-burst-y),
+          0
+        )
+        rotate(var(--confetti-mid-rotation))
+        scale(var(--confetti-scale)) scaleX(-0.55);
+    }
+    72% {
       opacity: 1;
     }
     100% {
       opacity: 0;
       transform: translate3d(
-          calc(-50% + var(--confetti-drift)),
-          calc(100vh + 28px),
+          calc(-50% + var(--confetti-burst-x) + var(--confetti-drift)),
+          22vh,
           0
         )
-        rotate(var(--confetti-rotation));
+        rotate(var(--confetti-rotation))
+        scale(var(--confetti-scale)) scaleX(0.35);
     }
   }
 
@@ -6724,6 +6981,347 @@
       grid-template-columns: 1fr auto;
     }
     .tabs {
+      display: none;
+    }
+  }
+
+  /* Mobile keeps the desktop visual system intact while exchanging the tray
+     popup for a safe-area-aware, touch-first application shell. */
+  .card.mobile {
+    --window-radius: 0;
+    --window-stroke-inset: 0;
+    --footer-safe: calc(126px + env(safe-area-inset-bottom));
+    width: 100vw;
+    min-width: 0;
+    min-height: 100dvh;
+    height: 100dvh;
+    border-radius: 0;
+    background: var(--shell-bg);
+  }
+  .card.mobile::before {
+    display: none;
+  }
+  .card.mobile .header {
+    grid-template-columns: minmax(0, 1fr) auto;
+    min-height: 64px;
+    padding: calc(10px + env(safe-area-inset-top)) 18px 10px;
+    -webkit-app-region: no-drag;
+  }
+  .card.mobile .title,
+  .card.mobile .brand-logo {
+    -webkit-app-region: no-drag;
+  }
+  .card.mobile .tabs,
+  .card.mobile .minimize-btn {
+    display: none;
+  }
+  .card.mobile .window-actions {
+    gap: 0;
+  }
+  .card.mobile .icon-btn {
+    width: 44px;
+    height: 44px;
+  }
+  .card.mobile .settings-menu {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    width: auto;
+    max-width: none;
+    max-height: none;
+    margin: 0;
+    padding: calc(20px + env(safe-area-inset-top)) 20px
+      calc(96px + env(safe-area-inset-bottom));
+    border: 0;
+    border-radius: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    background: var(--panel);
+  }
+  .mobile-settings-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    min-height: 44px;
+    margin: 0 0 20px;
+  }
+  .mobile-settings-title {
+    color: var(--text-strong);
+    font-size: 18px;
+    font-weight: 800;
+  }
+  .mobile-settings-done {
+    min-width: 64px;
+    min-height: 44px;
+    padding: 0 14px;
+    border: 1px solid var(--accent);
+    border-radius: 10px;
+    background: transparent;
+    color: var(--accent);
+    font: inherit;
+    font-weight: 800;
+  }
+  .settings-version {
+    margin-top: 18px;
+    color: var(--muted-soft);
+    font-size: 11px;
+    text-align: center;
+  }
+  .card.mobile .compose,
+  .card.mobile .history,
+  .card.mobile .files {
+    min-height: 0;
+    padding: 16px 18px var(--footer-safe);
+  }
+  .card.mobile .compose {
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+  .card.mobile .box {
+    min-height: max(220px, 42dvh);
+    flex: 0 0 auto;
+    padding: 16px;
+    font-size: 16px;
+  }
+  .card.mobile .compose-controls {
+    flex-wrap: wrap;
+    min-height: 50px;
+  }
+  .card.mobile .network-target {
+    min-height: 44px;
+  }
+  .card.mobile .send-btn,
+  .card.mobile .ghost,
+  .card.mobile .pair-btn,
+  .card.mobile .mini-action,
+  .card.mobile .revoke-btn,
+  .card.mobile .transfer-cancel,
+  .card.mobile .transfer-detail-toggle,
+  .card.mobile .danger-icon-btn,
+  .card.mobile .devices-back {
+    min-height: 44px;
+  }
+  .card.mobile .join-input,
+  .card.mobile .settings-input,
+  .card.mobile .settings-textarea {
+    min-height: 44px;
+    font-size: 16px;
+  }
+  .scan-pair-btn {
+    min-width: 104px;
+  }
+  .scan-feedback {
+    margin: 7px 0 0;
+    color: var(--accent);
+    font-size: 13px;
+    line-height: 1.35;
+  }
+  .scan-feedback.err {
+    color: var(--danger);
+  }
+  .card.mobile .history,
+  .card.mobile .files {
+    overflow: hidden;
+  }
+  .card.mobile .clip-list,
+  .card.mobile .transfer-list {
+    min-height: 0;
+    max-height: none;
+    flex: 1;
+  }
+  .card.mobile .clip-body,
+  .card.mobile .clip-del {
+    min-height: 48px;
+  }
+  .card.mobile .devices-view {
+    min-height: 0;
+    padding: 0 18px var(--footer-safe);
+    overflow: hidden;
+  }
+  .card.mobile .devices-view-scroll {
+    min-height: 0;
+    max-height: none;
+    padding-bottom: 18px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+  .card.mobile .devices-view-heading,
+  .card.mobile .devices-section,
+  .card.mobile .network-target,
+  .card.mobile .device-row {
+    min-height: 44px;
+  }
+  .card.mobile .utility-footer {
+    left: 16px;
+    right: 16px;
+    bottom: calc(66px + env(safe-area-inset-bottom));
+    min-height: 44px;
+  }
+  .card.mobile .footer-tool,
+  .card.mobile .footer-tools .private-toggle {
+    width: auto;
+    min-width: 44px;
+    height: 44px;
+    padding: 0 12px;
+    gap: 7px;
+    border: 1px solid var(--line-soft);
+    border-radius: 999px;
+    background: var(--panel-raised);
+    color: var(--text);
+    font-size: 12px;
+    font-weight: 800;
+  }
+  .card.mobile .footer-tool .icon-svg,
+  .card.mobile .footer-tools .private-toggle > .icon-svg {
+    width: 18px;
+    height: 18px;
+  }
+  .card.mobile .footer-security {
+    min-height: 44px;
+  }
+  .mobile-nav {
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 20;
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 5px;
+    box-sizing: border-box;
+    min-height: calc(64px + env(safe-area-inset-bottom));
+    padding: 8px 12px calc(8px + env(safe-area-inset-bottom));
+    border-top: 1px solid var(--line);
+    background: var(--panel);
+    box-shadow: 0 -12px 28px rgba(0, 0, 0, 0.16);
+  }
+  .mobile-nav button {
+    min-height: 44px;
+    border: 1px solid transparent;
+    border-radius: 14px;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-size: 11px;
+    font-weight: 800;
+  }
+  .mobile-nav button.active {
+    border-color: var(--line-strong);
+    background: var(--mint-panel);
+    color: var(--accent);
+  }
+  .mobile-nav button:disabled {
+    opacity: 0.42;
+  }
+  .card.mobile .pairing-overlay,
+  .card.mobile .modal-overlay {
+    align-items: flex-end;
+    padding-bottom: env(safe-area-inset-bottom);
+    box-sizing: border-box;
+  }
+  .card.mobile .pairing-card,
+  .card.mobile .confirm-dialog,
+  .card.mobile .transfer-dialog {
+    width: 100%;
+    max-width: none;
+    max-height: calc(100dvh - env(safe-area-inset-top) - 12px);
+    margin: 0;
+    padding: 22px 20px;
+    border-right: 0;
+    border-bottom: 0;
+    border-left: 0;
+    border-radius: 26px 26px 0 0;
+    overflow-y: auto;
+  }
+  .card.mobile .pairing-card .send-btn,
+  .card.mobile .dialog-actions .send-btn {
+    min-height: 44px;
+  }
+  .settings-legal-actions {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+  }
+  .legal-dialog {
+    width: min(390px, calc(100% - 28px));
+    max-height: calc(100% - 28px);
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--panel);
+    color: var(--text);
+    box-shadow: 0 24px 54px rgba(0, 0, 0, 0.46);
+  }
+  .legal-dialog-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    min-height: 48px;
+    padding: 6px 8px 6px 16px;
+    border-bottom: 1px solid var(--line);
+  }
+  .legal-dialog-header h3 {
+    margin: 0;
+    color: var(--text-strong);
+    font-size: 15px;
+  }
+  .legal-content {
+    min-height: 0;
+    padding: 4px 18px 20px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    scrollbar-width: thin;
+    font-size: 12px;
+    line-height: 1.55;
+  }
+  .legal-content :global(h1) {
+    margin: 16px 0 8px;
+    color: var(--text-strong);
+    font-size: 18px;
+  }
+  .legal-content :global(h2) {
+    margin: 18px 0 6px;
+    color: var(--text-strong);
+    font-size: 14px;
+  }
+  .legal-content :global(p),
+  .legal-content :global(ul) {
+    margin: 7px 0;
+  }
+  .legal-content :global(ul) {
+    padding-left: 18px;
+  }
+  .legal-content :global(a) {
+    color: var(--accent);
+  }
+  .legal-content :global(blockquote) {
+    margin: 10px 0;
+    padding: 1px 10px;
+    border-left: 3px solid var(--line-strong);
+    color: var(--muted);
+  }
+  :global(html[data-theme="light"]) .legal-dialog {
+    border-color: #cbd8e8;
+    background: #ffffff;
+    box-shadow: 0 18px 40px rgba(30, 41, 59, 0.2);
+  }
+  :global(html[data-theme="light"]) .legal-dialog-header {
+    border-bottom-color: #d8e2ef;
+  }
+  .card.mobile .legal-dialog {
+    width: 100%;
+    max-height: calc(100dvh - env(safe-area-inset-top) - 12px);
+    border-right: 0;
+    border-bottom: 0;
+    border-left: 0;
+    border-radius: 26px 26px 0 0;
+  }
+  @media (hover: none) {
+    .card.mobile .private-tooltip {
       display: none;
     }
   }

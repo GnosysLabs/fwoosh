@@ -8,16 +8,23 @@ pub mod roster;
 pub mod store;
 
 use commands::AppState;
-use std::path::PathBuf;
 use std::sync::Arc;
+use tauri::{Emitter, Manager};
+
+#[cfg(desktop)]
+use std::path::PathBuf;
+#[cfg(all(desktop, not(target_os = "macos")))]
 use tauri::{
     menu::{Menu, MenuItem},
     tray::TrayIconBuilder,
-    DragDropEvent, Emitter, Manager, WebviewEvent, WindowEvent,
 };
+#[cfg(desktop)]
+use tauri::{DragDropEvent, WebviewEvent, WindowEvent};
+#[cfg(desktop)]
 use tauri_plugin_global_shortcut::{Code, Modifiers, Shortcut, ShortcutState};
 
-/// Toggle the popup window: show + focus, or hide if already visible.
+#[cfg(desktop)]
+/// Toggle the popup window: show + focus, or dismiss if already visible.
 fn toggle_popup(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
         let visible = win.is_visible().unwrap_or(false);
@@ -25,25 +32,20 @@ fn toggle_popup(app: &tauri::AppHandle) {
         let focused = win.is_focused().unwrap_or(false);
 
         if visible && !minimized && focused {
-            let _ = win.hide();
+            let _ = commands::dismiss_main_window(app.clone());
         } else {
             let _ = commands::reveal_main_window(app);
         }
     }
 }
 
+#[cfg(desktop)]
 /// Show and focus the popup window.
 fn show_popup(app: &tauri::AppHandle) {
     let _ = commands::reveal_main_window(app);
 }
 
-/// Hide the popup window.
-fn hide_popup(app: &tauri::AppHandle) {
-    if let Some(win) = app.get_webview_window("main") {
-        let _ = win.hide();
-    }
-}
-
+#[cfg(desktop)]
 fn grant_dropped_paths(app: tauri::AppHandle, paths: &[PathBuf]) {
     let path = match paths {
         [path] => path.clone(),
@@ -65,26 +67,41 @@ fn grant_dropped_paths(app: tauri::AppHandle, paths: &[PathBuf]) {
     });
 }
 
+fn restart_relay_subscribers(app: &tauri::AppHandle) {
+    let state = app.state::<Arc<AppState>>().inner().clone();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        commands::restart_subscribers(&state, app).await;
+    });
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(
-            tauri_plugin_global_shortcut::Builder::new()
-                .with_shortcut(Shortcut::new(
-                    Some(Modifiers::SHIFT | Modifiers::CONTROL),
-                    Code::KeyV,
-                ))
-                .expect("invalid shortcut")
-                .with_handler(move |app, _shortcut, event| {
-                    if event.state == ShortcutState::Pressed {
-                        toggle_popup(app);
-                    }
-                })
-                .build(),
-        )
+        .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_os::init());
+    #[cfg(desktop)]
+    let builder = builder.plugin(
+        tauri_plugin_global_shortcut::Builder::new()
+            .with_shortcut(Shortcut::new(
+                Some(Modifiers::SHIFT | Modifiers::CONTROL),
+                Code::KeyV,
+            ))
+            .expect("invalid shortcut")
+            .with_handler(move |app, _shortcut, event| {
+                if event.state == ShortcutState::Pressed {
+                    toggle_popup(app);
+                }
+            })
+            .build(),
+    );
+    #[cfg(mobile)]
+    let builder = builder.plugin(tauri_plugin_barcode_scanner::init());
+
+    builder
         .setup(|app| {
             // --- Load device keypairs + history DB key ---
             // Set the file-fallback dir for tests or explicit development
@@ -109,6 +126,8 @@ pub fn run() {
             let legacy_roster_path = app_data.join("roster.bin");
             let groups_dir = app_data.join("groups");
             let settings_path = app_data.join("settings.json");
+            #[cfg(target_os = "windows")]
+            let is_first_launch = !settings_path.exists();
             if let Ok(mut gd) = state.groups_dir.try_lock() {
                 *gd = Some(groups_dir.clone());
             }
@@ -119,7 +138,6 @@ pub fn run() {
             if let Ok(mut invitations) = state.invitations.try_lock() {
                 *invitations = commands::load_invitations_from_keychain();
             }
-            let mut startup_topic = None;
             if let Some((roster_path, verified)) = commands::prepare_sync_groups(
                 &mut loaded_settings,
                 &groups_dir,
@@ -131,7 +149,6 @@ pub fn run() {
                     *rp = Some(roster_path);
                 }
                 if let Some(verified) = verified {
-                    startup_topic = Some(verified.topic().to_string());
                     if let Ok(mut r) = state.roster.try_lock() {
                         *r = Some(verified);
                     }
@@ -151,66 +168,88 @@ pub fn run() {
 
             app.manage(state.clone());
 
-            let state_clone = state.clone();
-            let app_handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                if let Some(topic) = startup_topic {
-                    commands::start_subscriber(&state_clone, app_handle.clone(), &topic).await;
-                }
-                commands::start_invitation_subscribers(&state_clone, app_handle).await;
-            });
+            // On mobile, this same helper is called on `RunEvent::Resumed`.
+            // It reconnects through the normal relay catch-up path without a
+            // push provider or a second backend.
+            restart_relay_subscribers(app.handle());
 
-            // --- Tray icon + menu ---
-            let show_item = MenuItem::with_id(app, "show", "Show Fwoosh", true, None::<&str>)?;
-            let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
-            let _tray = TrayIconBuilder::new()
-                .icon(app.default_window_icon().unwrap().clone())
-                .menu(&menu)
-                // Let the click handler below open the popup; keep the menu
-                // accessible with a secondary click.
-                .show_menu_on_left_click(false)
-                .tooltip("Fwoosh")
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => show_popup(app),
-                    "quit" => app.exit(0),
-                    _ => {}
-                })
-                .on_tray_icon_event(|tray, event| {
-                    if let tauri::tray::TrayIconEvent::Click {
-                        button: tauri::tray::MouseButton::Left,
-                        button_state: tauri::tray::MouseButtonState::Up,
-                        ..
-                    } = event
-                    {
-                        toggle_popup(tray.app_handle());
+            #[cfg(all(desktop, not(target_os = "macos")))]
+            {
+                // --- Tray icon + menu ---
+                let show_item = MenuItem::with_id(app, "show", "Show Fwoosh", true, None::<&str>)?;
+                let quit_item = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
+                let menu = Menu::with_items(app, &[&show_item, &quit_item])?;
+                let _tray = TrayIconBuilder::new()
+                    .icon(app.default_window_icon().unwrap().clone())
+                    .menu(&menu)
+                    // Let the click handler below open the popup; keep the menu
+                    // accessible with a secondary click.
+                    .show_menu_on_left_click(false)
+                    .tooltip("Fwoosh")
+                    .on_menu_event(|app, event| match event.id.as_ref() {
+                        "show" => show_popup(app),
+                        "quit" => app.exit(0),
+                        _ => {}
+                    })
+                    .on_tray_icon_event(|tray, event| {
+                        if let tauri::tray::TrayIconEvent::Click {
+                            button: tauri::tray::MouseButton::Left,
+                            button_state: tauri::tray::MouseButtonState::Up,
+                            ..
+                        } = event
+                        {
+                            toggle_popup(tray.app_handle());
+                        }
+                    })
+                    .build(app)?;
+
+                // Windows hides newly installed tray icons in the overflow
+                // area by default. Make the first successful launch visible
+                // so Store users know Fwoosh opened; later launches retain the
+                // tray-first behavior.
+                if let Some(win) = app.get_webview_window("main") {
+                    #[cfg(target_os = "windows")]
+                    let _ = win.set_shadow(false);
+
+                    #[cfg(target_os = "windows")]
+                    if is_first_launch {
+                        show_popup(app.handle());
+                    } else {
+                        let _ = win.hide();
                     }
-                })
-                .build(app)?;
 
-            // Hide the window on startup; it lives in the tray.
-            if let Some(win) = app.get_webview_window("main") {
-                #[cfg(target_os = "windows")]
-                let _ = win.set_shadow(false);
-                let _ = win.hide();
+                    #[cfg(not(target_os = "windows"))]
+                    let _ = win.hide();
+                }
             }
 
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Hide instead of close so the app keeps running in the tray.
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_close();
-                hide_popup(window.app_handle());
+            #[cfg(desktop)]
+            {
+                // Keep the process alive: macOS minimizes to its Dock, while
+                // tray-oriented desktop platforms hide the popup.
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    let _ = commands::dismiss_main_window(window.app_handle().clone());
+                }
+                if let WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. }) = event {
+                    grant_dropped_paths(window.app_handle().clone(), paths);
+                }
             }
-            if let WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. }) = event {
-                grant_dropped_paths(window.app_handle().clone(), paths);
-            }
+            #[cfg(not(desktop))]
+            let _ = (window, event);
         })
         .on_webview_event(|webview, event| {
-            if let WebviewEvent::DragDrop(DragDropEvent::Drop { paths, .. }) = event {
-                grant_dropped_paths(webview.app_handle().clone(), paths);
+            #[cfg(desktop)]
+            {
+                if let WebviewEvent::DragDrop(DragDropEvent::Drop { paths, .. }) = event {
+                    grant_dropped_paths(webview.app_handle().clone(), paths);
+                }
             }
+            #[cfg(not(desktop))]
+            let _ = (webview, event);
         })
         .invoke_handler(tauri::generate_handler![
             commands::sync_groups::create_room,
@@ -239,6 +278,7 @@ pub fn run() {
             commands::sync_groups::revoke_device,
             commands::send_clip,
             commands::transfer::start_file_send,
+            commands::transfer::pending_file_offers,
             commands::transfer::accept_file_transfer,
             commands::transfer::reject_file_transfer,
             commands::transfer::cancel_file_transfer,
@@ -248,20 +288,25 @@ pub fn run() {
             commands::history_commands::delete_clip,
             commands::history_commands::delete_all_clips,
             commands::history_commands::copy_to_clipboard,
+            commands::dismiss_main_window,
             commands::show_main_window,
             commands::notify_incoming_clip,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Fwoosh")
         .run(|app, event| {
-            // macOS emits this when the user clicks the Dock icon while every
-            // app window is hidden. Restore our tray-style popup in response.
+            #[cfg(mobile)]
+            if matches!(event, tauri::RunEvent::Resumed) {
+                restart_relay_subscribers(app);
+            }
+
+            // Restore the window when the macOS Dock icon is clicked.
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen { .. } = event {
                 show_popup(app);
             }
 
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", mobile)))]
             let _ = (app, event);
         });
 }

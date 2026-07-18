@@ -1,0 +1,94 @@
+name: Mobile build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "package.json"
+      - "package-lock.json"
+      - "src/**"
+      - "src-tauri/**"
+      - ".github/workflows/mobile.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "package.json"
+      - "package-lock.json"
+      - "src/**"
+      - "src-tauri/**"
+      - ".github/workflows/mobile.yml"
+  workflow_dispatch:
+
+jobs:
+  android:
+    name: Android release build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Install Android build tools
+        shell: bash
+        run: |
+          sdkmanager --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;27.2.12479018"
+          echo "NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Initialize Android project
+        run: npm run mobile:android:init
+      - name: Build Android release package
+        run: npm run mobile:android:build
+      - name: Upload Android packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: fwoosh-android
+          path: |
+            src-tauri/gen/android/app/build/outputs/**/*.apk
+            src-tauri/gen/android/app/build/outputs/**/*.aab
+          if-no-files-found: error
+
+  ios-simulator:
+    name: iOS simulator debug build
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios,x86_64-apple-ios,aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - name: Ensure CocoaPods is available
+        shell: bash
+        run: |
+          if ! command -v pod >/dev/null 2>&1; then
+            brew install cocoapods
+          fi
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Initialize iOS project
+        run: npm run mobile:ios:init
+      - name: Build iOS simulator app
+        run: npm run tauri -- ios build --debug --target aarch64-sim

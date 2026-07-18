@@ -1,11 +1,20 @@
 {
   "name": "fwoosh",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Fwoosh encrypted clipboard sync",
   "type": "module",
   "scripts": {
     "dev": "vite dev",
-    "build": "vite build",
+    "build": "npm run version:check && vite build",
+    "build:macos": "npm run tauri -- build --bundles app dmg --ci",
+    "build:windows": "cmd /c scripts\\build-windows.cmd",
+    "build:windows:msix": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\build-windows-msix.ps1",
+    "mobile:android:init": "npm run tauri -- android init --ci",
+    "mobile:android:dev": "npm run tauri -- android dev",
+    "mobile:android:build": "npm run tauri -- android build",
+    "mobile:ios:init": "npm run tauri -- ios init --ci",
+    "mobile:ios:dev": "npm run tauri -- ios dev",
+    "mobile:ios:build": "npm run tauri -- ios build",
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
@@ -16,9 +25,13 @@
   "license": "MIT",
   "dependencies": {
     "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-barcode-scanner": "^2.4.5",
     "@tauri-apps/plugin-clipboard-manager": "^2.3.2",
     "@tauri-apps/plugin-dialog": "^2.7.1",
+    "@tauri-apps/plugin-fs": "^2.5.1",
     "@tauri-apps/plugin-notification": "^2.3.3",
+    "@tauri-apps/plugin-os": "^2",
+    "marked": "^16.4.2",
     "qrcode": "^1.5.4"
   },
   "devDependencies": {

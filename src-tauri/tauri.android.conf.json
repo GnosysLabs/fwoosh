@@ -1,0 +1,20 @@
+{
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Fwoosh",
+        "width": 390,
+        "height": 844,
+        "resizable": true,
+        "decorations": true,
+        "transparent": false,
+        "alwaysOnTop": false,
+        "skipTaskbar": false,
+        "visible": true,
+        "center": false,
+        "fullscreen": true
+      }
+    ]
+  }
+}

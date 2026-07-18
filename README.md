@@ -1,7 +1,7 @@
 # Fwoosh
 
 A free, open-source, **end-to-end-encrypted clipboard sync and P2P file
-sharing** app for Windows, macOS, and Linux (planned). Pop a small text box
+sharing** app for Windows, macOS, Android, and iOS (Linux planned). Pop a small text box
 out of the tray/dock with `Ctrl/Cmd+Shift+V`, paste, and it becomes available
 on all your paired devices, instantly, using the free public
 [ntfy.sh](https://ntfy.sh) relay. **No servers to set up.**
@@ -50,9 +50,9 @@ with encrypted topic-rotation notice. Multiple named Sync Groups keep
 membership, relay topics, and history separate, with an active-group switcher
 for deliberate sends.
 
-**Planned for release:** mobile companion app, Linux support, QR scanning,
-custom relay settings UI, pause sync, full room-repair UX, signed and notarized
-installer releases, and a cross-device installed-app smoke test.
+**Planned for release:** Linux support, custom relay settings UI, pause sync,
+full room-repair UX, signed and notarized installer releases, mobile device
+validation, and a cross-device installed-app smoke test.
 
 | Area | State |
 |---|---|
@@ -65,7 +65,8 @@ installer releases, and a cross-device installed-app smoke test.
 | Sync Groups | Named groups, isolated roster files/history, legacy-room migration, active-group switching |
 | P2P file transfer (`commands/transfer/`) | WebRTC data channels; streamed encrypted chunks; configurable timeout |
 | Desktop shell (tray, hotkey, popup UI) | ✅ builds |
-| CI / release pipeline | Tests plus cargo/npm audit in CI; installer publishing and signing remain before public release |
+| Mobile shell (Android / iOS) | Shared protocol core; responsive shell, QR scan, secure storage, file picker streaming, and target CI are wired |
+| CI / release pipeline | Tests plus cargo/npm audit in CI; Windows NSIS/MSI and unsigned macOS app/DMG publishing are wired, signing remains before public release |
 
 ## Threat model (honest)
 
@@ -110,6 +111,60 @@ npm run build
 cd src-tauri && cargo build --release
 ```
 
+### Build Windows installers
+
+On a Windows machine with the Visual Studio C++ workload installed:
+
+```cmd
+npm ci
+npm run build:windows
+```
+
+The NSIS setup executable and MSI installer are written to
+`src-tauri/target/x86_64-pc-windows-msvc/release/bundle/`.
+
+### Build for Microsoft Store
+
+Fwoosh is packaged as MSIX for Microsoft Store distribution. The package
+contains the application, Store assets, Terms of Use, and Privacy Policy, and
+declares the Evergreen WebView2 runtime as an installation dependency.
+
+Export the package identity values shown in Partner Center, then build with:
+
+```cmd
+npm ci
+set FWOOSH_MSIX_IDENTITY_NAME=<Package/Identity/Name>
+set FWOOSH_MSIX_PUBLISHER=<Package/Identity/Publisher>
+set FWOOSH_MSIX_PUBLISHER_DISPLAY_NAME=<Publisher display name>
+npm run build:windows:msix
+```
+
+The Store-ready `.msixupload`, raw `.msix`, symbols, and SHA-256 checksums are
+written under `artifacts/msix/`. For local package-structure testing without a
+Store identity, run `powershell -File scripts/build-windows-msix.ps1 -Development`.
+Microsoft signs the production package after Store certification.
+
+### Build macOS testing artifacts
+
+On macOS, with Xcode command-line tools installed:
+
+```bash
+npm ci
+npm run build:macos
+```
+
+This creates an ad-hoc-signed `.app` bundle and `.dmg` installer under
+`src-tauri/target/<your-target>/release/bundle/`. Ad-hoc signing makes the app
+structurally runnable on Apple Silicon, but it is not notarization: a Mac that
+downloads the app must still approve its first launch in Privacy & Security.
+
+### Build Android and iOS
+
+See [mobile development](docs/mobile.md) for the Android and iOS prerequisites,
+development commands, and lifecycle behavior. Android builds can run on
+Windows, macOS, or Linux after the SDK/NDK is installed; iOS builds require
+macOS with full Xcode and CocoaPods.
+
 ### Run the test suite
 ```bash
 cd src-tauri && cargo test --lib
@@ -131,6 +186,9 @@ npm run version:bump -- patch   # or minor, major, 0.2.0
 Before tagging a release, move the relevant `CHANGELOG.md` entries from
 `Unreleased` to the target version and create a matching `vX.Y.Z` tag.
 
+Every frontend and installer build checks that these version values agree. The
+current version is also shown in the app's Settings menu.
+
 > **Windows + Git Bash:** because Git Bash's `/usr/bin/link` (GNU coreutils)
 > shadows MSVC's `link.exe` in PATH, builds from Git Bash use
 > `src-tauri/cargo-dev.cmd`, which discovers Visual Studio locally, loads
@@ -147,7 +205,7 @@ src-tauri/src/
   keychain.rs  OS credential storage (device keys + history key)
   ntfy.rs      TLS-enforced publish + WSS subscribe + reconnect
   pairing.rs   durable invitation URI + reusable HMAC proof-of-knowledge
-  network.rs   Group, invitation, People/contact, and recipient domain types
+  network.rs   Network, invitation, People/contact, and recipient domain types
   commands.rs  thin shared command facade and clipboard-send orchestration
   commands/
     state.rs             shared AppState, settings, wire types, and IPC DTOs
@@ -159,7 +217,7 @@ src-tauri/src/
       mod.rs             file-transfer commands and signaling state machine
       webrtc.rs          WebRTC channels, framing, finalization, and cleanup
     tests.rs             cross-module command regression tests
-  lib.rs       tray icon, global hotkey, popup window, plugin setup
+  lib.rs       desktop lifecycle, tray/Dock behavior, global hotkey, plugin setup
 src/routes/+page.svelte   the popup UI (Svelte + Tailwind)
 .github/workflows/        Release build/checksum workflow
 ```

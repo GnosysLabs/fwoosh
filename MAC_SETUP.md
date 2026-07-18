@@ -36,8 +36,8 @@ npm run tauri dev     # builds + launches the native Mac app
 ```
 
 The first build compiles the Rust core (~3-5 min). A native window appears and
-a **Fwoosh icon shows in the menu bar** (top-right). Hit
-**`Cmd+Shift+V`** anywhere to pop the text box.
+Fwoosh stays available from the Dock without adding a menu-bar status icon.
+Hit **`Cmd+Shift+V`** anywhere to bring the text box forward.
 
 > **No `dev.cmd` on Mac** — that file is Windows-only (it loads the MSVC build
 > env). On Mac, just `npm run tauri dev` directly.
@@ -69,7 +69,7 @@ Subsequent builds are incremental (~10s).
 Accessibility permissions (System Settings → Privacy & Security → Accessibility,
 enable Terminal/iTerm). Global shortcuts need it.
 
-**App crashes / no tray icon** — check the Terminal output. Fwoosh expects
+**App crashes / no Dock window** — check the Terminal output. Fwoosh expects
 macOS Keychain to be available. A raw file fallback is only for development or
 tests with `FWOOSH_ALLOW_FILE_KEY_FALLBACK=1`.
 
@@ -80,19 +80,35 @@ npm run tauri build
 # Output: src-tauri/target/release/bundle/dmg/fwoosh_0.1.0_*.dmg
 ```
 
-For throwaway local testing, an unsigned DMG can be opened with right-click ->
-Open. Do not use unsigned or ad-hoc-signed builds as the normal update path:
+The automated testing build uses an ad-hoc signature. After dragging Fwoosh to
+Applications, Control-click **Fwoosh.app** and choose **Open**, then confirm
+**Open**. If macOS does not offer that choice, try launching it once and go to
+**System Settings -> Privacy & Security -> Security -> Open Anyway**.
+
+If macOS says the app is damaged, remove only Fwoosh's downloaded-file
+quarantine marker and try the Control-click launch again:
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/Fwoosh.app"
+```
+
+The downloadable build is Apple Silicon only. Check **Apple menu -> About This
+Mac -> Chip**; an Intel Mac requires a separate Intel or universal build.
+
+Do not use unsigned or ad-hoc-signed builds as the normal update path:
 macOS Keychain authorization is tracked against the app's code-signing
 requirement, so every rebuilt unsigned app can look like a different app and
 trigger repeated "Fwoosh wants to use your confidential information" prompts.
 
 For builds you keep updating, sign with the same Apple code-signing identity
-every time. On the Mac that builds the app:
+every time. The repository currently sets `bundle.macOS.signingIdentity` to
+`"-"` in `src-tauri/tauri.macos.conf.json` for ad-hoc testing. Override it on
+the Mac that builds the app:
 
 ```bash
 security find-identity -v -p codesigning
-export APPLE_SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)"
-npm run tauri build
+npm run tauri -- build --config \
+  '{"bundle":{"macOS":{"signingIdentity":"Developer ID Application: Your Name (TEAMID)"}}}'
 ```
 
 For sharing outside your own Mac, use a paid Apple Developer account and
@@ -102,8 +118,8 @@ notarize the build too:
 export APPLE_ID="you@example.com"
 export APPLE_PASSWORD="app-specific-password"
 export APPLE_TEAM_ID="TEAMID"
-export APPLE_SIGNING_IDENTITY="Developer ID Application: Your Name (TEAMID)"
-npm run tauri build
+npm run tauri -- build --config \
+  '{"bundle":{"macOS":{"signingIdentity":"Developer ID Application: Your Name (TEAMID)"}}}'
 ```
 
 After moving from an unsigned build to a consistently signed build, macOS may

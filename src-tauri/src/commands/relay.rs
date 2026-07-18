@@ -3,6 +3,11 @@
 use super::*;
 
 const GROUP_REMOVAL_NOTICE_MARKER: &str = "fwoosh-group-removal-v1";
+// A fresh process has no in-memory ntfy message cursor. Ask the relay for its
+// normal cache window in that case; authenticated envelope/replay validation
+// makes duplicate cached messages safe to process. Private sends still opt out
+// of relay caching and therefore remain live-delivery only.
+const COLD_START_CATCH_UP: &str = "12h";
 
 fn invitation_is_subscribable(
     invite: &InvitationRecord,
@@ -31,12 +36,7 @@ fn spawn_relay_message_pump<'a>(
             .await
             .get(&topic)
             .cloned()
-            // A topic may have been inactive, or the app may have restarted
-            // before a cached removal notice was observed. Ask ntfy for the
-            // bounded server-side cache on the first local subscription; all
-            // replayed payloads still pass normal signature, epoch, recipient,
-            // and message-id validation below.
-            .or_else(|| Some("all".to_string()));
+            .or_else(|| Some(COLD_START_CATCH_UP.to_string()));
         let cfg = ntfy::SubscribeConfig {
             base,
             topic: topic.clone(),
@@ -185,6 +185,46 @@ pub async fn start_invitation_subscribers(state: &Arc<AppState>, app: tauri::App
                 stop_auxiliary_subscriber(&state_clone, &format!("invite:{invite_id}")).await;
             });
         }
+    }
+}
+
+/// Recreate relay subscriptions after a mobile resume. ntfy supplies `since`
+/// catch-up from the last observed message id (or a bounded cold-start cache),
+/// so this does not require a push service or a separate backend.
+pub async fn restart_subscribers(state: &Arc<AppState>, app: tauri::AppHandle) {
+    if let Some(tx) = state.subscriber_shutdown.lock().await.take() {
+        let _ = tx.send(());
+    }
+    let auxiliary = state
+        .auxiliary_subscriber_shutdowns
+        .lock()
+        .await
+        .drain()
+        .map(|(_, tx)| tx)
+        .collect::<Vec<_>>();
+    for tx in auxiliary {
+        let _ = tx.send(());
+    }
+
+    let room_topic = state
+        .roster
+        .lock()
+        .await
+        .as_ref()
+        .map(|roster| roster.topic().to_string());
+    if let Some(topic) = room_topic {
+        start_subscriber(state, app.clone(), &topic).await;
+    }
+    start_invitation_subscribers(state, app.clone()).await;
+
+    if let Some(pending) = state.pending_network_join.lock().await.clone() {
+        start_auxiliary_subscriber(
+            state,
+            app,
+            format!("pending:{}", pending.invite_id),
+            pending.rendezvous_topic,
+        )
+        .await;
     }
 }
 

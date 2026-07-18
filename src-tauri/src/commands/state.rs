@@ -1,6 +1,7 @@
 //! Shared application state, persisted settings, wire types, and IPC DTOs.
 
 use super::*;
+use tauri_plugin_fs::FilePath;
 
 /// App-wide shared state.
 pub struct AppState {
@@ -313,7 +314,10 @@ pub struct ReceiverWriteState {
     pub(crate) content_key: [u8; 32],
     pub(crate) nonce_prefix: [u8; FILE_NONCE_PREFIX_LEN],
     pub(crate) file: Option<tokio::fs::File>,
-    pub(crate) final_path: PathBuf,
+    /// Desktop destinations are ordinary paths. Mobile save dialogs can
+    /// return provider URIs, which are copied to only after verification.
+    pub(crate) final_path: Option<PathBuf>,
+    pub(crate) final_destination: Option<FilePath>,
     pub(crate) part_path: PathBuf,
     pub(crate) hasher: Sha256,
     pub(crate) done: bool,
@@ -321,7 +325,7 @@ pub struct ReceiverWriteState {
 
 #[derive(Clone)]
 pub struct OutgoingFilePayload {
-    pub(crate) path: PathBuf,
+    pub(crate) path: FilePath,
     pub(crate) file_name: String,
     pub(crate) total: u64,
     pub(crate) content_key: [u8; 32],

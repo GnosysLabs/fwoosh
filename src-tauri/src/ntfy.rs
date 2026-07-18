@@ -397,18 +397,26 @@ pub fn spawn_subscriber(
         loop {
             let url = ws_url(&https_base, &cfg.topic, last_id.as_deref());
             eprintln!("[ntfy] connecting to relay (topic hidden)…");
-            let stream = tokio_tungstenite::connect_async(&url).await;
+            let stream = tokio::select! {
+                _ = &mut shutdown => return,
+                stream = tokio_tungstenite::connect_async(&url) => stream,
+            };
             match stream {
                 Ok((mut ws, _)) => {
                     eprintln!("[ntfy] WebSocket connected, listening for messages");
                     backoff = Duration::from_secs(1); // reset on success
-                    while let Some(msg_result) = ws.next().await {
-                        // Check for shutdown between messages.
-                        if shutdown.try_recv().is_ok() {
-                            let _ = ws.close(None).await;
-                            eprintln!("[ntfy] subscriber shutting down");
-                            return;
-                        }
+                    loop {
+                        let msg_result = tokio::select! {
+                            _ = &mut shutdown => {
+                                let _ = ws.close(None).await;
+                                eprintln!("[ntfy] subscriber shutting down");
+                                return;
+                            }
+                            msg = ws.next() => msg,
+                        };
+                        let Some(msg_result) = msg_result else {
+                            break;
+                        };
                         let msg = match msg_result {
                             Ok(m) => m,
                             Err(e) => {
@@ -439,9 +447,18 @@ pub fn spawn_subscriber(
                                     rm.payload.len()
                                 );
                                 last_id = Some(rm.id.clone());
-                                if out.send(rm).await.is_err() {
-                                    eprintln!("[ntfy] consumer gone, stopping");
-                                    return; // consumer gone
+                                tokio::select! {
+                                    _ = &mut shutdown => {
+                                        let _ = ws.close(None).await;
+                                        eprintln!("[ntfy] subscriber shutting down");
+                                        return;
+                                    }
+                                    result = out.send(rm) => {
+                                        if result.is_err() {
+                                            eprintln!("[ntfy] consumer gone, stopping");
+                                            return; // consumer gone
+                                        }
+                                    }
                                 }
                             }
                         }

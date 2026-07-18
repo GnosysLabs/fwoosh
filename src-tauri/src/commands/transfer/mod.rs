@@ -1,8 +1,40 @@
 //! Large-file transfer commands and the WebRTC transfer state machine.
 
 use super::*;
+use tauri_plugin_fs::{FilePath, FsExt, OpenOptions};
 
 mod webrtc;
+
+// Opening a file URL with the filesystem plugin starts access to its iOS
+// security-scoped resource. Keep a small guard next to that descriptor so
+// every completion, failure, and cancellation balances the access.
+#[cfg(target_os = "ios")]
+pub(crate) struct IosSecurityScope {
+    app: tauri::AppHandle,
+    path: FilePath,
+}
+
+#[cfg(target_os = "ios")]
+impl IosSecurityScope {
+    pub(crate) fn after_open(app: &tauri::AppHandle, path: FilePath) -> Self {
+        Self {
+            app: app.clone(),
+            path,
+        }
+    }
+}
+
+#[cfg(target_os = "ios")]
+impl Drop for IosSecurityScope {
+    fn drop(&mut self) {
+        if matches!(&self.path, FilePath::Url(_)) {
+            let _ = self
+                .app
+                .fs()
+                .stop_accessing_security_scoped_resource(self.path.clone());
+        }
+    }
+}
 
 use webrtc::*;
 pub(super) use webrtc::{cancel_all_transfers, cancel_transfers_not_in_roster};
@@ -102,30 +134,141 @@ async fn consume_file_grant(state: &Arc<AppState>, grant_id: &str) -> Result<Pat
     Ok(grant.path)
 }
 
-fn dialog_file_path_to_pathbuf(path: tauri_plugin_dialog::FilePath) -> Result<PathBuf, String> {
-    path.into_path()
-        .map_err(|_| "dialog returned an invalid local file path".to_string())
-}
-
-fn pick_file_for_send(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let selected = app
-        .dialog()
+fn pick_file_for_send(app: &tauri::AppHandle) -> Result<FilePath, String> {
+    app.dialog()
         .file()
         .set_title("Choose file to send")
         .blocking_pick_file()
-        .ok_or_else(|| "File selection cancelled".to_string())?;
-    dialog_file_path_to_pathbuf(selected)
+        .ok_or_else(|| "File selection cancelled".to_string())
 }
 
-fn pick_save_path(app: &tauri::AppHandle, file_name: &str) -> Result<PathBuf, String> {
-    let selected = app
-        .dialog()
+fn pick_save_path(app: &tauri::AppHandle, file_name: &str) -> Result<FilePath, String> {
+    app.dialog()
         .file()
         .set_title("Save incoming file")
         .set_file_name(safe_default_file_name(file_name))
         .blocking_save_file()
-        .ok_or_else(|| "Save cancelled".to_string())?;
-    dialog_file_path_to_pathbuf(selected)
+        .ok_or_else(|| "Save cancelled".to_string())
+}
+
+#[cfg(target_os = "android")]
+fn android_display_name(app: &tauri::AppHandle, uri: &str) -> Option<String> {
+    use jni::objects::{JObject, JString, JValue};
+
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let uri = uri.to_string();
+    let webview = app.get_webview_window("main")?;
+    webview
+        .with_webview(move |webview| {
+            webview.jni_handle().exec(move |env, activity, _webview| {
+                let display_name = (|| -> jni::errors::Result<Option<String>> {
+                    let uri_text = JObject::from(env.new_string(uri)?);
+                    let uri_class = env.find_class("android/net/Uri")?;
+                    let uri = env
+                        .call_static_method(
+                            uri_class,
+                            "parse",
+                            "(Ljava/lang/String;)Landroid/net/Uri;",
+                            &[JValue::Object(&uri_text)],
+                        )?
+                        .l()?;
+                    let picker_class = env.find_class("app/tauri/dialog/FilePickerUtils")?;
+                    let companion = env
+                        .get_static_field(
+                            picker_class,
+                            "Companion",
+                            "Lapp/tauri/dialog/FilePickerUtils$Companion;",
+                        )?
+                        .l()?;
+                    let name = env
+                        .call_method(
+                            companion,
+                            "getNameFromUri",
+                            "(Landroid/content/Context;Landroid/net/Uri;)Ljava/lang/String;",
+                            &[JValue::Object(activity), JValue::Object(&uri)],
+                        )?
+                        .l()?;
+                    if name.is_null() {
+                        return Ok(None);
+                    }
+                    let name = JString::from(name);
+                    Ok(Some(env.get_string(&name)?.into()))
+                })()
+                .ok()
+                .flatten();
+                let _ = sender.send(display_name);
+            });
+        })
+        .ok()?;
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .ok()
+        .flatten()
+}
+
+fn inspect_selected_file(
+    app: &tauri::AppHandle,
+    selected: FilePath,
+) -> Result<(FilePath, String, u64), String> {
+    match selected {
+        FilePath::Path(path) => {
+            let (path, file_name, size) = inspect_local_file(path)?;
+            Ok((FilePath::Path(path), file_name, size))
+        }
+        FilePath::Url(url) => {
+            // Android's picker returns content:// URIs and iOS returns
+            // security-scoped file:// URLs. The fs plugin turns both into a
+            // readable descriptor without changing the transfer protocol.
+            let selected = FilePath::Url(url);
+            let mut options = OpenOptions::new();
+            options.read(true);
+            let file = app
+                .fs()
+                .open(selected.clone(), options)
+                .map_err(|e| format!("Could not open selected file: {e}"))?;
+            #[cfg(target_os = "ios")]
+            let _security_scope = IosSecurityScope::after_open(app, selected.clone());
+            let metadata = file
+                .metadata()
+                .map(|metadata| metadata.len())
+                .map_err(|e| format!("Could not inspect selected file: {e}"));
+            drop(file);
+            let size = metadata?;
+            let file_name = match &selected {
+                FilePath::Url(url) => {
+                    #[cfg(target_os = "android")]
+                    let display_name = android_display_name(app, url.as_str());
+                    #[cfg(not(target_os = "android"))]
+                    let display_name: Option<String> = None;
+
+                    display_name
+                        .filter(|name| !name.trim().is_empty())
+                        .or_else(|| {
+                            url.path_segments()
+                                .and_then(|segments| segments.last())
+                                .filter(|name| !name.is_empty())
+                                .map(str::to_owned)
+                        })
+                        .map(|name| safe_default_file_name(&name))
+                        .unwrap_or_else(|| "fwoosh-file".to_string())
+                }
+                FilePath::Path(_) => unreachable!("selected path handled above"),
+            };
+            Ok((selected, file_name, size))
+        }
+    }
+}
+
+#[cfg(mobile)]
+fn mobile_receive_part_path(app: &tauri::AppHandle, session_id: &str) -> Result<PathBuf, String> {
+    let directory = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| format!("Could not create a temporary download location: {e}"))?
+        .join("incoming-files");
+    std::fs::create_dir_all(&directory)
+        .map_err(|e| format!("Could not create a temporary download location: {e}"))?;
+    Ok(directory.join(format!("{session_id}.fwoosh-part")))
 }
 
 fn ensure_transfer_capacity(transfers: &HashMap<String, TransferRecord>) -> Result<(), String> {
@@ -158,15 +301,15 @@ pub async fn start_file_send(
         let settings = state.settings.lock().await;
         ensure_expected_active_group(&settings, &network_id, "starting the file transfer")?;
     }
-    let path = match grant_id
+    let selected = match grant_id
         .as_deref()
         .map(str::trim)
         .filter(|id| !id.is_empty())
     {
-        Some(id) => consume_file_grant(state.inner(), id).await?,
+        Some(id) => FilePath::Path(consume_file_grant(state.inner(), id).await?),
         None => pick_file_for_send(&app)?,
     };
-    let (path, file_name, size) = inspect_local_file(path)?;
+    let (path, file_name, size) = inspect_selected_file(&app, selected)?;
     let recipient = parse_device_id(&recipient_id)?;
     {
         let settings = state.settings.lock().await;
@@ -291,6 +434,45 @@ pub async fn start_file_send(
     })
 }
 
+/// Return offers that are still waiting for a local accept/decline decision.
+/// This lets a resumed mobile webview recover an offer whose live event was
+/// emitted while the UI was suspended.
+#[tauri::command]
+pub async fn pending_file_offers(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<FileOfferDto>, String> {
+    let pending = {
+        let transfers = state.file_transfers.lock().await;
+        transfers
+            .iter()
+            .filter_map(|(session_id, record)| match record {
+                TransferRecord::PendingIncoming(pending) => {
+                    Some((session_id.clone(), pending.clone()))
+                }
+                TransferRecord::Outgoing(_) | TransferRecord::Incoming(_) => None,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let mut offers = Vec::with_capacity(pending.len());
+    for (session_id, pending) in pending {
+        let sender_label = active_device_identity(state.inner(), &pending.sender_id)
+            .await
+            .map(|device| device.label)
+            .unwrap_or_else(|_| hex::encode(&pending.sender_id.0[..4]));
+        offers.push(FileOfferDto {
+            session_id,
+            network_id: pending.network_id,
+            sender_id: hex::encode(pending.sender_id.0),
+            sender_label,
+            file_name: pending.file_name,
+            size: pending.size,
+        });
+    }
+    offers.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+    Ok(offers)
+}
+
 #[tauri::command]
 pub async fn accept_file_transfer(
     state: State<'_, Arc<AppState>>,
@@ -319,10 +501,23 @@ pub async fn accept_file_transfer(
             None => return Err("transfer not found".to_string()),
         }
     };
-    let save_path = pick_save_path(&app, &pending_for_dialog.file_name)?;
-    ensure_receive_destination_available(&save_path)?;
-    let part_path = part_path_for(&save_path);
-    ensure_receive_destination_available(&part_path)?;
+    let save_destination = pick_save_path(&app, &pending_for_dialog.file_name)?;
+    #[cfg(desktop)]
+    let (final_path, final_destination, part_path) = {
+        let save_path = save_destination
+            .into_path()
+            .map_err(|_| "dialog returned an invalid local file path".to_string())?;
+        ensure_receive_destination_available(&save_path)?;
+        let part_path = part_path_for(&save_path);
+        ensure_receive_destination_available(&part_path)?;
+        (Some(save_path), None, part_path)
+    };
+    #[cfg(mobile)]
+    let (final_path, final_destination, part_path) = (
+        None,
+        Some(save_destination),
+        mobile_receive_part_path(&app, &session_id)?,
+    );
     {
         let settings = state.settings.lock().await;
         ensure_expected_active_group(&settings, &network_id, "accepting the file transfer")?;
@@ -331,7 +526,13 @@ pub async fn accept_file_transfer(
     let pending = {
         let mut transfers = state.file_transfers.lock().await;
         match transfers.remove(&session_id) {
-            Some(TransferRecord::PendingIncoming(pending)) => pending,
+            Some(TransferRecord::PendingIncoming(pending)) if pending.network_id == network_id => {
+                pending
+            }
+            Some(TransferRecord::PendingIncoming(pending)) => {
+                transfers.insert(session_id.clone(), TransferRecord::PendingIncoming(pending));
+                return Err("file offer belongs to another sync group".to_string());
+            }
             Some(other) => {
                 transfers.insert(session_id.clone(), other);
                 return Err("transfer is not waiting for acceptance".to_string());
@@ -483,7 +684,8 @@ pub async fn accept_file_transfer(
             content_key: pending.content_key,
             nonce_prefix: pending.nonce_prefix,
             file: Some(file),
-            final_path: save_path.clone(),
+            final_path,
+            final_destination,
             part_path: part_path.clone(),
             hasher: Sha256::new(),
             done: false,
@@ -805,6 +1007,10 @@ pub(super) async fn handle_file_signal(
                     size,
                 },
             );
+            // Desktop surfaces an offer by opening the tray popup. Mobile
+            // remains in the platform's normal activity lifecycle; it will
+            // show the offer when the user opens or resumes Fwoosh.
+            #[cfg(desktop)]
             let _ = reveal_main_window(app);
         }
         FileSignal::Answer {

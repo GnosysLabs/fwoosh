@@ -6,6 +6,10 @@ This project uses SemVer. Release tags should use the form `vX.Y.Z`.
 
 ## Unreleased
 
+- Add a visible app version sourced from the synchronized SemVer metadata.
+- Add a local Windows release command and CI packaging for NSIS and MSI
+  installers instead of a raw executable ZIP.
+- Add unsigned macOS `.app` and `.dmg` test builds for Apple Silicon and Intel.
 - Split the oversized Tauri command implementation into focused state, Sync
   Group, pairing, relay, history, and file-transfer modules without changing
   the IPC contract.
@@ -13,12 +17,12 @@ This project uses SemVer. Release tags should use the form `vX.Y.Z`.
 - Add multiple named Sync Groups with isolated rosters and clip history,
   active-group switching, create/join/rename/remove controls, and automatic
   migration of the legacy single-room state.
-- Replace short-lived single-use pairing with reusable, revocable group
+- Replace short-lived single-use pairing with reusable, revocable Network
   invitations stored in the OS keychain, plus optional expiring invitations.
 - Encrypt pairing bootstrap requests and grants with HPKE and require explicit
   admin approval before a device is added to the signed roster.
-- Add stable group identity/default-target scaffolding and make clipboard
-  routing fail closed when the requested group is unavailable.
+- Add stable Network identity/default-target scaffolding and make clipboard
+  routing fail closed when the requested Network is unavailable.
 - Always show the file recipient picker and separate My Devices from the
   reserved People/direct-share section.
 - Add coordinated version tooling for npm, Cargo, Tauri, and lockfiles.
