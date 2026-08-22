@@ -71,7 +71,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc,
+};
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_clipboard_manager::ClipboardExt;
 use tauri_plugin_dialog::DialogExt;
@@ -79,8 +82,9 @@ use tauri_plugin_notification::NotificationExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 pub use transfer::{
-    accept_file_transfer, cancel_file_transfer, grant_dropped_file, pending_file_offers,
-    reject_file_transfer, reveal_received_file, start_file_send,
+    accept_file_transfer, cancel_file_transfer, diagnose_file_transfer_connectivity,
+    grant_dropped_file, pending_file_offers, reject_file_transfer, reveal_received_file,
+    start_file_send,
 };
 use transfer::{
     cancel_all_transfers, cancel_transfers_not_in_roster, decode_file_signal, handle_file_signal,
@@ -146,6 +150,9 @@ const MIN_FILE_TRANSFER_TIMEOUT_MINUTES: u64 = 1;
 const MAX_FILE_TRANSFER_TIMEOUT_MINUTES: u64 = 7 * 24 * 60;
 const FILE_BACKPRESSURE_TIMEOUT_SECS: u64 = 30;
 const ICE_GATHER_TIMEOUT_SECS: u64 = 20;
+const FILE_CONNECTION_TIMEOUT_SECS: u64 = 30;
+const FILE_DISCONNECTED_GRACE_SECS: u64 = 10;
+const FILE_IDLE_TIMEOUT_SECS: u64 = 45;
 const MAX_FILE_NAME_CHARS: usize = 255;
 const MAX_SDP_JSON_BYTES: usize = 256 * 1024;
 const MAX_FILE_FRAME_BYTES: usize = FILE_CHUNK_SIZE + 1024;

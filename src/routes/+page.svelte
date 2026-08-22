@@ -81,6 +81,9 @@
   let stunServersText = $state("");
   let transferTimeoutMinutes = $state(60);
   let savingNetwork = $state(false);
+  let diagnosingNetwork = $state(false);
+  let networkDiagnostics = $state<FileTransferConnectivityDiagnosticsDto | null>(null);
+  let networkDiagnosticsError = $state("");
   let isMobile = $state(false);
   let scanningPairingCode = $state(false);
   let scanFeedback = $state("");
@@ -122,6 +125,7 @@
       pairingRefreshing ||
       savingDeviceLabel ||
       savingNetwork ||
+      diagnosingNetwork ||
       creatingSyncGroup
   );
   let activeLegalDocument = $derived(legalDocument ? legalDocuments[legalDocument] : null);
@@ -240,6 +244,21 @@
     total: number;
     status: string;
     message: string;
+  }
+  interface FileTransferConnectivityDiagnosticsDto {
+    relay_ok: boolean;
+    relay_latency_ms: number | null;
+    relay_message: string;
+    ice_message: string;
+    ice_gathering_complete: boolean;
+    ice_elapsed_ms: number;
+    candidate_types: string[];
+    host_candidates: number;
+    server_reflexive_candidates: number;
+    relay_candidates: number;
+    severity: "ok" | "warning" | "error";
+    summary: string;
+    recommendations: string[];
   }
   interface TransferView {
     session_id: string;
@@ -594,6 +613,22 @@
       showStatus("err", String(e));
     } finally {
       savingNetwork = false;
+    }
+  }
+
+  async function runConnectionDiagnostics() {
+    if (groupTransitionBusy) return;
+    diagnosingNetwork = true;
+    networkDiagnostics = null;
+    networkDiagnosticsError = "";
+    try {
+      networkDiagnostics = await invoke<FileTransferConnectivityDiagnosticsDto>(
+        "diagnose_file_transfer_connectivity"
+      );
+    } catch (e) {
+      networkDiagnosticsError = String(e);
+    } finally {
+      diagnosingNetwork = false;
     }
   }
 
@@ -1885,6 +1920,46 @@
             <button class="mini-action full" onclick={saveNetworkSettings} disabled={savingNetwork}>
               {savingNetwork ? "Saving..." : "Save connection settings"}
             </button>
+            <button
+              class="mini-action full"
+              onclick={runConnectionDiagnostics}
+              disabled={groupTransitionBusy}
+            >
+              {diagnosingNetwork ? "Diagnosing..." : "Diagnose connection"}
+            </button>
+            {#if networkDiagnostics}
+              <div
+                class="network-diagnostics {networkDiagnostics.severity}"
+                role="status"
+                aria-live="polite"
+              >
+                <strong>{networkDiagnostics.summary}</strong>
+                <span>{networkDiagnostics.relay_message}</span>
+                <span>{networkDiagnostics.ice_message}</span>
+                <span>
+                  Candidates: {networkDiagnostics.host_candidates} local,
+                  {networkDiagnostics.server_reflexive_candidates} public,
+                  {networkDiagnostics.relay_candidates} relayed
+                </span>
+                {#if networkDiagnostics.candidate_types.length > 0}
+                  <span>
+                    Types: {Array.from(new Set(networkDiagnostics.candidate_types)).join(", ")}
+                  </span>
+                {/if}
+                {#if networkDiagnostics.recommendations.length > 0}
+                  <ul>
+                    {#each networkDiagnostics.recommendations as recommendation}
+                      <li>{recommendation}</li>
+                    {/each}
+                  </ul>
+                {/if}
+              </div>
+            {:else if networkDiagnosticsError}
+              <div class="network-diagnostics error" role="alert">
+                <strong>Connection diagnostic could not run.</strong>
+                <span>{networkDiagnosticsError}</span>
+              </div>
+            {/if}
           </div>
           <div class="settings-section">
             <div class="settings-title">Legal</div>
@@ -5921,6 +5996,42 @@
     max-height: calc(100vh - 76px);
     overflow-y: auto;
     overscroll-behavior: contain;
+  }
+  .network-diagnostics {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    padding: 9px 10px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: var(--field);
+    color: var(--text);
+    font-size: 11px;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+  }
+  .network-diagnostics.ok {
+    border-color: rgba(52, 211, 153, 0.55);
+    background: rgba(52, 211, 153, 0.08);
+  }
+  .network-diagnostics.warning {
+    border-color: rgba(245, 158, 11, 0.6);
+    background: rgba(245, 158, 11, 0.09);
+  }
+  .network-diagnostics.error {
+    border-color: rgba(248, 113, 113, 0.6);
+    background: rgba(248, 113, 113, 0.09);
+  }
+  .network-diagnostics strong {
+    color: var(--text-strong);
+    font-size: 12px;
+  }
+  .network-diagnostics ul {
+    margin: 2px 0 0;
+    padding-left: 17px;
+  }
+  .network-diagnostics li + li {
+    margin-top: 4px;
   }
   .settings-select {
     min-width: 0;

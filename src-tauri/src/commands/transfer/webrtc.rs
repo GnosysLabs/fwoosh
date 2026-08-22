@@ -3,6 +3,86 @@
 use super::*;
 use tauri_plugin_fs::{FsExt, OpenOptions};
 
+pub(crate) struct IceCandidateDiagnostics {
+    pub(crate) gathering_complete: bool,
+    pub(crate) elapsed_ms: u64,
+    pub(crate) candidate_types: Vec<String>,
+    pub(crate) host_candidates: usize,
+    pub(crate) server_reflexive_candidates: usize,
+    pub(crate) relay_candidates: usize,
+}
+
+pub(super) fn candidate_types_from_sdp(sdp: &str) -> Vec<String> {
+    let mut types = Vec::new();
+    for line in sdp.lines().map(str::trim) {
+        if !line.starts_with("a=candidate:") {
+            continue;
+        }
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        let Some(type_index) = fields.iter().position(|field| *field == "typ") else {
+            continue;
+        };
+        if let Some(candidate_type) = fields.get(type_index + 1) {
+            types.push(candidate_type.to_ascii_lowercase());
+        }
+    }
+    types
+}
+
+pub(crate) async fn diagnose_ice_candidates(
+    stun_servers: Vec<String>,
+) -> Result<IceCandidateDiagnostics, String> {
+    let peer = new_peer_connection(stun_servers).await?;
+    peer.create_data_channel("fwoosh-connectivity-diagnostic", None)
+        .await
+        .map_err(|e| e.to_string())?;
+    let offer = peer.create_offer(None).await.map_err(|e| e.to_string())?;
+    let mut gather_complete = peer.gathering_complete_promise().await;
+    peer.set_local_description(offer)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let started = std::time::Instant::now();
+    let gathering_complete = tokio::time::timeout(
+        std::time::Duration::from_secs(ICE_GATHER_TIMEOUT_SECS),
+        gather_complete.recv(),
+    )
+    .await
+    .is_ok();
+    let elapsed_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    let local = peer
+        .local_description()
+        .await
+        .ok_or_else(|| "WebRTC did not produce a local description".to_string())?;
+    let candidate_types = candidate_types_from_sdp(&local.sdp);
+    let host_candidates = candidate_types
+        .iter()
+        .filter(|kind| kind.as_str() == "host")
+        .count();
+    let server_reflexive_candidates = candidate_types
+        .iter()
+        .filter(|kind| kind.as_str() == "srflx")
+        .count();
+    let relay_candidates = candidate_types
+        .iter()
+        .filter(|kind| kind.as_str() == "relay")
+        .count();
+    let _ = peer.close().await;
+
+    Ok(IceCandidateDiagnostics {
+        gathering_complete,
+        elapsed_ms,
+        candidate_types,
+        host_candidates,
+        server_reflexive_candidates,
+        relay_candidates,
+    })
+}
+
+fn mark_transfer_activity(last_activity: &Arc<AtomicU64>) {
+    last_activity.store(now_unix(), Ordering::Relaxed);
+}
+
 pub(crate) async fn new_peer_connection(
     stun_servers: Vec<String>,
 ) -> Result<Arc<RTCPeerConnection>, String> {
@@ -33,15 +113,34 @@ pub(crate) fn install_peer_state_handler(
     app: tauri::AppHandle,
     state: Arc<AppState>,
     session_id: String,
+    timeout_token: u64,
     total: u64,
+    connected: Arc<AtomicBool>,
+    last_activity: Arc<AtomicU64>,
 ) {
     peer.on_peer_connection_state_change(Box::new(move |s: RTCPeerConnectionState| {
         let app = app.clone();
         let state = state.clone();
         let session_id = session_id.clone();
+        let connected = connected.clone();
+        let last_activity = last_activity.clone();
         Box::pin(async move {
             match s {
+                RTCPeerConnectionState::Connecting => {
+                    let _ = app.emit(
+                        "file-transfer-progress",
+                        FileTransferProgressDto {
+                            session_id,
+                            transferred: 0,
+                            total,
+                            status: "connecting".to_string(),
+                            message: "Negotiating a direct connection".to_string(),
+                        },
+                    );
+                }
                 RTCPeerConnectionState::Connected => {
+                    connected.store(true, Ordering::Relaxed);
+                    mark_transfer_activity(&last_activity);
                     let _ = app.emit(
                         "file-transfer-progress",
                         FileTransferProgressDto {
@@ -54,8 +153,49 @@ pub(crate) fn install_peer_state_handler(
                     );
                 }
                 RTCPeerConnectionState::Failed => {
-                    emit_file_failed(&app, &state, &session_id, "Direct connection unavailable")
+                    connected.store(false, Ordering::Relaxed);
+                    emit_file_failed_if_active(
+                        &app,
+                        &state,
+                        &session_id,
+                        timeout_token,
+                        "Direct connection failed. Open Settings and run Diagnose connection to check VPN, NAT, and STUN access.",
+                    )
+                    .await;
+                }
+                RTCPeerConnectionState::Disconnected => {
+                    connected.store(false, Ordering::Relaxed);
+                    let app = app.clone();
+                    let state = state.clone();
+                    let session_id = session_id.clone();
+                    let connected = connected.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(
+                            FILE_DISCONNECTED_GRACE_SECS,
+                        ))
                         .await;
+                        if !connected.load(Ordering::Relaxed) {
+                            emit_file_failed_if_active(
+                                &app,
+                                &state,
+                                &session_id,
+                                timeout_token,
+                                "Direct connection was lost. A VPN or restrictive NAT may be interfering.",
+                            )
+                            .await;
+                        }
+                    });
+                }
+                RTCPeerConnectionState::Closed => {
+                    connected.store(false, Ordering::Relaxed);
+                    emit_file_failed_if_active(
+                        &app,
+                        &state,
+                        &session_id,
+                        timeout_token,
+                        "Direct connection closed before the transfer completed",
+                    )
+                    .await;
                 }
                 _ => {}
             }
@@ -172,6 +312,7 @@ pub(crate) async fn send_file_over_channel(
         dc.send(&Bytes::from(frame))
             .await
             .map_err(|e| e.to_string())?;
+        mark_transfer_activity(&payload.last_activity);
         hasher.update(&buf[..n]);
         sent += n as u64;
         index += 1;
@@ -252,6 +393,7 @@ pub(crate) async fn handle_file_frame(
                 .as_mut()
                 .ok_or_else(|| "receive file is already closed".to_string())?;
             file.write_all(&pt).await.map_err(|e| e.to_string())?;
+            mark_transfer_activity(&guard.last_activity);
             guard.hasher.update(&pt);
             guard.received += pt.len() as u64;
             guard.next_index += 1;
@@ -492,6 +634,81 @@ pub(crate) fn spawn_transfer_timeout(
     });
 }
 
+pub(crate) fn spawn_connection_timeout(
+    app: tauri::AppHandle,
+    state: Arc<AppState>,
+    session_id: String,
+    timeout_token: u64,
+    connected: Arc<AtomicBool>,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(FILE_CONNECTION_TIMEOUT_SECS)).await;
+        if !connected.load(Ordering::Relaxed) {
+            emit_file_failed_if_active(
+                &app,
+                &state,
+                &session_id,
+                timeout_token,
+                "Could not establish a direct connection in 30 seconds. Open Settings and run Diagnose connection to check VPN, NAT, and STUN access.",
+            )
+            .await;
+        }
+    });
+}
+
+pub(crate) fn spawn_transfer_idle_timeout(
+    app: tauri::AppHandle,
+    state: Arc<AppState>,
+    session_id: String,
+    timeout_token: u64,
+    connected: Arc<AtomicBool>,
+    last_activity: Arc<AtomicU64>,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            if !transfer_timeout_token_is_active(&state, &session_id, timeout_token).await {
+                return;
+            }
+            if !connected.load(Ordering::Relaxed) {
+                continue;
+            }
+            let inactive_for = now_unix().saturating_sub(last_activity.load(Ordering::Relaxed));
+            if inactive_for >= FILE_IDLE_TIMEOUT_SECS {
+                emit_file_failed_if_active(
+                    &app,
+                    &state,
+                    &session_id,
+                    timeout_token,
+                    "File transfer made no progress for 45 seconds. The peer connection may be blocked or unstable.",
+                )
+                .await;
+                return;
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::candidate_types_from_sdp;
+
+    #[test]
+    fn connection_diagnostic_parses_ice_candidate_types() {
+        let sdp = concat!(
+            "v=0\r\n",
+            "a=candidate:1 1 udp 2130706431 192.168.1.5 50000 typ host\r\n",
+            "a=candidate:2 1 udp 1694498815 203.0.113.10 62000 typ srflx raddr 192.168.1.5 rport 50000\r\n",
+            "a=candidate:3 1 udp 1677730815 198.51.100.20 53000 typ relay raddr 203.0.113.10 rport 62000\r\n",
+        );
+
+        assert_eq!(
+            candidate_types_from_sdp(sdp),
+            vec!["host", "srflx", "relay"]
+        );
+    }
+}
+
 pub(crate) async fn emit_file_failed(
     app: &tauri::AppHandle,
     state: &Arc<AppState>,
@@ -543,6 +760,19 @@ pub(crate) fn transfer_timeout_token(record: &TransferRecord) -> u64 {
         TransferRecord::Outgoing(outgoing) => outgoing.timeout_token,
         TransferRecord::Incoming(incoming) => incoming.timeout_token,
     }
+}
+
+pub(crate) async fn transfer_timeout_token_is_active(
+    state: &Arc<AppState>,
+    session_id: &str,
+    timeout_token: u64,
+) -> bool {
+    state
+        .file_transfers
+        .lock()
+        .await
+        .get(session_id)
+        .is_some_and(|record| transfer_timeout_token(record) == timeout_token)
 }
 
 pub(crate) async fn cleanup_transfer_if_timeout_token(

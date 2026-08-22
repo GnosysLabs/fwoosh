@@ -282,6 +282,7 @@ pub fn run() {
             commands::transfer::accept_file_transfer,
             commands::transfer::reject_file_transfer,
             commands::transfer::cancel_file_transfer,
+            commands::transfer::diagnose_file_transfer_connectivity,
             commands::transfer::reveal_received_file,
             commands::history_commands::recent_clips,
             commands::history_commands::search_clips,

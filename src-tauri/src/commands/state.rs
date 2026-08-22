@@ -213,6 +213,8 @@ pub struct OutgoingTransfer {
     pub(crate) recipient_id: crypto::Ed25519PubKey,
     pub(crate) peer: Arc<RTCPeerConnection>,
     pub(crate) timeout_token: u64,
+    pub(crate) connected: Arc<AtomicBool>,
+    pub(crate) last_activity: Arc<AtomicU64>,
 }
 
 pub struct IncomingTransfer {
@@ -249,6 +251,23 @@ pub struct FileTransferProgressDto {
     pub total: u64,
     pub status: String,
     pub message: String,
+}
+
+#[derive(Clone, Serialize)]
+pub struct FileTransferConnectivityDiagnosticsDto {
+    pub relay_ok: bool,
+    pub relay_latency_ms: Option<u64>,
+    pub relay_message: String,
+    pub ice_message: String,
+    pub ice_gathering_complete: bool,
+    pub ice_elapsed_ms: u64,
+    pub candidate_types: Vec<String>,
+    pub host_candidates: usize,
+    pub server_reflexive_candidates: usize,
+    pub relay_candidates: usize,
+    pub severity: String,
+    pub summary: String,
+    pub recommendations: Vec<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -321,6 +340,7 @@ pub struct ReceiverWriteState {
     pub(crate) part_path: PathBuf,
     pub(crate) hasher: Sha256,
     pub(crate) done: bool,
+    pub(crate) last_activity: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -330,6 +350,7 @@ pub struct OutgoingFilePayload {
     pub(crate) total: u64,
     pub(crate) content_key: [u8; 32],
     pub(crate) nonce_prefix: [u8; FILE_NONCE_PREFIX_LEN],
+    pub(crate) last_activity: Arc<AtomicU64>,
 }
 
 // ---- Wire message kinds (postcard-encoded, then base64 by ntfy.rs) ----

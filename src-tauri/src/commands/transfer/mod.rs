@@ -289,6 +289,134 @@ pub(super) fn normalize_transfer_timeout_minutes(minutes: u64) -> Result<u64, St
 }
 
 #[tauri::command]
+pub async fn diagnose_file_transfer_connectivity(
+    state: State<'_, Arc<AppState>>,
+) -> Result<FileTransferConnectivityDiagnosticsDto, String> {
+    let (relay_base, stun_servers) = {
+        let relay_base = state.ntfy_base.lock().await.clone();
+        let stun_servers = state.settings.lock().await.stun_servers.clone();
+        (relay_base, stun_servers)
+    };
+
+    let (relay_result, ice_result) = tokio::join!(
+        ntfy::diagnose_relay(&relay_base),
+        diagnose_ice_candidates(stun_servers)
+    );
+    let (relay_ok, relay_latency_ms, relay_message) = match relay_result {
+        Ok(latency) => (
+            true,
+            Some(latency),
+            format!("Relay reachable in {latency} ms"),
+        ),
+        Err(error) => (false, None, format!("Relay check failed: {error}")),
+    };
+
+    let (ice, ice_message) = match ice_result {
+        Ok(ice) => {
+            let message = if ice.gathering_complete {
+                format!("ICE candidate gathering completed in {} ms", ice.elapsed_ms)
+            } else {
+                format!(
+                    "ICE candidate gathering stopped after {} ms without completing",
+                    ice.elapsed_ms
+                )
+            };
+            (Some(ice), message)
+        }
+        Err(error) => (None, format!("ICE check failed: {error}")),
+    };
+    let has_public_candidate = ice
+        .as_ref()
+        .is_some_and(|result| result.server_reflexive_candidates > 0);
+    let has_relay_candidate = ice
+        .as_ref()
+        .is_some_and(|result| result.relay_candidates > 0);
+    let mut recommendations = Vec::new();
+    let (severity, summary) = if !relay_ok {
+        recommendations.push(
+            "Check the VPN, firewall, DNS, or proxy rules for access to the configured ntfy relay."
+                .to_string(),
+        );
+        (
+            "error".to_string(),
+            "The signaling relay is unreachable, so file-transfer offers and answers cannot be exchanged."
+                .to_string(),
+        )
+    } else if ice.is_none() {
+        recommendations.push(
+            "Check the saved STUN server addresses, then try without the VPN or firewall filtering."
+                .to_string(),
+        );
+        recommendations
+            .push("Try a different network if the ICE check continues to fail.".to_string());
+        (
+            "error".to_string(),
+            "The relay is reachable, but Fwoosh could not run its WebRTC connection check."
+                .to_string(),
+        )
+    } else if !has_public_candidate && !has_relay_candidate {
+        recommendations.push(
+            "Temporarily disable the VPN or allow outbound UDP to the configured STUN server, then run the diagnostic again."
+                .to_string(),
+        );
+        recommendations.push(
+            "Try a different network. Host-only candidates usually cannot cross separate NATs."
+                .to_string(),
+        );
+        (
+            "error".to_string(),
+            "STUN did not discover a public connection candidate. A VPN, firewall, or restrictive NAT is likely blocking direct transfers."
+                .to_string(),
+        )
+    } else {
+        recommendations.push(
+            "STUN is working, but Fwoosh currently has no TURN relay fallback. Symmetric NAT, carrier-grade NAT, and some VPNs can still block peer-to-peer connections."
+                .to_string(),
+        );
+        (
+            if ice.as_ref().is_some_and(|result| result.gathering_complete) {
+                "ok"
+            } else {
+                "warning"
+            }
+            .to_string(),
+            if ice.as_ref().is_some_and(|result| result.gathering_complete) {
+                "Relay and STUN checks passed. Direct connectivity still depends on the other device's network."
+                    .to_string()
+            } else {
+                "A public candidate was found, but ICE gathering did not complete before the diagnostic timeout."
+                    .to_string()
+            },
+        )
+    };
+
+    let ice = ice.unwrap_or(IceCandidateDiagnostics {
+        gathering_complete: false,
+        elapsed_ms: 0,
+        candidate_types: Vec::new(),
+        host_candidates: 0,
+        server_reflexive_candidates: 0,
+        relay_candidates: 0,
+    });
+
+    Ok(FileTransferConnectivityDiagnosticsDto {
+        relay_ok,
+        relay_latency_ms,
+        relay_message,
+        ice_message,
+        ice_gathering_complete: ice.gathering_complete,
+        ice_elapsed_ms: ice.elapsed_ms,
+        candidate_types: ice.candidate_types,
+        host_candidates: ice.host_candidates,
+        server_reflexive_candidates: ice.server_reflexive_candidates,
+        relay_candidates: ice.relay_candidates,
+        severity,
+        summary,
+        recommendations,
+    })
+}
+
+#[tauri::command]
 pub async fn start_file_send(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
@@ -324,6 +452,8 @@ pub async fn start_file_send(
     rand::rng().fill_bytes(&mut nonce_prefix);
     let session_id = new_session_id();
     let timeout_token = new_timeout_token();
+    let connected = Arc::new(AtomicBool::new(false));
+    let last_activity = Arc::new(AtomicU64::new(now_unix()));
     let (stun_servers, transfer_timeout_minutes) = {
         let settings = state.settings.lock().await;
         (
@@ -337,7 +467,10 @@ pub async fn start_file_send(
         app.clone(),
         state.inner().clone(),
         session_id.clone(),
+        timeout_token,
         size,
+        connected.clone(),
+        last_activity.clone(),
     );
     let data_channel = peer
         .create_data_channel("fwoosh-file", None)
@@ -349,6 +482,7 @@ pub async fn start_file_send(
         total: size,
         content_key,
         nonce_prefix,
+        last_activity: last_activity.clone(),
     };
     install_sender_channel(
         data_channel,
@@ -395,17 +529,11 @@ pub async fn start_file_send(
                 recipient_id: recipient.clone(),
                 peer: peer.clone(),
                 timeout_token,
+                connected: connected.clone(),
+                last_activity: last_activity.clone(),
             }),
         );
     }
-    spawn_transfer_timeout(
-        app.clone(),
-        state.inner().clone(),
-        session_id.clone(),
-        timeout_token,
-        transfer_timeout_minutes,
-    );
-
     let signal = FileSignal::Offer {
         session_id: session_id.clone(),
         file_name: file_name.clone(),
@@ -414,7 +542,7 @@ pub async fn start_file_send(
         nonce_prefix,
         sdp_json,
     };
-    publish_file_signal(
+    if let Err(error) = publish_file_signal(
         state.inner(),
         &topic,
         epoch,
@@ -422,8 +550,18 @@ pub async fn start_file_send(
         signal,
         "file-offer",
     )
-    .await?;
-
+    .await
+    {
+        cleanup_transfer(state.inner(), &session_id).await;
+        return Err(error);
+    }
+    spawn_transfer_timeout(
+        app.clone(),
+        state.inner().clone(),
+        session_id.clone(),
+        timeout_token,
+        transfer_timeout_minutes,
+    );
     Ok(TransferDto {
         session_id,
         file_name,
@@ -542,6 +680,8 @@ pub async fn accept_file_transfer(
     };
 
     let timeout_token = new_timeout_token();
+    let connected = Arc::new(AtomicBool::new(false));
+    let last_activity = Arc::new(AtomicU64::new(now_unix()));
     let (stun_servers, transfer_timeout_minutes) = {
         let settings = state.settings.lock().await;
         (
@@ -577,7 +717,10 @@ pub async fn accept_file_transfer(
         app.clone(),
         state.inner().clone(),
         session_id.clone(),
+        timeout_token,
         pending.size,
+        connected.clone(),
+        last_activity.clone(),
     );
 
     let offer: RTCSessionDescription = match serde_json::from_str(&pending.offer_sdp_json) {
@@ -659,6 +802,32 @@ pub async fn accept_file_transfer(
         return Err(e);
     }
 
+    let (topic, epoch) = match current_room_topic_epoch(state.inner()).await {
+        Ok(room) => room,
+        Err(e) => {
+            let _ = peer.close().await;
+            state
+                .file_transfers
+                .lock()
+                .await
+                .insert(session_id.clone(), TransferRecord::PendingIncoming(pending));
+            return Err(e);
+        }
+    };
+    let recipient = match active_device_identity(state.inner(), &pending.sender_id).await {
+        Ok(recipient) => recipient,
+        Err(e) => {
+            let _ = peer.close().await;
+            state
+                .file_transfers
+                .lock()
+                .await
+                .insert(session_id.clone(), TransferRecord::PendingIncoming(pending));
+            return Err(e);
+        }
+    };
+    let peer_label = recipient.label.clone();
+
     let file = match create_new_file(&part_path).await {
         Ok(file) => file,
         Err(e) => {
@@ -689,6 +858,7 @@ pub async fn accept_file_transfer(
             part_path: part_path.clone(),
             hasher: Sha256::new(),
             done: false,
+            last_activity: last_activity.clone(),
         },
     );
 
@@ -701,17 +871,6 @@ pub async fn accept_file_transfer(
             timeout_token,
         }),
     );
-    spawn_transfer_timeout(
-        app.clone(),
-        state.inner().clone(),
-        session_id.clone(),
-        timeout_token,
-        transfer_timeout_minutes,
-    );
-
-    let (topic, epoch) = current_room_topic_epoch(state.inner()).await?;
-    let recipient = active_device_identity(state.inner(), &pending.sender_id).await?;
-    let peer_label = recipient.label.clone();
     if let Err(e) = publish_file_signal(
         state.inner(),
         &topic,
@@ -728,6 +887,28 @@ pub async fn accept_file_transfer(
         cleanup_transfer(state.inner(), &session_id).await;
         return Err(e);
     }
+    spawn_transfer_timeout(
+        app.clone(),
+        state.inner().clone(),
+        session_id.clone(),
+        timeout_token,
+        transfer_timeout_minutes,
+    );
+    spawn_connection_timeout(
+        app.clone(),
+        state.inner().clone(),
+        session_id.clone(),
+        timeout_token,
+        connected.clone(),
+    );
+    spawn_transfer_idle_timeout(
+        app.clone(),
+        state.inner().clone(),
+        session_id.clone(),
+        timeout_token,
+        connected,
+        last_activity,
+    );
 
     Ok(TransferDto {
         session_id,
@@ -1024,13 +1205,18 @@ pub(super) async fn handle_file_signal(
                 emit_file_failed(app, state, &session_id, &e).await;
                 return;
             }
-            let peer = {
+            let outgoing = {
                 let transfers = state.file_transfers.lock().await;
                 match transfers.get(&session_id) {
                     Some(TransferRecord::Outgoing(outgoing))
                         if outgoing.recipient_id == sender_id =>
                     {
-                        Some(outgoing.peer.clone())
+                        Some((
+                            outgoing.peer.clone(),
+                            outgoing.timeout_token,
+                            outgoing.connected.clone(),
+                            outgoing.last_activity.clone(),
+                        ))
                     }
                     Some(TransferRecord::Outgoing(_)) => {
                         eprintln!("file answer ignored: sender did not match transfer");
@@ -1039,13 +1225,29 @@ pub(super) async fn handle_file_signal(
                     _ => None,
                 }
             };
-            let Some(peer) = peer else {
+            let Some((peer, timeout_token, connected, last_activity)) = outgoing else {
                 return;
             };
             match serde_json::from_str::<RTCSessionDescription>(&sdp_json) {
                 Ok(answer) => {
                     if let Err(e) = peer.set_remote_description(answer).await {
                         emit_file_failed(app, state, &session_id, &format!("{e}")).await;
+                    } else {
+                        spawn_connection_timeout(
+                            app.clone(),
+                            state.clone(),
+                            session_id.clone(),
+                            timeout_token,
+                            connected.clone(),
+                        );
+                        spawn_transfer_idle_timeout(
+                            app.clone(),
+                            state.clone(),
+                            session_id.clone(),
+                            timeout_token,
+                            connected,
+                            last_activity,
+                        );
                     }
                 }
                 Err(e) => emit_file_failed(app, state, &session_id, &e.to_string()).await,

@@ -28,6 +28,26 @@ pub const MAX_BODY_BYTES: usize = 3500;
 /// public ntfy.sh 2 MB limit for a 1 MiB text clip plus framing overhead.
 pub const MAX_ATTACHMENT_BYTES: usize = 1_500_000;
 
+/// Verify that the configured relay is reachable without publishing a topic
+/// message. Returns the round-trip latency of the relay health endpoint.
+pub async fn diagnose_relay(base: &str) -> Result<u64, NtfyError> {
+    ensure_rustls_crypto_provider();
+    let https_base = require_tls_base(base)?;
+    let url = format!("{https_base}/v1/health");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()?;
+    let started = std::time::Instant::now();
+    let response = client.get(url).send().await?;
+    let elapsed = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().await.unwrap_or_default();
+        return Err(NtfyError::BadStatus(status.as_u16(), text));
+    }
+    Ok(elapsed)
+}
+
 /// Relay-side caching behavior for a published message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayCache {
