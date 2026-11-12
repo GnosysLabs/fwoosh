@@ -129,9 +129,12 @@ pub(super) fn sanitize_device_label(label: &str) -> Result<String, String> {
 }
 
 pub(super) fn detected_device_label() -> String {
+    #[cfg(not(target_os = "ios"))]
     let label = whoami::devicename()
         .or_else(|_| whoami::hostname())
         .unwrap_or_else(|_| "This device".to_string());
+    #[cfg(target_os = "ios")]
+    let label = "iOS device".to_string();
     sanitize_device_label(&label).unwrap_or_else(|_| "This device".to_string())
 }
 
