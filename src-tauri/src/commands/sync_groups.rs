@@ -363,15 +363,19 @@ pub(super) async fn ensure_active_sync_group(
 }
 
 async fn stop_active_group_runtime(state: &Arc<AppState>) {
+    state.subscriber_generation.fetch_add(1, Ordering::SeqCst);
     if let Some(tx) = state.subscriber_shutdown.lock().await.take() {
         let _ = tx.send(());
     }
+    *state.relay_status.lock().await = RelayStatusDto::default();
     *state.roster.lock().await = None;
     for (_, tx) in state.auxiliary_subscriber_shutdowns.lock().await.drain() {
         let _ = tx.send(());
     }
     *state.pending_network_join.lock().await = None;
     state.pending.lock().await.clear();
+    state.deferred_future_clips.lock().await.clear();
+    *state.last_outbound_epoch.lock().await = None;
 }
 
 pub(super) async fn activate_sync_group(
@@ -405,6 +409,9 @@ pub(super) async fn activate_sync_group(
 
     if let Some(topic) = topic {
         start_subscriber(state, app.clone(), &topic).await;
+    } else {
+        let status = state.relay_status.lock().await.clone();
+        let _ = app.emit("relay-status-changed", status);
     }
     // Invitations belong to configured groups, not only the active runtime.
     // Restart all eligible invitation listeners even when this group does not
@@ -696,9 +703,62 @@ pub(super) async fn broadcast_roster(
         }
     };
     let base = state.ntfy_base.lock().await.clone();
-    if let Err(e) = ntfy::publish(&base, topic, &msg, "roster").await {
-        eprintln!("failed to broadcast roster: {e}");
+    for attempt in 0..3 {
+        match ntfy::publish(&base, topic, &msg, "roster").await {
+            Ok(_) => return,
+            Err(e) if attempt < 2 => {
+                eprintln!("retrying roster broadcast after error: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(500 * (attempt + 1))).await;
+            }
+            Err(e) => {
+                eprintln!("failed to broadcast roster: {e}");
+            }
+        }
     }
+}
+
+/// Load the verified persisted roster chain for the active group so we can
+/// serve multi-epoch catch-up (`from_epoch + 1 ..= current_epoch`) to peers
+/// whose relay cache expired while offline.
+pub(super) async fn load_active_roster_chain_entries(
+    state: &Arc<AppState>,
+    verified: &VerifiedRoster,
+) -> Vec<roster::RosterEntry> {
+    let mut candidate_paths = Vec::new();
+    if let Some(path) = state.roster_path.lock().await.clone() {
+        candidate_paths.push(path);
+    }
+    if let (Ok(groups_dir), Ok(group_id)) = (
+        configured_groups_dir(state).await,
+        current_sync_group_id(state).await,
+    ) {
+        if let Ok(path) = group_roster_path(&groups_dir, &group_id) {
+            if !candidate_paths.contains(&path) {
+                candidate_paths.push(path);
+            }
+        }
+    }
+
+    for path in candidate_paths {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Some(entries) = decode_persisted_roster_entries(&bytes) else {
+            continue;
+        };
+        let Ok(loaded) = verify_persisted_roster_entries(entries.clone()) else {
+            continue;
+        };
+        if loaded.topic() == verified.topic()
+            && loaded.epoch() == verified.epoch()
+            && loaded.entry.prev_hash == verified.entry.prev_hash
+            && loaded.entry.signature == verified.entry.signature
+        {
+            return entries;
+        }
+    }
+
+    vec![verified.entry.clone()]
 }
 
 /// Persist the current roster chain to disk so it survives restarts without
@@ -855,6 +915,8 @@ pub(super) async fn remove_sync_group_from_device(
         drop(settings);
         *state.roster_path.lock().await = None;
         persist_settings(state).await?;
+        let status = state.relay_status.lock().await.clone();
+        let _ = app.emit("relay-status-changed", status);
         let _ = app.emit("sync-group-changed", "");
         let _ = app.emit("roster-updated", ());
     }

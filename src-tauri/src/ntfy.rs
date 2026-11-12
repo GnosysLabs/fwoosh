@@ -13,10 +13,12 @@
 //! opaque bytes to publish and receive opaque bytes on subscribe.
 
 use base64::Engine;
-use futures_util::StreamExt;
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use serde::Deserialize;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
+use tokio_tungstenite::tungstenite::{self, Message};
 
 /// Default public relay. Zero infra cost for the user.
 pub const DEFAULT_BASE: &str = "https://ntfy.sh";
@@ -28,6 +30,48 @@ pub const MAX_BODY_BYTES: usize = 3500;
 /// public ntfy.sh 2 MB limit for a 1 MiB text clip plus framing overhead.
 pub const MAX_ATTACHMENT_BYTES: usize = 1_500_000;
 
+const WS_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Live status transitions emitted by a subscriber task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubscriberStatusEvent {
+    Connecting,
+    Connected,
+    Healthy,
+    Reconnecting(String),
+}
+
+#[derive(Clone, Copy)]
+struct WsHealthTimeouts {
+    ping_interval: Duration,
+    idle_timeout: Duration,
+    watchdog_tick: Duration,
+    write_timeout: Duration,
+    probe_timeout: Duration,
+    sleep_jump_threshold: Duration,
+}
+
+impl Default for WsHealthTimeouts {
+    fn default() -> Self {
+        Self {
+            ping_interval: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(75),
+            watchdog_tick: Duration::from_secs(15),
+            write_timeout: Duration::from_secs(10),
+            probe_timeout: Duration::from_secs(10),
+            sleep_jump_threshold: Duration::from_secs(45),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum StreamPumpOutcome {
+    Shutdown,
+    ConsumerGone,
+    Disconnected(String),
+}
+
 /// Verify that the configured relay is reachable without publishing a topic
 /// message. Returns the round-trip latency of the relay health endpoint.
 pub async fn diagnose_relay(base: &str) -> Result<u64, NtfyError> {
@@ -35,6 +79,7 @@ pub async fn diagnose_relay(base: &str) -> Result<u64, NtfyError> {
     let https_base = require_tls_base(base)?;
     let url = format!("{https_base}/v1/health");
     let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(8))
         .build()?;
     let started = std::time::Instant::now();
@@ -231,6 +276,7 @@ pub async fn publish_with_options(
     let url = format!("{https_base}/{topic}");
 
     let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(15))
         .build()?;
 
@@ -271,6 +317,7 @@ pub async fn publish_attachment_with_options(
     }
     let url = format!("{https_base}/{topic}");
     let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         .build()?;
     let response = client
@@ -316,6 +363,7 @@ pub async fn download_attachment(
     let https_base = require_tls_base(base)?;
     validate_attachment_url(&https_base, &attachment.url)?;
     let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
         // The event URL is validated as same-origin. Do not let a relay-side
         // redirect silently turn the subsequent request into a cross-origin
@@ -380,6 +428,288 @@ pub struct SubscribeConfig {
     pub topic: String,
     /// Last seen message id, for `since=` catch-up on reconnect.
     pub since: Option<String>,
+    /// Optional channel for reporting live subscriber health to the app.
+    pub status_tx: Option<mpsc::UnboundedSender<SubscriberStatusEvent>>,
+    /// Optional wakeup handle used to interrupt backoff or probe a potentially
+    /// stale socket when the user wakes/reveals the app or sends a clip.
+    pub reconnect_notify: Option<Arc<Notify>>,
+}
+
+fn emit_subscriber_status(
+    status_tx: &Option<mpsc::UnboundedSender<SubscriberStatusEvent>>,
+    event: SubscriberStatusEvent,
+) {
+    if let Some(tx) = status_tx {
+        let _ = tx.send(event);
+    }
+}
+
+fn is_bad_request_ws_error(err: &tungstenite::Error) -> bool {
+    matches!(err, tungstenite::Error::Http(resp) if resp.status().as_u16() == 400)
+}
+
+fn friendly_ws_error(err: &tungstenite::Error) -> String {
+    match err {
+        tungstenite::Error::Http(resp) => {
+            format!(
+                "Relay returned HTTP {} while connecting",
+                resp.status().as_u16()
+            )
+        }
+        tungstenite::Error::Io(io_err) => {
+            format!("Network error connecting to relay ({io_err})")
+        }
+        tungstenite::Error::Tls(tls_err) => {
+            format!("TLS error connecting to relay ({tls_err})")
+        }
+        other => format!("Relay connection error ({other})"),
+    }
+}
+
+async fn pump_ws_stream<S>(
+    ws: &mut S,
+    out: &mpsc::Sender<RelayMessage>,
+    shutdown: &mut tokio::sync::oneshot::Receiver<()>,
+    last_id: &mut Option<String>,
+    received_any_frame: &mut bool,
+    status_tx: &Option<mpsc::UnboundedSender<SubscriberStatusEvent>>,
+    reconnect_notify: &Option<Arc<Notify>>,
+    timeouts: WsHealthTimeouts,
+) -> StreamPumpOutcome
+where
+    S: Stream<Item = Result<Message, tungstenite::Error>>
+        + Sink<Message, Error = tungstenite::Error>
+        + Unpin,
+{
+    let mut last_inbound = tokio::time::Instant::now();
+    let mut probe_deadline: Option<tokio::time::Instant> = None;
+    let mut reported_healthy = false;
+    let mut last_wall_clock = std::time::SystemTime::now();
+
+    let mut ping_ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + timeouts.ping_interval,
+        timeouts.ping_interval,
+    );
+    ping_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let mut watchdog_ticker = tokio::time::interval_at(
+        tokio::time::Instant::now() + timeouts.watchdog_tick,
+        timeouts.watchdog_tick,
+    );
+    watchdog_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            _ = &mut *shutdown => {
+                let _ = tokio::time::timeout(Duration::from_secs(2), ws.close()).await;
+                eprintln!("[ntfy] subscriber shutting down");
+                return StreamPumpOutcome::Shutdown;
+            }
+            _ = async {
+                match reconnect_notify {
+                    Some(notify) => notify.notified().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let now_wall = std::time::SystemTime::now();
+                if let Ok(wall_elapsed) = now_wall.duration_since(last_wall_clock) {
+                    if wall_elapsed > timeouts.sleep_jump_threshold {
+                        eprintln!(
+                            "[ntfy] system clock jumped by {}s on wake nudge, reconnecting…",
+                            wall_elapsed.as_secs()
+                        );
+                        return StreamPumpOutcome::Disconnected(
+                            "System woke from sleep — refreshing relay connection".to_string(),
+                        );
+                    }
+                }
+                last_wall_clock = now_wall;
+
+                match tokio::time::timeout(
+                    timeouts.write_timeout,
+                    ws.send(Message::Ping(Default::default())),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        if probe_deadline.is_none() {
+                            probe_deadline =
+                                Some(tokio::time::Instant::now() + timeouts.probe_timeout);
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("[ntfy] ws probe ping error: {e}");
+                        return StreamPumpOutcome::Disconnected(
+                            "Relay socket closed — reconnecting".to_string(),
+                        );
+                    }
+                    Err(_) => {
+                        eprintln!("[ntfy] ws probe ping write timed out");
+                        return StreamPumpOutcome::Disconnected(
+                            "Relay socket stopped responding — reconnecting".to_string(),
+                        );
+                    }
+                }
+            }
+            _ = async {
+                match probe_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                eprintln!("[ntfy] relay did not answer liveness ping in time, reconnecting…");
+                return StreamPumpOutcome::Disconnected(
+                    "Relay connection stopped responding — reconnecting".to_string(),
+                );
+            }
+            _ = ping_ticker.tick() => {
+                match tokio::time::timeout(
+                    timeouts.write_timeout,
+                    ws.send(Message::Ping(Default::default())),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        eprintln!("[ntfy] ws keepalive ping error: {e}");
+                        return StreamPumpOutcome::Disconnected(
+                            "Relay keepalive failed — reconnecting".to_string(),
+                        );
+                    }
+                    Err(_) => {
+                        eprintln!("[ntfy] ws keepalive ping timed out");
+                        return StreamPumpOutcome::Disconnected(
+                            "Relay keepalive timed out — reconnecting".to_string(),
+                        );
+                    }
+                }
+            }
+            _ = watchdog_ticker.tick() => {
+                let now_wall = std::time::SystemTime::now();
+                if let Ok(wall_elapsed) = now_wall.duration_since(last_wall_clock) {
+                    if wall_elapsed > timeouts.sleep_jump_threshold {
+                        eprintln!(
+                            "[ntfy] system clock jumped by {}s (sleep/wake detected), reconnecting…",
+                            wall_elapsed.as_secs()
+                        );
+                        return StreamPumpOutcome::Disconnected(
+                            "System woke from sleep — reconnecting to relay".to_string(),
+                        );
+                    }
+                }
+                last_wall_clock = now_wall;
+
+                if last_inbound.elapsed() >= timeouts.idle_timeout {
+                    eprintln!(
+                        "[ntfy] no inbound traffic or keepalive for {}s, reconnecting…",
+                        last_inbound.elapsed().as_secs()
+                    );
+                    return StreamPumpOutcome::Disconnected(
+                        "Relay keepalive timed out — reconnecting".to_string(),
+                    );
+                }
+            }
+            msg_result = ws.next() => {
+                let Some(msg_result) = msg_result else {
+                    return StreamPumpOutcome::Disconnected(
+                        "Relay stream closed — reconnecting".to_string(),
+                    );
+                };
+                let msg = match msg_result {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("[ntfy] ws read error: {e}");
+                        return StreamPumpOutcome::Disconnected(friendly_ws_error(&e));
+                    }
+                };
+
+                last_inbound = tokio::time::Instant::now();
+                probe_deadline = None;
+                last_wall_clock = std::time::SystemTime::now();
+                *received_any_frame = true;
+                if !reported_healthy {
+                    reported_healthy = true;
+                    emit_subscriber_status(status_tx, SubscriberStatusEvent::Healthy);
+                }
+
+                match msg {
+                    Message::Text(text) => {
+                        let text_str: &str = &text;
+                        let is_idle_event = text_str.contains(r#""event":"open""#)
+                            || text_str.contains(r#""event":"keepalive""#);
+                        if !is_idle_event {
+                            match serde_json::from_str::<NtfyJson>(text_str) {
+                                Ok(parsed) => eprintln!(
+                                    "[ntfy] received event={} id={} message_bytes={}",
+                                    parsed.event.as_deref().unwrap_or("message"),
+                                    parsed.id.as_deref().unwrap_or("<none>"),
+                                    parsed.message.as_ref().map(|m| m.len()).unwrap_or(0)
+                                ),
+                                Err(_) => eprintln!(
+                                    "[ntfy] received non-json websocket message ({} bytes)",
+                                    text_str.len()
+                                ),
+                            }
+                        }
+                        if let Some(rm) = decode_ntfy_json(text_str) {
+                            eprintln!(
+                                "[ntfy] decoded message, {} bytes payload",
+                                rm.payload.len()
+                            );
+                            if !rm.id.is_empty() {
+                                *last_id = Some(rm.id.clone());
+                            }
+                            tokio::select! {
+                                _ = &mut *shutdown => {
+                                    let _ = tokio::time::timeout(
+                                        Duration::from_secs(2),
+                                        ws.close(),
+                                    )
+                                    .await;
+                                    eprintln!("[ntfy] subscriber shutting down");
+                                    return StreamPumpOutcome::Shutdown;
+                                }
+                                result = out.send(rm) => {
+                                    if result.is_err() {
+                                        eprintln!("[ntfy] consumer gone, stopping");
+                                        return StreamPumpOutcome::ConsumerGone;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Message::Ping(payload) => {
+                        match tokio::time::timeout(
+                            timeouts.write_timeout,
+                            ws.send(Message::Pong(payload)),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => {
+                                eprintln!("[ntfy] ws pong write error: {e}");
+                                return StreamPumpOutcome::Disconnected(
+                                    "Relay pong failed — reconnecting".to_string(),
+                                );
+                            }
+                            Err(_) => {
+                                eprintln!("[ntfy] ws pong write timed out");
+                                return StreamPumpOutcome::Disconnected(
+                                    "Relay pong timed out — reconnecting".to_string(),
+                                );
+                            }
+                        }
+                    }
+                    Message::Close(_) => {
+                        return StreamPumpOutcome::Disconnected(
+                            "Relay closed connection — reconnecting".to_string(),
+                        );
+                    }
+                    Message::Pong(_) | Message::Binary(_) | Message::Frame(_) => {}
+                }
+            }
+        }
+    }
 }
 
 /// Spawn a subscriber task. It connects via WSS, decodes incoming messages, and
@@ -399,6 +729,10 @@ pub fn spawn_subscriber(
             Ok(b) => b,
             Err(e) => {
                 eprintln!("ntfy subscribe aborting: {e}");
+                emit_subscriber_status(
+                    &cfg.status_tx,
+                    SubscriberStatusEvent::Reconnecting(e.to_string()),
+                );
                 let _ = out
                     .send(RelayMessage {
                         id: String::new(),
@@ -417,86 +751,97 @@ pub fn spawn_subscriber(
         loop {
             let url = ws_url(&https_base, &cfg.topic, last_id.as_deref());
             eprintln!("[ntfy] connecting to relay (topic hidden)…");
-            let stream = tokio::select! {
+            emit_subscriber_status(&cfg.status_tx, SubscriberStatusEvent::Connecting);
+
+            let connect_attempt = tokio::select! {
                 _ = &mut shutdown => return,
-                stream = tokio_tungstenite::connect_async(&url) => stream,
+                res = tokio::time::timeout(
+                    WS_CONNECT_TIMEOUT,
+                    tokio_tungstenite::connect_async(&url),
+                ) => res,
             };
-            match stream {
-                Ok((mut ws, _)) => {
+
+            let sleep_for = match connect_attempt {
+                Ok(Ok((mut ws, _))) => {
                     eprintln!("[ntfy] WebSocket connected, listening for messages");
-                    backoff = Duration::from_secs(1); // reset on success
-                    loop {
-                        let msg_result = tokio::select! {
-                            _ = &mut shutdown => {
-                                let _ = ws.close(None).await;
-                                eprintln!("[ntfy] subscriber shutting down");
-                                return;
-                            }
-                            msg = ws.next() => msg,
-                        };
-                        let Some(msg_result) = msg_result else {
-                            break;
-                        };
-                        let msg = match msg_result {
-                            Ok(m) => m,
-                            Err(e) => {
-                                eprintln!("[ntfy] ws read error: {e}");
-                                break;
-                            }
-                        };
-                        if let Ok(text) = msg.into_text() {
-                            let is_idle_event = text.contains(r#""event":"open""#)
-                                || text.contains(r#""event":"keepalive""#);
-                            if !is_idle_event {
-                                match serde_json::from_str::<NtfyJson>(&text) {
-                                    Ok(parsed) => eprintln!(
-                                        "[ntfy] received event={} id={} message_bytes={}",
-                                        parsed.event.as_deref().unwrap_or("message"),
-                                        parsed.id.as_deref().unwrap_or("<none>"),
-                                        parsed.message.as_ref().map(|m| m.len()).unwrap_or(0)
-                                    ),
-                                    Err(_) => eprintln!(
-                                        "[ntfy] received non-json websocket message ({} bytes)",
-                                        text.len()
-                                    ),
-                                }
-                            }
-                            if let Some(rm) = decode_ntfy_json(&text) {
-                                eprintln!(
-                                    "[ntfy] decoded message, {} bytes payload",
-                                    rm.payload.len()
-                                );
-                                last_id = Some(rm.id.clone());
-                                tokio::select! {
-                                    _ = &mut shutdown => {
-                                        let _ = ws.close(None).await;
-                                        eprintln!("[ntfy] subscriber shutting down");
-                                        return;
-                                    }
-                                    result = out.send(rm) => {
-                                        if result.is_err() {
-                                            eprintln!("[ntfy] consumer gone, stopping");
-                                            return; // consumer gone
-                                        }
-                                    }
-                                }
+                    emit_subscriber_status(&cfg.status_tx, SubscriberStatusEvent::Connected);
+                    let mut received_any_frame = false;
+                    let outcome = pump_ws_stream(
+                        &mut ws,
+                        &out,
+                        &mut shutdown,
+                        &mut last_id,
+                        &mut received_any_frame,
+                        &cfg.status_tx,
+                        &cfg.reconnect_notify,
+                        WsHealthTimeouts::default(),
+                    )
+                    .await;
+                    match outcome {
+                        StreamPumpOutcome::Shutdown | StreamPumpOutcome::ConsumerGone => return,
+                        StreamPumpOutcome::Disconnected(reason) => {
+                            eprintln!("[ntfy] stream ended ({reason}), reconnecting…");
+                            emit_subscriber_status(
+                                &cfg.status_tx,
+                                SubscriberStatusEvent::Reconnecting(reason),
+                            );
+                            if received_any_frame {
+                                backoff = Duration::from_secs(1);
+                                Duration::from_millis(250)
+                            } else {
+                                let wait = backoff;
+                                backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
+                                wait
                             }
                         }
                     }
-                    eprintln!("[ntfy] stream ended, reconnecting…");
-                    // stream ended; fall through to reconnect
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     eprintln!("[ntfy] ws connect failed: {e}");
+                    if is_bad_request_ws_error(&e) && last_id.is_some() {
+                        eprintln!(
+                            "[ntfy] relay rejected since cursor with HTTP 400; resetting cursor"
+                        );
+                        last_id = None;
+                    }
+                    emit_subscriber_status(
+                        &cfg.status_tx,
+                        SubscriberStatusEvent::Reconnecting(friendly_ws_error(&e)),
+                    );
+                    let wait = backoff;
+                    backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
+                    wait
                 }
-            }
+                Err(_) => {
+                    eprintln!(
+                        "[ntfy] ws connect timed out after {}s",
+                        WS_CONNECT_TIMEOUT.as_secs()
+                    );
+                    emit_subscriber_status(
+                        &cfg.status_tx,
+                        SubscriberStatusEvent::Reconnecting(
+                            "Connection to relay timed out — retrying".to_string(),
+                        ),
+                    );
+                    let wait = backoff;
+                    backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
+                    wait
+                }
+            };
 
-            // Reconnect with backoff, unless shutting down.
+            // Reconnect with backoff, unless shutting down or woken early.
             tokio::select! {
                 _ = &mut shutdown => return,
-                _ = tokio::time::sleep(backoff) => {}
+                _ = tokio::time::sleep(sleep_for) => {}
+                _ = async {
+                    match &cfg.reconnect_notify {
+                        Some(notify) => notify.notified().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    backoff = Duration::from_secs(1);
+                }
             }
-            backoff = (backoff * 2).min(Duration::from_secs(60));
         }
     })
 }
@@ -681,5 +1026,182 @@ mod tests {
         )
         .is_err());
         assert!(validate_attachment_url("https://ntfy.sh", "https://ntfy.sh/admin").is_err());
+    }
+
+    async fn duplex_ws_pair() -> (
+        tokio_tungstenite::WebSocketStream<tokio::io::DuplexStream>,
+        tokio_tungstenite::WebSocketStream<tokio::io::DuplexStream>,
+    ) {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let client_fut = tokio_tungstenite::client_async("ws://localhost/test/ws", client_io);
+        let server_fut = tokio_tungstenite::accept_async(server_io);
+        let (client_res, server_res) = tokio::join!(client_fut, server_fut);
+        (client_res.unwrap().0, server_res.unwrap())
+    }
+
+    #[tokio::test]
+    async fn stream_pump_reconnects_when_keepalive_stalls() {
+        let (mut client_ws, mut server_ws) = duplex_ws_pair().await;
+        // Send initial open frame, then stop reading/responding completely to simulate
+        // a half-open zombie socket after NAT idle drop.
+        server_ws
+            .send(Message::Text(r#"{"event":"open"}"#.into()))
+            .await
+            .unwrap();
+
+        let (out_tx, _out_rx) = mpsc::channel(8);
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+        let (status_tx, mut status_rx) = mpsc::unbounded_channel();
+        let mut last_id = None;
+        let mut received_any_frame = false;
+
+        let timeouts = WsHealthTimeouts {
+            ping_interval: Duration::from_millis(30),
+            idle_timeout: Duration::from_millis(90),
+            watchdog_tick: Duration::from_millis(25),
+            write_timeout: Duration::from_millis(50),
+            probe_timeout: Duration::from_millis(50),
+            sleep_jump_threshold: Duration::from_secs(45),
+        };
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            pump_ws_stream(
+                &mut client_ws,
+                &out_tx,
+                &mut shutdown_rx,
+                &mut last_id,
+                &mut received_any_frame,
+                &Some(status_tx),
+                &None,
+                timeouts,
+            ),
+        )
+        .await
+        .expect("watchdog should break stalled stream");
+
+        assert!(received_any_frame);
+        assert!(matches!(outcome, StreamPumpOutcome::Disconnected(_)));
+        assert_eq!(
+            status_rx.try_recv().ok(),
+            Some(SubscriberStatusEvent::Healthy)
+        );
+        drop(server_ws);
+    }
+
+    #[tokio::test]
+    async fn stream_pump_stays_alive_on_pong_and_delivers_messages() {
+        let (mut client_ws, mut server_ws) = duplex_ws_pair().await;
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+        let (status_tx, mut status_rx) = mpsc::unbounded_channel();
+        let mut last_id = None;
+        let mut received_any_frame = false;
+
+        let server_task = tokio::spawn(async move {
+            server_ws
+                .send(Message::Text(r#"{"event":"open"}"#.into()))
+                .await
+                .unwrap();
+            // Answer two client pings with Pong across >2x idle_timeout, then deliver a message.
+            let mut pongs = 0;
+            while pongs < 2 {
+                if let Some(Ok(Message::Ping(payload))) = server_ws.next().await {
+                    server_ws.send(Message::Pong(payload)).await.unwrap();
+                    pongs += 1;
+                }
+            }
+            server_ws
+                .send(Message::Text(
+                    r#"{"id":"cursor42","message":"aGVsbG8=","time":99}"#.into(),
+                ))
+                .await
+                .unwrap();
+            // Keep socket alive until client shuts down cleanly.
+            while let Some(Ok(_)) = server_ws.next().await {}
+        });
+
+        let timeouts = WsHealthTimeouts {
+            ping_interval: Duration::from_millis(35),
+            idle_timeout: Duration::from_millis(90),
+            watchdog_tick: Duration::from_millis(25),
+            write_timeout: Duration::from_millis(50),
+            probe_timeout: Duration::from_millis(50),
+            sleep_jump_threshold: Duration::from_secs(45),
+        };
+
+        let pump = tokio::spawn(async move {
+            pump_ws_stream(
+                &mut client_ws,
+                &out_tx,
+                &mut shutdown_rx,
+                &mut last_id,
+                &mut received_any_frame,
+                &Some(status_tx),
+                &None,
+                timeouts,
+            )
+            .await;
+            last_id
+        });
+
+        let delivered = tokio::time::timeout(Duration::from_secs(2), out_rx.recv())
+            .await
+            .expect("message should arrive")
+            .expect("channel open");
+        assert_eq!(delivered.id, "cursor42");
+        assert_eq!(delivered.payload, b"hello");
+        assert_eq!(
+            status_rx.try_recv().ok(),
+            Some(SubscriberStatusEvent::Healthy)
+        );
+
+        let _ = shutdown_tx.send(());
+        let final_cursor = pump.await.unwrap();
+        assert_eq!(final_cursor.as_deref(), Some("cursor42"));
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn stream_pump_nudge_detects_half_open_socket() {
+        let (mut client_ws, _server_ws) = duplex_ws_pair().await;
+        let (out_tx, _out_rx) = mpsc::channel(8);
+        let (_shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
+        let notify = Arc::new(Notify::new());
+        let mut last_id = None;
+        let mut received_any_frame = false;
+
+        let timeouts = WsHealthTimeouts {
+            ping_interval: Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(60),
+            watchdog_tick: Duration::from_secs(60),
+            write_timeout: Duration::from_millis(50),
+            probe_timeout: Duration::from_millis(60),
+            sleep_jump_threshold: Duration::from_secs(45),
+        };
+
+        let notify_clone = notify.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            notify_clone.notify_waiters();
+        });
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            pump_ws_stream(
+                &mut client_ws,
+                &out_tx,
+                &mut shutdown_rx,
+                &mut last_id,
+                &mut received_any_frame,
+                &None,
+                &Some(notify),
+                timeouts,
+            ),
+        )
+        .await
+        .expect("probe deadline should fire promptly on silent half-open peer");
+
+        assert!(matches!(outcome, StreamPumpOutcome::Disconnected(_)));
     }
 }

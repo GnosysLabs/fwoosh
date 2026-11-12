@@ -13,10 +13,29 @@ pub struct AppState {
     pub ntfy_base: Mutex<String>,
     /// In-flight partial clips keyed by msg_id: (manifest, received chunks).
     pub pending: Mutex<HashMap<[u8; 16], PendingClip>>,
+    /// Clips received for a future roster epoch while we request missing signed
+    /// roster links from peers. Bounded in count and TTL.
+    pub deferred_future_clips: Mutex<HashMap<[u8; 16], DeferredFutureClip>>,
     /// Last ntfy message id per topic, for `since=` catch-up.
     pub last_msg_ids: Mutex<HashMap<String, String>>,
     /// Handle to the subscriber task (so we can shut it down on topic change).
     pub subscriber_shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Monotonic generation counter for the primary room subscriber so status
+    /// updates from a shutting-down subscriber are ignored.
+    pub subscriber_generation: AtomicU64,
+    /// Wakeup handle that interrupts subscriber backoff or probes an idle
+    /// WebSocket immediately on window reveal / send / wake.
+    pub reconnect_notify: Arc<tokio::sync::Notify>,
+    /// Current live status of the active sync group's relay subscription.
+    pub relay_status: Mutex<RelayStatusDto>,
+    /// Per-topic rate limiter for outbound `RosterSyncRequest` messages.
+    pub last_roster_sync_request: Mutex<HashMap<String, std::time::Instant>>,
+    /// Per-topic rate limiter for outbound roster chain catch-up broadcasts:
+    /// stores `(lowest_requested_epoch_served, when)`.
+    pub last_roster_sync_broadcast: Mutex<HashMap<String, (u64, std::time::Instant)>>,
+    /// Records `(topic, epoch, sent_at)` of the most recent outbound clip so we
+    /// can alert the user if a peer immediately pushes a newer roster epoch.
+    pub last_outbound_epoch: Mutex<Option<(String, u64, std::time::Instant)>>,
     /// Durable, reusable invitations loaded from the OS keychain.
     pub invitations: Mutex<HashMap<String, InvitationRecord>>,
     /// Valid v2 requests waiting for an explicit admin decision.
@@ -49,6 +68,37 @@ pub struct PendingClip {
     pub(crate) chunks: Vec<Option<crypto::Chunk>>,
 }
 
+pub enum DeferredClipBody {
+    Chunks(Vec<Option<crypto::Chunk>>),
+    Attachment(ntfy::RelayAttachment),
+}
+
+pub struct DeferredFutureClip {
+    pub(crate) manifest: crypto::Manifest,
+    pub(crate) body: DeferredClipBody,
+    pub(crate) received_at: std::time::Instant,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RelayStatusDto {
+    /// One of `"disconnected"`, `"connecting"`, `"connected"`, or `"reconnecting"`.
+    pub state: String,
+    pub message: String,
+    pub last_error: Option<String>,
+    pub last_healthy_at: Option<u64>,
+}
+
+impl Default for RelayStatusDto {
+    fn default() -> Self {
+        Self {
+            state: "disconnected".to_string(),
+            message: "Not connected to relay".to_string(),
+            last_error: None,
+            last_healthy_at: None,
+        }
+    }
+}
+
 pub struct FileGrant {
     pub(crate) path: PathBuf,
     pub(crate) created_at: u64,
@@ -62,8 +112,15 @@ impl AppState {
             roster: Mutex::new(None),
             ntfy_base: Mutex::new(ntfy::DEFAULT_BASE.to_string()),
             pending: Mutex::new(HashMap::new()),
+            deferred_future_clips: Mutex::new(HashMap::new()),
             last_msg_ids: Mutex::new(HashMap::new()),
             subscriber_shutdown: Mutex::new(None),
+            subscriber_generation: AtomicU64::new(0),
+            reconnect_notify: Arc::new(tokio::sync::Notify::new()),
+            relay_status: Mutex::new(RelayStatusDto::default()),
+            last_roster_sync_request: Mutex::new(HashMap::new()),
+            last_roster_sync_broadcast: Mutex::new(HashMap::new()),
+            last_outbound_epoch: Mutex::new(None),
             invitations: Mutex::new(HashMap::new()),
             pending_joins: Mutex::new(HashMap::new()),
             pending_network_join: Mutex::new(None),
@@ -214,6 +271,8 @@ pub struct OutgoingTransfer {
     pub(crate) peer: Arc<RTCPeerConnection>,
     pub(crate) timeout_token: u64,
     pub(crate) connected: Arc<AtomicBool>,
+    pub(crate) peer_ringing: Arc<AtomicBool>,
+    pub(crate) sent_epoch: u64,
     pub(crate) last_activity: Arc<AtomicU64>,
 }
 
@@ -299,6 +358,9 @@ pub enum FileSignal {
         session_id: String,
         reason: String,
     },
+    Ringing {
+        session_id: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -375,6 +437,8 @@ pub enum WireMessage {
     PairingGrant(PairingRosterGrant),
     /// Tag 7: signed manifest whose encrypted chunks are in an ntfy attachment.
     ClipAttachment(crypto::Manifest),
+    /// Tag 8: signed request from an active member for missing roster epochs.
+    RosterSyncRequest(RosterSyncRequestMessage),
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -393,6 +457,15 @@ pub struct RenameDeviceMessage {
     pub room_id: String,
     pub roster_epoch: u64,
     pub label: String,
+    pub ts: u64,
+    pub signature: Vec<u8>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct RosterSyncRequestMessage {
+    pub requester_id: crypto::Ed25519PubKey,
+    pub room_id: String,
+    pub current_epoch: u64,
     pub ts: u64,
     pub signature: Vec<u8>,
 }

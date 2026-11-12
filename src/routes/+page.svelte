@@ -82,6 +82,13 @@
   let transferTimeoutMinutes = $state(60);
   let savingNetwork = $state(false);
   let diagnosingNetwork = $state(false);
+  let reconnectingRelay = $state(false);
+  let relayStatus = $state<RelayStatusDto>({
+    state: "disconnected",
+    message: "Not connected to relay",
+    last_error: null,
+    last_healthy_at: null,
+  });
   let networkDiagnostics = $state<FileTransferConnectivityDiagnosticsDto | null>(null);
   let networkDiagnosticsError = $state("");
   let isMobile = $state(false);
@@ -164,6 +171,17 @@
   }
   let pairingSecondsLeft = $derived(Math.max(0, pairingExpiresAt - nowSeconds));
   let pairingExpiryLabel = $derived(formatPairingExpiry(pairingSecondsLeft));
+  let relayIsLive = $derived(inRoom && relayStatus.state === "connected");
+  let relayIsReconnecting = $derived(
+    inRoom && (relayStatus.state === "reconnecting" || relayStatus.state === "connecting")
+  );
+  let relayIndicatorTitle = $derived(
+    !inRoom
+      ? "Not connected to a group"
+      : relayStatus.state === "connected"
+        ? "Connected to relay"
+        : relayStatus.message || "Connecting to relay…"
+  );
   let toastTimer: ReturnType<typeof setTimeout> | null = null;
   let statusTimer: ReturnType<typeof setTimeout> | null = null;
   let pairingTickTimer: ReturnType<typeof setInterval> | null = null;
@@ -196,6 +214,13 @@
     preview: string;
     text: string;
     ts?: number;
+    desktop_attention_handled?: boolean;
+  }
+  interface RelayStatusDto {
+    state: "disconnected" | "connecting" | "connected" | "reconnecting";
+    message: string;
+    last_error: string | null;
+    last_healthy_at: number | null;
   }
   interface DeviceDto {
     id: string;
@@ -295,12 +320,18 @@
     pairingTickTimer = setInterval(() => {
       nowSeconds = Math.floor(Date.now() / 1000);
     }, 1000);
-    const onVisibilityChange = () => {
+    const refreshOnWake = () => {
       if (document.visibilityState === "visible") {
+        void refreshRelayStatus();
+        void refreshRoom();
+        void refreshSyncGroups();
+        void refreshRecentClips();
+        void refreshPendingJoins();
         void refreshPendingFileOffers();
       }
     };
-    document.addEventListener("visibilitychange", onVisibilityChange);
+    document.addEventListener("visibilitychange", refreshOnWake);
+    window.addEventListener("focus", refreshOnWake);
 
     const savedTheme = localStorage.getItem("fwoosh-theme");
     const preferredTheme =
@@ -344,8 +375,24 @@
       // Check if we're already in a room (e.g. after restart).
       await refreshSyncGroups();
       await refreshRoom();
+      await refreshRelayStatus();
       await refreshRecentClips();
       await refreshPendingJoins();
+
+      unlisteners.push(
+        await listen<RelayStatusDto>("relay-status-changed", (e) => {
+          relayStatus = e.payload;
+        })
+      );
+      unlisteners.push(
+        await listen("roster-resynced-after-send", () => {
+          showStatus(
+            "err",
+            "Group membership just updated — please send your clip again",
+            6000
+          );
+        })
+      );
 
       unlisteners.push(
         await listen("clip-received", (e) => {
@@ -493,7 +540,8 @@
       stopPendingJoinPolling();
       clearStatusTimer();
       clearConfettiTimer();
-      document.removeEventListener("visibilitychange", onVisibilityChange);
+      document.removeEventListener("visibilitychange", refreshOnWake);
+      window.removeEventListener("focus", refreshOnWake);
       unlisteners.forEach((u) => void u());
     };
   });
@@ -616,6 +664,27 @@
     }
   }
 
+  async function refreshRelayStatus() {
+    try {
+      relayStatus = await invoke<RelayStatusDto>("relay_status");
+    } catch {
+      /* ignore while backend initialises */
+    }
+  }
+
+  async function reconnectRelay() {
+    if (reconnectingRelay || groupTransitionBusy) return;
+    reconnectingRelay = true;
+    try {
+      relayStatus = await invoke<RelayStatusDto>("reconnect_relay");
+      showStatus("ok", "Refreshing relay connection…", 2500);
+    } catch (e) {
+      showStatus("err", String(e));
+    } finally {
+      reconnectingRelay = false;
+    }
+  }
+
   async function runConnectionDiagnostics() {
     if (groupTransitionBusy) return;
     diagnosingNetwork = true;
@@ -687,7 +756,7 @@
           transferred: terminal ? existing.transferred : 0,
           total: transfer.size,
           status: terminal ? existing.status : transfer.status,
-          message: terminal ? existing.message : "Waiting for recipient",
+          message: existing ? existing.message : "Waiting for recipient",
           path: existing?.path,
           started_at: existing?.started_at ?? Date.now(),
           completed_at: existing?.completed_at,
@@ -1613,6 +1682,9 @@
 
   async function handleIncomingClip(p: ToastInfo) {
     showToast(p);
+    if (p.desktop_attention_handled) {
+      return;
+    }
     const attention = await windowAttentionState();
     if (attention.notify) {
       await notifyIncoming(p);
@@ -1927,6 +1999,15 @@
             >
               {diagnosingNetwork ? "Diagnosing..." : "Diagnose connection"}
             </button>
+            {#if inRoom}
+              <button
+                class="mini-action full"
+                onclick={reconnectRelay}
+                disabled={groupTransitionBusy || reconnectingRelay}
+              >
+                {reconnectingRelay ? "Reconnecting..." : "Reconnect relay"}
+              </button>
+            {/if}
             {#if networkDiagnostics}
               <div
                 class="network-diagnostics {networkDiagnostics.severity}"
@@ -1973,6 +2054,21 @@
       {/if}
     </div>
   </header>
+
+  {#if inRoom && relayStatus.state === "reconnecting"}
+    <div class="relay-banner" role="status" aria-live="polite">
+      <span class="relay-banner-dot" aria-hidden="true"></span>
+      <span class="relay-banner-copy">{relayStatus.message}</span>
+      <button
+        type="button"
+        class="relay-banner-action"
+        onclick={reconnectRelay}
+        disabled={reconnectingRelay || groupTransitionBusy}
+      >
+        {reconnectingRelay ? "Retrying…" : "Reconnect"}
+      </button>
+    </div>
+  {/if}
 
   {#if activeView === "compose"}
     <div class="compose" class:onboarding={!activeSyncGroup}>
@@ -3192,9 +3288,10 @@
       </span>
       <span
         class="connection-indicator"
-        class:live={inRoom}
-        aria-label={inRoom ? "Connected" : "Not connected"}
-        title={inRoom ? "Connected" : "Not connected"}
+        class:live={relayIsLive}
+        class:reconnecting={relayIsReconnecting}
+        aria-label={relayIndicatorTitle}
+        title={relayIndicatorTitle}
       ></span>
     </div>
   </div>
@@ -5862,11 +5959,75 @@
     height: 6px;
     flex: 0 0 6px;
     box-shadow: 0 0 0 2px var(--shell-bg);
+    pointer-events: auto;
   }
   .footer-security .connection-indicator.live {
     box-shadow:
       0 0 0 2px var(--shell-bg),
       0 0 7px rgba(117, 239, 173, 0.55);
+  }
+  .connection-indicator.reconnecting,
+  :global(html[data-theme="light"]) .connection-indicator.reconnecting {
+    background: #f59e0b;
+    box-shadow:
+      0 0 0 2px var(--shell-bg),
+      0 0 8px rgba(245, 158, 11, 0.6);
+    animation: relay-pulse 1.5s ease-in-out infinite;
+  }
+  @keyframes relay-pulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.42;
+    }
+  }
+  .relay-banner {
+    margin: 8px 18px 0;
+    padding: 7px 10px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border-radius: 10px;
+    border: 1px solid rgba(245, 158, 11, 0.36);
+    background: rgba(245, 158, 11, 0.11);
+    color: var(--ink);
+    font-size: 11.5px;
+    line-height: 1.3;
+  }
+  .relay-banner-dot {
+    width: 7px;
+    height: 7px;
+    flex: 0 0 7px;
+    border-radius: 999px;
+    background: #f59e0b;
+    animation: relay-pulse 1.5s ease-in-out infinite;
+  }
+  .relay-banner-copy {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .relay-banner-action {
+    flex: 0 0 auto;
+    padding: 4px 9px;
+    border-radius: 7px;
+    border: 1px solid rgba(245, 158, 11, 0.48);
+    background: rgba(245, 158, 11, 0.18);
+    color: var(--ink);
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .relay-banner-action:hover:not(:disabled) {
+    background: rgba(245, 158, 11, 0.28);
+  }
+  .relay-banner-action:disabled {
+    opacity: 0.55;
+    cursor: default;
   }
   :global(html[data-theme="onyx"]) .footer-security .connection-indicator.live {
     box-shadow:

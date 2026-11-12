@@ -302,12 +302,24 @@ pub async fn diagnose_file_transfer_connectivity(
         ntfy::diagnose_relay(&relay_base),
         diagnose_ice_candidates(stun_servers)
     );
+    state.reconnect_notify.notify_waiters();
+    let live_ws_status = state.relay_status.lock().await.clone();
+    let in_room = state.roster.lock().await.is_some();
     let (relay_ok, relay_latency_ms, relay_message) = match relay_result {
-        Ok(latency) => (
-            true,
-            Some(latency),
-            format!("Relay reachable in {latency} ms"),
-        ),
+        Ok(latency) => {
+            let ws_suffix = if in_room && live_ws_status.state == "reconnecting" {
+                format!("; live WebSocket reconnecting ({})", live_ws_status.message)
+            } else if in_room && live_ws_status.state == "connected" {
+                " (WebSocket live)".to_string()
+            } else {
+                String::new()
+            };
+            (
+                true,
+                Some(latency),
+                format!("Relay reachable in {latency} ms{ws_suffix}"),
+            )
+        }
         Err(error) => (false, None, format!("Relay check failed: {error}")),
     };
 
@@ -453,6 +465,7 @@ pub async fn start_file_send(
     let session_id = new_session_id();
     let timeout_token = new_timeout_token();
     let connected = Arc::new(AtomicBool::new(false));
+    let peer_ringing = Arc::new(AtomicBool::new(false));
     let last_activity = Arc::new(AtomicU64::new(now_unix()));
     let (stun_servers, transfer_timeout_minutes) = {
         let settings = state.settings.lock().await;
@@ -530,6 +543,8 @@ pub async fn start_file_send(
                 peer: peer.clone(),
                 timeout_token,
                 connected: connected.clone(),
+                peer_ringing: peer_ringing.clone(),
+                sent_epoch: epoch,
                 last_activity: last_activity.clone(),
             }),
         );
@@ -555,6 +570,17 @@ pub async fn start_file_send(
         cleanup_transfer(state.inner(), &session_id).await;
         return Err(error);
     }
+    state.reconnect_notify.notify_waiters();
+    spawn_offer_responsiveness_hint(
+        app.clone(),
+        state.inner().clone(),
+        session_id.clone(),
+        timeout_token,
+        size,
+        recipient_label.clone(),
+        connected.clone(),
+        peer_ringing,
+    );
     spawn_transfer_timeout(
         app.clone(),
         state.inner().clone(),
@@ -1078,6 +1104,27 @@ async fn publish_file_signal(
     signal: FileSignal,
     title: &str,
 ) -> Result<(), String> {
+    publish_file_signal_with_options(
+        state,
+        topic,
+        epoch,
+        recipient,
+        signal,
+        title,
+        ntfy::PublishOptions::default(),
+    )
+    .await
+}
+
+async fn publish_file_signal_with_options(
+    state: &Arc<AppState>,
+    topic: &str,
+    epoch: u64,
+    recipient: &roster::DeviceIdentity,
+    signal: FileSignal,
+    title: &str,
+    options: ntfy::PublishOptions,
+) -> Result<(), String> {
     let bytes = postcard::to_allocvec(&signal).map_err(|e| e.to_string())?;
     let text = format!(
         "{}{}",
@@ -1098,9 +1145,82 @@ async fn publish_file_signal(
     )
     .map_err(|e| e.to_string())?;
     let base = state.ntfy_base.lock().await.clone();
-    publish_sealed_clip(&base, topic, sealed, ntfy::PublishOptions::default())
+    publish_sealed_clip(&base, topic, sealed, options)
         .await
         .map_err(|e| format!("{title}: {e}"))
+}
+
+fn spawn_offer_responsiveness_hint(
+    app: tauri::AppHandle,
+    state: Arc<AppState>,
+    session_id: String,
+    timeout_token: u64,
+    total: u64,
+    peer_label: String,
+    connected: Arc<AtomicBool>,
+    peer_ringing: Arc<AtomicBool>,
+) {
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+        if connected.load(Ordering::Relaxed) || peer_ringing.load(Ordering::Relaxed) {
+            return;
+        }
+        let still_waiting = {
+            let transfers = state.file_transfers.lock().await;
+            matches!(
+                transfers.get(&session_id),
+                Some(TransferRecord::Outgoing(outgoing))
+                    if outgoing.timeout_token == timeout_token
+                        && !outgoing.connected.load(Ordering::Relaxed)
+                        && !outgoing.peer_ringing.load(Ordering::Relaxed)
+            )
+        };
+        if still_waiting {
+            let _ = app.emit(
+                "file-transfer-progress",
+                FileTransferProgressDto {
+                    session_id,
+                    transferred: 0,
+                    total,
+                    status: "waiting".to_string(),
+                    message: format!(
+                        "No response from {peer_label} yet — check that Fwoosh is open and connected on that device"
+                    ),
+                },
+            );
+        }
+    });
+}
+
+pub(crate) async fn fail_stale_epoch_outgoing_transfers(
+    state: &Arc<AppState>,
+    app: &tauri::AppHandle,
+    new_epoch: u64,
+) {
+    let stale_sessions: Vec<String> = {
+        let transfers = state.file_transfers.lock().await;
+        transfers
+            .iter()
+            .filter_map(|(session_id, record)| match record {
+                TransferRecord::Outgoing(outgoing)
+                    if outgoing.sent_epoch < new_epoch
+                        && !outgoing.connected.load(Ordering::Relaxed) =>
+                {
+                    Some(session_id.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    for session_id in stale_sessions {
+        emit_file_failed(
+            app,
+            state,
+            &session_id,
+            "Group membership updated while waiting for recipient — please send the file again.",
+        )
+        .await;
+    }
 }
 
 pub(super) fn decode_file_signal(text: &str) -> Result<Option<FileSignal>, String> {
@@ -1180,7 +1300,7 @@ pub(super) async fn handle_file_signal(
             let _ = app.emit(
                 "file-offer-received",
                 FileOfferDto {
-                    session_id,
+                    session_id: session_id.clone(),
                     network_id,
                     sender_id: hex::encode(sender_id.0),
                     sender_label,
@@ -1188,6 +1308,32 @@ pub(super) async fn handle_file_signal(
                     size,
                 },
             );
+            // Acknowledge receipt best-effort so the sender knows the offer
+            // arrived and Fwoosh is running on this device.
+            {
+                let state_for_ring = state.clone();
+                let sender_for_ring = sender_id.clone();
+                let ring_session_id = session_id;
+                tokio::spawn(async move {
+                    if let (Ok((topic, epoch)), Ok(recipient)) = (
+                        current_room_topic_epoch(&state_for_ring).await,
+                        active_device_identity(&state_for_ring, &sender_for_ring).await,
+                    ) {
+                        let _ = publish_file_signal_with_options(
+                            &state_for_ring,
+                            &topic,
+                            epoch,
+                            &recipient,
+                            FileSignal::Ringing {
+                                session_id: ring_session_id,
+                            },
+                            "file-ringing",
+                            ntfy::PublishOptions::no_cache(),
+                        )
+                        .await;
+                    }
+                });
+            }
             // Desktop surfaces an offer by opening the tray popup. Mobile
             // remains in the platform's normal activity lifecycle; it will
             // show the offer when the user opens or resumes Fwoosh.
@@ -1303,6 +1449,40 @@ pub(super) async fn handle_file_signal(
                     message: reason,
                 },
             );
+        }
+        FileSignal::Ringing { session_id } => {
+            if !is_valid_session_id(&session_id) {
+                return;
+            }
+            let matched = {
+                let transfers = state.file_transfers.lock().await;
+                match transfers.get(&session_id) {
+                    Some(TransferRecord::Outgoing(outgoing))
+                        if outgoing.recipient_id == sender_id
+                            && !outgoing.connected.load(Ordering::Relaxed) =>
+                    {
+                        outgoing.peer_ringing.store(true, Ordering::Relaxed);
+                        true
+                    }
+                    _ => false,
+                }
+            };
+            if matched {
+                let peer_label = active_device_identity(state, &sender_id)
+                    .await
+                    .map(|d| d.label)
+                    .unwrap_or_else(|_| "recipient".to_string());
+                let _ = app.emit(
+                    "file-transfer-progress",
+                    FileTransferProgressDto {
+                        session_id,
+                        transferred: 0,
+                        total: 0,
+                        status: "waiting".to_string(),
+                        message: format!("Offer delivered — waiting for {peer_label} to accept"),
+                    },
+                );
+            }
         }
     }
 }

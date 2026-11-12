@@ -697,3 +697,391 @@ fn legacy_roster_migrates_into_default_sync_group() {
     assert_eq!(roster.unwrap().topic(), "legacy-topic");
     assert!(load_persisted_roster(&path).is_some());
 }
+
+fn wire_relay_msg(id: &str, wire: &WireMessage) -> ntfy::RelayMessage {
+    ntfy::RelayMessage {
+        id: id.to_string(),
+        payload: postcard::to_allocvec(&wire).unwrap(),
+        time_ms: 1_000,
+        attachment: None,
+    }
+}
+
+#[derive(Default)]
+struct TestRelayRuntime {
+    resynced_epochs: std::sync::Mutex<Vec<u64>>,
+    received_clips: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+impl relay::RelayRuntime for TestRelayRuntime {
+    fn emit_roster_resynced_after_send(&self, new_epoch: u64) {
+        self.resynced_epochs.lock().unwrap().push(new_epoch);
+    }
+
+    fn on_clip_received(
+        &self,
+        sender_label: String,
+        _clip_preview: String,
+        text: String,
+        _ts: u64,
+    ) {
+        self.received_clips
+            .lock()
+            .unwrap()
+            .push((sender_label, text));
+    }
+}
+
+#[tokio::test]
+async fn receiver_behind_by_multiple_epochs_catches_up_and_opens_deferred_clip() {
+    let runtime = TestRelayRuntime::default();
+    let dir = tempfile::tempdir().unwrap();
+    let admin_groups = dir.path().join("admin-groups");
+    let bob_groups = dir.path().join("bob-groups");
+    std::fs::create_dir_all(&admin_groups).unwrap();
+    std::fs::create_dir_all(&bob_groups).unwrap();
+
+    let group_id = "44444444444444444444444444444444";
+    let topic = "sync-catchup-topic";
+    let admin_keys = DeviceKeypairs::generate();
+    let bob_keys = DeviceKeypairs::generate();
+    let charlie_keys = DeviceKeypairs::generate();
+
+    let e0 = roster::sign_and_chain(
+        &admin_keys,
+        roster::build_genesis(&admin_keys, "Admin", topic),
+        None,
+    )
+    .unwrap();
+    let e1 = roster::sign_and_chain(
+        &admin_keys,
+        roster::build_add_device(&e0, identity(&bob_keys, "Bob Laptop")),
+        Some(&e0),
+    )
+    .unwrap();
+    let e2 = roster::sign_and_chain(
+        &admin_keys,
+        roster::build_add_device(&e1, identity(&charlie_keys, "Charlie Phone")),
+        Some(&e1),
+    )
+    .unwrap();
+    let e3 = roster::sign_and_chain(
+        &admin_keys,
+        roster::build_update_device_label(&e2, &admin_keys.signing_pub, "Admin Desk").unwrap(),
+        Some(&e2),
+    )
+    .unwrap();
+
+    // Admin has full chain [e0, e1, e2, e3] at epoch 3.
+    let admin_state = Arc::new(AppState::new(
+        admin_keys,
+        HistoryStore::open(Path::new(":memory:"), &[21u8; 32]).unwrap(),
+    ));
+    *admin_state.groups_dir.lock().await = Some(admin_groups);
+    {
+        let mut s = admin_state.settings.lock().await;
+        s.sync_groups.push(SyncGroupConfig {
+            id: group_id.to_string(),
+            name: "Personal".to_string(),
+        });
+        s.active_sync_group_id = Some(group_id.to_string());
+    }
+    for entry in [&e0, &e1, &e2, &e3] {
+        let p = sync_groups::persist_sync_group_roster_checked(&admin_state, group_id, entry)
+            .await
+            .unwrap();
+        *admin_state.roster_path.lock().await = Some(p);
+    }
+    let admin_verified =
+        verify_persisted_roster_entries(vec![e0.clone(), e1.clone(), e2.clone(), e3.clone()])
+            .unwrap();
+    *admin_state.roster.lock().await = Some(admin_verified.clone());
+
+    // Bob was offline since epoch 1: only has [e0, e1].
+    let bob_state = Arc::new(AppState::new(
+        bob_keys,
+        HistoryStore::open(Path::new(":memory:"), &[22u8; 32]).unwrap(),
+    ));
+    // Point ntfy_base at an invalid scheme so background fire-and-forget HTTP tasks fail fast.
+    *bob_state.ntfy_base.lock().await = "http://offline.invalid".to_string();
+    *admin_state.ntfy_base.lock().await = "http://offline.invalid".to_string();
+    *bob_state.groups_dir.lock().await = Some(bob_groups);
+    {
+        let mut s = bob_state.settings.lock().await;
+        s.sync_groups.push(SyncGroupConfig {
+            id: group_id.to_string(),
+            name: "Personal".to_string(),
+        });
+        s.active_sync_group_id = Some(group_id.to_string());
+    }
+    let mut bob_roster_path = PathBuf::new();
+    for entry in [&e0, &e1] {
+        bob_roster_path =
+            sync_groups::persist_sync_group_roster_checked(&bob_state, group_id, entry)
+                .await
+                .unwrap();
+        *bob_state.roster_path.lock().await = Some(bob_roster_path.clone());
+    }
+    let bob_verified = verify_persisted_roster_entries(vec![e0.clone(), e1.clone()]).unwrap();
+    *bob_state.roster.lock().await = Some(bob_verified);
+
+    // Admin sends a clip encrypted at epoch 3.
+    let sealed = crypto::seal_compressed_clip(
+        &admin_state.device,
+        &admin_verified.recipients(),
+        "hello across multi-epoch gap",
+        topic,
+        admin_verified.epoch(),
+        StorePolicy::History,
+        500,
+    )
+    .unwrap();
+
+    relay::process_relay_message_with(
+        &bob_state,
+        &runtime,
+        topic,
+        wire_relay_msg("m1", &WireMessage::Manifest(sealed.manifest.clone())),
+    )
+    .await;
+    for (idx, chunk) in sealed.chunks.iter().cloned().enumerate() {
+        relay::process_relay_message_with(
+            &bob_state,
+            &runtime,
+            topic,
+            wire_relay_msg(&format!("c{idx}"), &WireMessage::Chunk(chunk)),
+        )
+        .await;
+    }
+
+    // Clip must stay unopened while Bob is still at epoch 1, buffered in deferred_future_clips.
+    assert_eq!(
+        bob_state
+            .store
+            .recent_for_group(group_id, 10)
+            .unwrap()
+            .len(),
+        0
+    );
+    assert_eq!(bob_state.deferred_future_clips.lock().await.len(), 1);
+
+    // Bob signs a RosterSyncRequest at epoch 1; Admin verifies it and collects [e2, e3].
+    let now = now_unix();
+    let sync_req = sign_roster_sync_request(&bob_state.device, topic.to_string(), 1, now);
+    let (validated_roster, from_epoch) =
+        relay::validate_roster_sync_request(&admin_state, topic, &sync_req, now)
+            .await
+            .expect("valid active member sync request");
+    assert_eq!(from_epoch, 1);
+    let missing =
+        relay::collect_missing_roster_entries(&admin_state, &validated_roster, from_epoch).await;
+    assert_eq!(missing.len(), 2);
+    assert_eq!(missing[0].epoch, 2);
+    assert_eq!(missing[1].epoch, 3);
+
+    // Deliver epoch 2 first: Bob advances to 2, clip for epoch 3 stays buffered.
+    relay::process_relay_message_with(
+        &bob_state,
+        &runtime,
+        topic,
+        wire_relay_msg("r2", &WireMessage::Roster(missing[0].clone())),
+    )
+    .await;
+    assert_eq!(bob_state.roster.lock().await.as_ref().unwrap().epoch(), 2);
+    assert_eq!(bob_state.deferred_future_clips.lock().await.len(), 1);
+    assert_eq!(
+        bob_state
+            .store
+            .recent_for_group(group_id, 10)
+            .unwrap()
+            .len(),
+        0
+    );
+
+    // Deliver epoch 3: Bob advances to 3, persists full chain, and opens the buffered clip!
+    relay::process_relay_message_with(
+        &bob_state,
+        &runtime,
+        topic,
+        wire_relay_msg("r3", &WireMessage::Roster(missing[1].clone())),
+    )
+    .await;
+    assert_eq!(bob_state.roster.lock().await.as_ref().unwrap().epoch(), 3);
+    assert!(bob_state.deferred_future_clips.lock().await.is_empty());
+    assert_eq!(load_persisted_roster(&bob_roster_path).unwrap().epoch(), 3);
+
+    let stored = bob_state.store.recent_for_group(group_id, 10).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].text, "hello across multi-epoch gap");
+    assert_eq!(
+        *runtime.received_clips.lock().unwrap(),
+        vec![(
+            "Admin Desk".to_string(),
+            "hello across multi-epoch gap".to_string()
+        )]
+    );
+}
+
+#[tokio::test]
+async fn stale_epoch_sender_triggers_roster_chain_push_and_flags_stale_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let admin_groups = dir.path().join("admin-groups");
+    std::fs::create_dir_all(&admin_groups).unwrap();
+    let group_id = "55555555555555555555555555555555";
+    let topic = "stale-sender-topic";
+
+    let admin_keys = DeviceKeypairs::generate();
+    let bob_keys = DeviceKeypairs::generate();
+    let charlie_keys = DeviceKeypairs::generate();
+
+    let e0 = roster::sign_and_chain(
+        &admin_keys,
+        roster::build_genesis(&admin_keys, "Admin", topic),
+        None,
+    )
+    .unwrap();
+    let e1 = roster::sign_and_chain(
+        &admin_keys,
+        roster::build_add_device(&e0, identity(&bob_keys, "Bob")),
+        Some(&e0),
+    )
+    .unwrap();
+    let e2 = roster::sign_and_chain(
+        &admin_keys,
+        roster::build_add_device(&e1, identity(&charlie_keys, "Charlie")),
+        Some(&e1),
+    )
+    .unwrap();
+
+    let admin_state = Arc::new(AppState::new(
+        admin_keys,
+        HistoryStore::open(Path::new(":memory:"), &[23u8; 32]).unwrap(),
+    ));
+    *admin_state.ntfy_base.lock().await = "http://offline.invalid".to_string();
+    *admin_state.groups_dir.lock().await = Some(admin_groups);
+    {
+        let mut s = admin_state.settings.lock().await;
+        s.sync_groups.push(SyncGroupConfig {
+            id: group_id.to_string(),
+            name: "Personal".to_string(),
+        });
+        s.active_sync_group_id = Some(group_id.to_string());
+    }
+    for entry in [&e0, &e1, &e2] {
+        let p = sync_groups::persist_sync_group_roster_checked(&admin_state, group_id, entry)
+            .await
+            .unwrap();
+        *admin_state.roster_path.lock().await = Some(p);
+    }
+    *admin_state.roster.lock().await =
+        Some(verify_persisted_roster_entries(vec![e0.clone(), e1.clone(), e2.clone()]).unwrap());
+
+    let bob_state = Arc::new(AppState::new(
+        bob_keys,
+        HistoryStore::open(Path::new(":memory:"), &[24u8; 32]).unwrap(),
+    ));
+    *bob_state.ntfy_base.lock().await = "http://offline.invalid".to_string();
+    let bob_v1 = verify_persisted_roster_entries(vec![e0.clone(), e1.clone()]).unwrap();
+    *bob_state.roster.lock().await = Some(bob_v1.clone());
+
+    // Bob sends a clip while stuck at epoch 1 (recording last_outbound_epoch).
+    *bob_state.last_outbound_epoch.lock().await =
+        Some((topic.to_string(), 1, std::time::Instant::now()));
+    let stale_sealed = crypto::seal_compressed_clip(
+        &bob_state.device,
+        &bob_v1.recipients(),
+        "sent at stale epoch 1",
+        topic,
+        1,
+        StorePolicy::History,
+        600,
+    )
+    .unwrap();
+
+    let admin_runtime = TestRelayRuntime::default();
+    let bob_runtime = TestRelayRuntime::default();
+    relay::process_relay_message_with(
+        &admin_state,
+        &admin_runtime,
+        topic,
+        wire_relay_msg("stale-m", &WireMessage::Manifest(stale_sealed.manifest)),
+    )
+    .await;
+
+    // Admin must reject opening the stale clip AND record a catch-up broadcast from epoch 1.
+    assert!(admin_state.pending.lock().await.is_empty());
+    assert_eq!(
+        admin_state
+            .last_roster_sync_broadcast
+            .lock()
+            .await
+            .get(topic)
+            .map(|(from_ep, _)| *from_ep),
+        Some(1)
+    );
+
+    // When the pushed Roster(e2) arrives at Bob, Bob advances to epoch 2 and emits resync notice.
+    relay::process_relay_message_with(
+        &bob_state,
+        &bob_runtime,
+        topic,
+        wire_relay_msg("r2", &WireMessage::Roster(e2)),
+    )
+    .await;
+    assert_eq!(bob_state.roster.lock().await.as_ref().unwrap().epoch(), 2);
+    assert!(bob_state.last_outbound_epoch.lock().await.is_none());
+    assert_eq!(*bob_runtime.resynced_epochs.lock().unwrap(), vec![2]);
+}
+
+#[tokio::test]
+async fn roster_sync_request_rejects_forged_or_unauthorized_devices() {
+    let topic = "auth-sync-topic";
+    let admin_keys = DeviceKeypairs::generate();
+    let member_keys = DeviceKeypairs::generate();
+    let outsider_keys = DeviceKeypairs::generate();
+
+    let e0 = roster::sign_and_chain(
+        &admin_keys,
+        roster::build_genesis(&admin_keys, "Admin", topic),
+        None,
+    )
+    .unwrap();
+    let e1 = roster::sign_and_chain(
+        &admin_keys,
+        roster::build_add_device(&e0, identity(&member_keys, "Member")),
+        Some(&e0),
+    )
+    .unwrap();
+    let state = Arc::new(AppState::new(
+        admin_keys,
+        HistoryStore::open(Path::new(":memory:"), &[25u8; 32]).unwrap(),
+    ));
+    *state.roster.lock().await = Some(verify_persisted_roster_entries(vec![e0, e1]).unwrap());
+
+    let now = 10_000;
+    // 1. Outsider not in roster is rejected.
+    let outsider_req = sign_roster_sync_request(&outsider_keys, topic.to_string(), 0, now);
+    assert!(
+        relay::validate_roster_sync_request(&state, topic, &outsider_req, now)
+            .await
+            .is_none()
+    );
+
+    // 2. Tampered epoch invalidates Ed25519 signature.
+    let mut tampered = sign_roster_sync_request(&member_keys, topic.to_string(), 0, now);
+    tampered.current_epoch = 0;
+    tampered.ts = now + 1;
+    assert!(
+        relay::validate_roster_sync_request(&state, topic, &tampered, now + 1)
+            .await
+            .is_none()
+    );
+
+    // 3. Stale replay outside 5-minute freshness window is rejected.
+    let old_req = sign_roster_sync_request(&member_keys, topic.to_string(), 0, now - 600);
+    assert!(
+        relay::validate_roster_sync_request(&state, topic, &old_req, now)
+            .await
+            .is_none()
+    );
+}

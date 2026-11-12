@@ -237,6 +237,15 @@ pub fn run() {
                 if let WindowEvent::DragDrop(DragDropEvent::Drop { paths, .. }) = event {
                     grant_dropped_paths(window.app_handle().clone(), paths);
                 }
+                if let WindowEvent::Focused(true) = event {
+                    let app_handle = window.app_handle().clone();
+                    if let Some(state) = app_handle.try_state::<Arc<AppState>>() {
+                        let state = state.inner().clone();
+                        tauri::async_runtime::spawn(async move {
+                            state.reconnect_notify.notify_waiters();
+                        });
+                    }
+                }
             }
             #[cfg(not(desktop))]
             let _ = (window, event);
@@ -276,6 +285,8 @@ pub fn run() {
             commands::sync_groups::room_state,
             commands::sync_groups::roster_devices,
             commands::sync_groups::revoke_device,
+            commands::relay::relay_status,
+            commands::relay::reconnect_relay,
             commands::send_clip,
             commands::transfer::start_file_send,
             commands::transfer::pending_file_offers,

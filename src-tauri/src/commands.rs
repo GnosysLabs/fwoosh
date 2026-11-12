@@ -23,9 +23,10 @@ use pairing_commands::{issue_pairing_code, persist_invitations};
 use sync_groups::{
     activate_sync_group, add_sync_group_config, broadcast_roster, current_sync_group_id,
     decode_persisted_roster_entries, detected_device_label, ensure_active_sync_group,
-    ensure_expected_active_group, load_sync_group_roster, normalize_stun_servers, persist_roster,
-    persist_settings, persist_sync_group_roster_checked, remove_sync_group_from_device,
-    sanitize_device_label, sanitize_sync_group_name, verify_persisted_roster_entries,
+    ensure_expected_active_group, load_active_roster_chain_entries, load_sync_group_roster,
+    normalize_stun_servers, persist_roster, persist_settings, persist_sync_group_roster_checked,
+    remove_sync_group_from_device, sanitize_device_label, sanitize_sync_group_name,
+    verify_persisted_roster_entries,
 };
 pub use sync_groups::{
     create_room, create_sync_group, leave_room, load_persisted_roster, load_settings,
@@ -36,7 +37,7 @@ pub use sync_groups::{
 pub mod state;
 
 pub use state::*;
-mod relay;
+pub mod relay;
 
 use relay::{
     encode_group_removal_notice, encode_roster_move, parse_device_id, publish_sealed_clip,
@@ -44,7 +45,8 @@ use relay::{
     stop_auxiliary_subscriber,
 };
 pub use relay::{
-    handle_relay_message, restart_subscribers, start_invitation_subscribers, start_subscriber,
+    handle_relay_message, reconnect_relay, relay_status, restart_subscribers,
+    start_invitation_subscribers, start_subscriber,
 };
 pub mod history_commands;
 
@@ -87,8 +89,8 @@ pub use transfer::{
     start_file_send,
 };
 use transfer::{
-    cancel_all_transfers, cancel_transfers_not_in_roster, decode_file_signal, handle_file_signal,
-    normalize_transfer_timeout_minutes,
+    cancel_all_transfers, cancel_transfers_not_in_roster, decode_file_signal,
+    fail_stale_epoch_outgoing_transfers, handle_file_signal, normalize_transfer_timeout_minutes,
 };
 #[cfg(test)]
 use transfer::{
@@ -262,6 +264,55 @@ fn verify_rename_device_sig(msg: &RenameDeviceMessage) -> Result<(), String> {
         .map_err(|_| "rename signature verification failed".to_string())
 }
 
+#[derive(serde::Serialize)]
+struct RosterSyncRequestForSigning<'a> {
+    requester_id: &'a crypto::Ed25519PubKey,
+    room_id: &'a str,
+    current_epoch: u64,
+    ts: u64,
+}
+
+fn roster_sync_request_signing_bytes(msg: &RosterSyncRequestMessage) -> Vec<u8> {
+    let view = RosterSyncRequestForSigning {
+        requester_id: &msg.requester_id,
+        room_id: &msg.room_id,
+        current_epoch: msg.current_epoch,
+        ts: msg.ts,
+    };
+    let mut buf = b"Fwoosh roster sync v1".to_vec();
+    buf.extend_from_slice(
+        &postcard::to_allocvec(&view).expect("postcard encode roster sync request"),
+    );
+    buf
+}
+
+fn sign_roster_sync_request(
+    device: &DeviceKeypairs,
+    room_id: String,
+    current_epoch: u64,
+    ts: u64,
+) -> RosterSyncRequestMessage {
+    let mut msg = RosterSyncRequestMessage {
+        requester_id: device.signing_pub.clone(),
+        room_id,
+        current_epoch,
+        ts,
+        signature: Vec::new(),
+    };
+    let bytes = roster_sync_request_signing_bytes(&msg);
+    msg.signature = device.signing.sign(&bytes).to_bytes().to_vec();
+    msg
+}
+
+fn verify_roster_sync_request_sig(msg: &RosterSyncRequestMessage) -> Result<(), String> {
+    let vk = VerifyingKey::from_bytes(&msg.requester_id.0)
+        .map_err(|_| "bad roster sync requester key".to_string())?;
+    let sig = Signature::from_slice(&msg.signature)
+        .map_err(|_| "bad roster sync signature".to_string())?;
+    vk.verify(&roster_sync_request_signing_bytes(msg), &sig)
+        .map_err(|_| "roster sync signature verification failed".to_string())
+}
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -351,6 +402,10 @@ pub async fn send_clip(
         publish_sealed_clip_attachment(&base, &topic, sealed, publish_options).await?;
     }
 
+    *state.last_outbound_epoch.lock().await =
+        Some((topic.clone(), epoch, std::time::Instant::now()));
+    state.reconnect_notify.notify_waiters();
+
     // Also store locally (history) unless private.
     if !private {
         let group_id = current_sync_group_id(state.inner()).await?;
@@ -370,6 +425,14 @@ pub async fn send_clip(
 }
 
 pub fn reveal_main_window(app: &tauri::AppHandle) -> Result<(), String> {
+    if let Some(state) = app.try_state::<Arc<AppState>>() {
+        let state = state.inner().clone();
+        let app_clone = app.clone();
+        tauri::async_runtime::spawn(async move {
+            relay::nudge_or_ensure_subscriber(&state, app_clone).await;
+        });
+    }
+
     #[cfg(desktop)]
     {
         let win = app
