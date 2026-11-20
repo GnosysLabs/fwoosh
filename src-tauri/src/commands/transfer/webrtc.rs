@@ -756,7 +756,7 @@ pub(crate) async fn emit_file_failed_if_active(
 
 pub(crate) fn transfer_timeout_token(record: &TransferRecord) -> u64 {
     match record {
-        TransferRecord::PendingIncoming(pending) => pending.timeout_token,
+        TransferRecord::PendingIncoming(pending) | TransferRecord::AcceptingIncoming(pending) => pending.timeout_token,
         TransferRecord::Outgoing(outgoing) => outgoing.timeout_token,
         TransferRecord::Incoming(incoming) => incoming.timeout_token,
     }
@@ -879,7 +879,7 @@ pub(crate) async fn remove_transfer_matching_sender(
     let matches_sender = match transfers.get(session_id) {
         Some(TransferRecord::Outgoing(outgoing)) => &outgoing.recipient_id == sender_id,
         Some(TransferRecord::Incoming(incoming)) => &incoming.sender_id == sender_id,
-        Some(TransferRecord::PendingIncoming(pending)) => &pending.sender_id == sender_id,
+        Some(TransferRecord::PendingIncoming(pending)) | Some(TransferRecord::AcceptingIncoming(pending)) => &pending.sender_id == sender_id,
         None => false,
     };
     if matches_sender {
@@ -965,7 +965,7 @@ pub(crate) fn transfer_is_stale_for_roster(
         return true;
     }
     let peer_id = match record {
-        TransferRecord::PendingIncoming(pending) => &pending.sender_id,
+        TransferRecord::PendingIncoming(pending) | TransferRecord::AcceptingIncoming(pending) => &pending.sender_id,
         TransferRecord::Outgoing(outgoing) => &outgoing.recipient_id,
         TransferRecord::Incoming(incoming) => &incoming.sender_id,
     };
@@ -981,6 +981,6 @@ pub(crate) async fn cleanup_transfer_record(record: Option<TransferRecord>) {
         Some(TransferRecord::Outgoing(outgoing)) => {
             let _ = outgoing.peer.close().await;
         }
-        Some(TransferRecord::PendingIncoming(_)) | None => {}
+        Some(TransferRecord::PendingIncoming(_)) | Some(TransferRecord::AcceptingIncoming(_)) | None => {}
     }
 }

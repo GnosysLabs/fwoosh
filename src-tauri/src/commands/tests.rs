@@ -574,6 +574,140 @@ async fn terminal_transfer_state_can_only_be_claimed_once() {
 }
 
 #[tokio::test]
+async fn accepting_incoming_transfer_is_hidden_from_pending_offers_and_cannot_be_rejected() {
+    let store = HistoryStore::open(Path::new(":memory:"), &[10u8; 32]).unwrap();
+    let state = Arc::new(AppState::new(DeviceKeypairs::generate(), store));
+    let session_id = "33333333333333333333333333333333";
+    let sender_id = crypto::Ed25519PubKey([2u8; 32]);
+    state.file_transfers.lock().await.insert(
+        session_id.to_string(),
+        TransferRecord::PendingIncoming(PendingIncomingTransfer {
+            network_id: "group-a".to_string(),
+            sender_id: sender_id.clone(),
+            file_name: "extension.zip".to_string(),
+            size: 1234,
+            content_key: [3u8; 32],
+            nonce_prefix: [4u8; FILE_NONCE_PREFIX_LEN],
+            offer_sdp_json: "{}".to_string(),
+            timeout_token: 200,
+        }),
+    );
+
+    assert_eq!(collect_pending_file_offers(&state).await.len(), 1);
+
+    let pending_for_dialog =
+        begin_accepting_pending_transfer(&state, "group-a", session_id)
+            .await
+            .unwrap();
+    assert_eq!(pending_for_dialog.file_name, "extension.zip");
+
+    // While the native Save dialog is open, refocus/wake queries must not
+    // re-expose the offer as pending, and concurrent reject/accept calls must
+    // leave the in-progress acceptance intact.
+    assert!(collect_pending_file_offers(&state).await.is_empty());
+    assert_eq!(
+        take_pending_for_rejection(&state, session_id)
+            .await
+            .err()
+            .as_deref(),
+        Some("transfer is not waiting for rejection")
+    );
+    assert_eq!(
+        begin_accepting_pending_transfer(&state, "group-a", session_id)
+            .await
+            .err()
+            .as_deref(),
+        Some("transfer is not waiting for acceptance")
+    );
+
+    let claimed = take_accepting_pending_transfer(&state, "group-a", session_id)
+        .await
+        .unwrap();
+    assert_eq!(claimed.sender_id, sender_id);
+    assert!(state.file_transfers.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn restoring_accepting_transfer_reexposes_offer_unless_cancelled_or_timed_out() {
+    let store = HistoryStore::open(Path::new(":memory:"), &[11u8; 32]).unwrap();
+    let state = Arc::new(AppState::new(DeviceKeypairs::generate(), store));
+    let sender_id = crypto::Ed25519PubKey([5u8; 32]);
+
+    // Cancelling the Save dialog restores PendingIncoming so the user can retry or decline.
+    let retry_session = "44444444444444444444444444444444";
+    state.file_transfers.lock().await.insert(
+        retry_session.to_string(),
+        TransferRecord::PendingIncoming(PendingIncomingTransfer {
+            network_id: "group-a".to_string(),
+            sender_id: sender_id.clone(),
+            file_name: "retry.zip".to_string(),
+            size: 42,
+            content_key: [3u8; 32],
+            nonce_prefix: [4u8; FILE_NONCE_PREFIX_LEN],
+            offer_sdp_json: "{}".to_string(),
+            timeout_token: 201,
+        }),
+    );
+    begin_accepting_pending_transfer(&state, "group-a", retry_session)
+        .await
+        .unwrap();
+    restore_accepting_pending_transfer(&state, retry_session, 201).await;
+    assert_eq!(collect_pending_file_offers(&state).await.len(), 1);
+    assert!(take_pending_for_rejection(&state, retry_session)
+        .await
+        .unwrap()
+        .is_some());
+
+    // If the sender cancels while the Save dialog is open, restoring must not resurrect it.
+    let cancelled_session = "55555555555555555555555555555555";
+    state.file_transfers.lock().await.insert(
+        cancelled_session.to_string(),
+        TransferRecord::PendingIncoming(PendingIncomingTransfer {
+            network_id: "group-a".to_string(),
+            sender_id: sender_id.clone(),
+            file_name: "cancelled.zip".to_string(),
+            size: 42,
+            content_key: [3u8; 32],
+            nonce_prefix: [4u8; FILE_NONCE_PREFIX_LEN],
+            offer_sdp_json: "{}".to_string(),
+            timeout_token: 202,
+        }),
+    );
+    begin_accepting_pending_transfer(&state, "group-a", cancelled_session)
+        .await
+        .unwrap();
+    assert!(
+        remove_transfer_matching_sender(&state, cancelled_session, &sender_id)
+            .await
+            .is_some()
+    );
+    restore_accepting_pending_transfer(&state, cancelled_session, 202).await;
+    assert!(collect_pending_file_offers(&state).await.is_empty());
+
+    // Timeouts still clean up an offer even if the Save dialog is open.
+    let timeout_session = "66666666666666666666666666666666";
+    state.file_transfers.lock().await.insert(
+        timeout_session.to_string(),
+        TransferRecord::PendingIncoming(PendingIncomingTransfer {
+            network_id: "group-a".to_string(),
+            sender_id,
+            file_name: "timeout.zip".to_string(),
+            size: 42,
+            content_key: [3u8; 32],
+            nonce_prefix: [4u8; FILE_NONCE_PREFIX_LEN],
+            offer_sdp_json: "{}".to_string(),
+            timeout_token: 203,
+        }),
+    );
+    begin_accepting_pending_transfer(&state, "group-a", timeout_session)
+        .await
+        .unwrap();
+    assert!(cleanup_transfer_if_timeout_token(&state, timeout_session, 203).await);
+    restore_accepting_pending_transfer(&state, timeout_session, 203).await;
+    assert!(state.file_transfers.lock().await.is_empty());
+}
+
+#[tokio::test]
 async fn completed_received_file_lookup_rejects_arbitrary_paths() {
     let store = HistoryStore::open(Path::new(":memory:"), &[9u8; 32]).unwrap();
     let state = Arc::new(AppState::new(DeviceKeypairs::generate(), store));

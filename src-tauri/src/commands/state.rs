@@ -250,6 +250,7 @@ pub struct PairingRosterPayload {
 
 pub enum TransferRecord {
     PendingIncoming(PendingIncomingTransfer),
+    AcceptingIncoming(PendingIncomingTransfer),
     Outgoing(OutgoingTransfer),
     Incoming(IncomingTransfer),
 }

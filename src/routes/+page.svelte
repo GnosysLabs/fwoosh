@@ -100,7 +100,8 @@
   let pendingFile = $state<DroppedFile | null>(null);
   let sendingFile = $state(false);
   let incomingFileOffer = $state<FileOfferDto | null>(null);
-  let acceptingFile = $state(false);
+  let acceptingSessionId = $state<string | null>(null);
+  let acceptingFile = $derived(acceptingSessionId !== null);
   let transfers = $state<Record<string, TransferView>>({});
   let expandedTransferIds = $state<Set<string>>(new Set());
   let dismissedTransferIds = $state<Set<string>>(new Set());
@@ -778,9 +779,9 @@
     ) {
       return;
     }
-    acceptingFile = true;
+    const offer = incomingFileOffer;
+    acceptingSessionId = offer.session_id;
     try {
-      const offer = incomingFileOffer;
       const transfer = await invoke<TransferDto>("accept_file_transfer", {
         sessionId: offer.session_id,
         networkId: offer.network_id,
@@ -810,17 +811,24 @@
         showStatus("err", String(e));
       }
     } finally {
-      acceptingFile = false;
+      acceptingSessionId = null;
       void refreshPendingFileOffers();
     }
   }
 
   function trackIncomingFileOffer(offer: FileOfferDto) {
     if (dismissedTransferIds.has(offer.session_id)) return;
-    if (groupTransitionBusy || activeSyncGroup?.id !== offer.network_id) {
+    if (acceptingSessionId === offer.session_id) return;
+    if (
+      switchingGroup ||
+      removingSyncGroup ||
+      creatingSyncGroup ||
+      activeSyncGroup?.id !== offer.network_id
+    ) {
       void invoke("reject_file_transfer", { sessionId: offer.session_id }).catch(() => {});
       return;
     }
+    if (acceptingFile) return;
     incomingFileOffer = offer;
 
     const existing = transfers[offer.session_id];
@@ -846,8 +854,10 @@
   // bound to their sync group, so stale offers are declined rather than being
   // shown in another group's UI.
   async function refreshPendingFileOffers() {
+    if (acceptingFile) return;
     try {
       const offers = await invoke<FileOfferDto[]>("pending_file_offers");
+      if (acceptingFile) return;
       const activeSession = incomingFileOffer?.session_id;
       if (activeSession && !offers.some((offer) => offer.session_id === activeSession)) {
         incomingFileOffer = null;
@@ -859,7 +869,7 @@
   }
 
   async function rejectIncomingFile() {
-    if (!incomingFileOffer) return;
+    if (!incomingFileOffer || acceptingFile) return;
     const offer = incomingFileOffer;
     incomingFileOffer = null;
 

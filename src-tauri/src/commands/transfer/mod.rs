@@ -42,7 +42,7 @@ pub(super) use webrtc::{cancel_all_transfers, cancel_transfers_not_in_roster};
 pub(super) use webrtc::{
     cleanup_transfer, cleanup_transfer_if_timeout_token, completed_received_file_path,
     ensure_receive_destination_available, finalize_received_file_no_overwrite,
-    remember_completed_received_file, take_transfer,
+    remember_completed_received_file, remove_transfer_matching_sender, take_transfer,
 };
 
 pub(super) fn safe_default_file_name(file_name: &str) -> String {
@@ -598,13 +598,9 @@ pub async fn start_file_send(
     })
 }
 
-/// Return offers that are still waiting for a local accept/decline decision.
-/// This lets a resumed mobile webview recover an offer whose live event was
-/// emitted while the UI was suspended.
-#[tauri::command]
-pub async fn pending_file_offers(
-    state: State<'_, Arc<AppState>>,
-) -> Result<Vec<FileOfferDto>, String> {
+pub(super) async fn collect_pending_file_offers(
+    state: &Arc<AppState>,
+) -> Vec<FileOfferDto> {
     let pending = {
         let transfers = state.file_transfers.lock().await;
         transfers
@@ -613,14 +609,16 @@ pub async fn pending_file_offers(
                 TransferRecord::PendingIncoming(pending) => {
                     Some((session_id.clone(), pending.clone()))
                 }
-                TransferRecord::Outgoing(_) | TransferRecord::Incoming(_) => None,
+                TransferRecord::AcceptingIncoming(_)
+                | TransferRecord::Outgoing(_)
+                | TransferRecord::Incoming(_) => None,
             })
             .collect::<Vec<_>>()
     };
 
     let mut offers = Vec::with_capacity(pending.len());
     for (session_id, pending) in pending {
-        let sender_label = active_device_identity(state.inner(), &pending.sender_id)
+        let sender_label = active_device_identity(state, &pending.sender_id)
             .await
             .map(|device| device.label)
             .unwrap_or_else(|_| hex::encode(&pending.sender_id.0[..4]));
@@ -634,7 +632,108 @@ pub async fn pending_file_offers(
         });
     }
     offers.sort_by(|left, right| left.session_id.cmp(&right.session_id));
-    Ok(offers)
+    offers
+}
+
+pub(super) async fn begin_accepting_pending_transfer(
+    state: &Arc<AppState>,
+    network_id: &str,
+    session_id: &str,
+) -> Result<PendingIncomingTransfer, String> {
+    let mut transfers = state.file_transfers.lock().await;
+    match transfers.remove(session_id) {
+        Some(TransferRecord::PendingIncoming(pending)) if pending.network_id == network_id => {
+            let cloned = pending.clone();
+            transfers.insert(
+                session_id.to_string(),
+                TransferRecord::AcceptingIncoming(pending),
+            );
+            Ok(cloned)
+        }
+        Some(TransferRecord::PendingIncoming(pending)) => {
+            transfers.insert(
+                session_id.to_string(),
+                TransferRecord::PendingIncoming(pending),
+            );
+            Err("file offer belongs to another sync group".to_string())
+        }
+        Some(other) => {
+            transfers.insert(session_id.to_string(), other);
+            Err("transfer is not waiting for acceptance".to_string())
+        }
+        None => Err("transfer not found".to_string()),
+    }
+}
+
+pub(super) async fn restore_accepting_pending_transfer(
+    state: &Arc<AppState>,
+    session_id: &str,
+    expected_timeout_token: u64,
+) {
+    let mut transfers = state.file_transfers.lock().await;
+    let should_restore = matches!(
+        transfers.get(session_id),
+        Some(TransferRecord::AcceptingIncoming(pending))
+            if pending.timeout_token == expected_timeout_token
+    );
+    if should_restore {
+        if let Some(TransferRecord::AcceptingIncoming(pending)) = transfers.remove(session_id) {
+            transfers.insert(
+                session_id.to_string(),
+                TransferRecord::PendingIncoming(pending),
+            );
+        }
+    }
+}
+
+pub(super) async fn take_accepting_pending_transfer(
+    state: &Arc<AppState>,
+    network_id: &str,
+    session_id: &str,
+) -> Result<PendingIncomingTransfer, String> {
+    let mut transfers = state.file_transfers.lock().await;
+    match transfers.remove(session_id) {
+        Some(TransferRecord::AcceptingIncoming(pending)) if pending.network_id == network_id => {
+            Ok(pending)
+        }
+        Some(TransferRecord::AcceptingIncoming(pending)) => {
+            transfers.insert(
+                session_id.to_string(),
+                TransferRecord::PendingIncoming(pending),
+            );
+            Err("file offer belongs to another sync group".to_string())
+        }
+        Some(other) => {
+            transfers.insert(session_id.to_string(), other);
+            Err("transfer is not waiting for acceptance".to_string())
+        }
+        None => Err("transfer not found".to_string()),
+    }
+}
+
+pub(super) async fn take_pending_for_rejection(
+    state: &Arc<AppState>,
+    session_id: &str,
+) -> Result<Option<PendingIncomingTransfer>, String> {
+    let mut transfers = state.file_transfers.lock().await;
+    match transfers.remove(session_id) {
+        Some(TransferRecord::PendingIncoming(pending)) => Ok(Some(pending)),
+        Some(other) => {
+            transfers.insert(session_id.to_string(), other);
+            Err("transfer is not waiting for rejection".to_string())
+        }
+        None => Ok(None),
+    }
+}
+
+/// Return offers that are still waiting for a local accept/decline decision.
+/// This lets a resumed mobile webview recover an offer whose live event was
+/// emitted while the UI was suspended.
+#[tauri::command]
+pub async fn pending_file_offers(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<FileOfferDto>, String> {
+    Ok(collect_pending_file_offers(state.inner()).await)
 }
 
 #[tauri::command]
@@ -652,58 +751,61 @@ pub async fn accept_file_transfer(
     if !is_valid_session_id(&session_id) {
         return Err("transfer id is invalid".to_string());
     }
-    let pending_for_dialog = {
-        let transfers = state.file_transfers.lock().await;
-        match transfers.get(&session_id) {
-            Some(TransferRecord::PendingIncoming(pending)) if pending.network_id == network_id => {
-                pending.clone()
-            }
-            Some(TransferRecord::PendingIncoming(_)) => {
-                return Err("file offer belongs to another sync group".to_string())
-            }
-            Some(_) => return Err("transfer is not waiting for acceptance".to_string()),
-            None => return Err("transfer not found".to_string()),
+    let pending_for_dialog =
+        begin_accepting_pending_transfer(state.inner(), &network_id, &session_id).await?;
+    let expected_timeout_token = pending_for_dialog.timeout_token;
+
+    let save_destination = match pick_save_path(&app, &pending_for_dialog.file_name) {
+        Ok(dest) => dest,
+        Err(e) => {
+            restore_accepting_pending_transfer(state.inner(), &session_id, expected_timeout_token)
+                .await;
+            return Err(e);
         }
     };
-    let save_destination = pick_save_path(&app, &pending_for_dialog.file_name)?;
     #[cfg(desktop)]
-    let (final_path, final_destination, part_path) = {
+    let (final_path, final_destination, part_path) = match (|| {
         let save_path = save_destination
             .into_path()
             .map_err(|_| "dialog returned an invalid local file path".to_string())?;
         ensure_receive_destination_available(&save_path)?;
         let part_path = part_path_for(&save_path);
         ensure_receive_destination_available(&part_path)?;
-        (Some(save_path), None, part_path)
-    };
-    #[cfg(mobile)]
-    let (final_path, final_destination, part_path) = (
-        None,
-        Some(save_destination),
-        mobile_receive_part_path(&app, &session_id)?,
-    );
-    {
-        let settings = state.settings.lock().await;
-        ensure_expected_active_group(&settings, &network_id, "accepting the file transfer")?;
-    }
-
-    let pending = {
-        let mut transfers = state.file_transfers.lock().await;
-        match transfers.remove(&session_id) {
-            Some(TransferRecord::PendingIncoming(pending)) if pending.network_id == network_id => {
-                pending
-            }
-            Some(TransferRecord::PendingIncoming(pending)) => {
-                transfers.insert(session_id.clone(), TransferRecord::PendingIncoming(pending));
-                return Err("file offer belongs to another sync group".to_string());
-            }
-            Some(other) => {
-                transfers.insert(session_id.clone(), other);
-                return Err("transfer is not waiting for acceptance".to_string());
-            }
-            None => return Err("transfer not found".to_string()),
+        Ok::<_, String>((Some(save_path), None, part_path))
+    })() {
+        Ok(paths) => paths,
+        Err(e) => {
+            restore_accepting_pending_transfer(state.inner(), &session_id, expected_timeout_token)
+                .await;
+            return Err(e);
         }
     };
+    #[cfg(mobile)]
+    let (final_path, final_destination, part_path) =
+        match mobile_receive_part_path(&app, &session_id) {
+            Ok(part_path) => (None, Some(save_destination), part_path),
+            Err(e) => {
+                restore_accepting_pending_transfer(
+                    state.inner(),
+                    &session_id,
+                    expected_timeout_token,
+                )
+                .await;
+                return Err(e);
+            }
+        };
+    let active_group_check = {
+        let settings = state.settings.lock().await;
+        ensure_expected_active_group(&settings, &network_id, "accepting the file transfer")
+    };
+    if let Err(e) = active_group_check {
+        restore_accepting_pending_transfer(state.inner(), &session_id, expected_timeout_token)
+            .await;
+        return Err(e);
+    }
+
+    let pending =
+        take_accepting_pending_transfer(state.inner(), &network_id, &session_id).await?;
 
     let timeout_token = new_timeout_token();
     let connected = Arc::new(AtomicBool::new(false));
@@ -727,13 +829,10 @@ pub async fn accept_file_transfer(
         }
     };
     {
-        let transfers = state.file_transfers.lock().await;
+        let mut transfers = state.file_transfers.lock().await;
         if let Err(e) = ensure_transfer_capacity(&transfers) {
-            state
-                .file_transfers
-                .lock()
-                .await
-                .insert(session_id.clone(), TransferRecord::PendingIncoming(pending));
+            transfers.insert(session_id.clone(), TransferRecord::PendingIncoming(pending));
+            drop(transfers);
             let _ = peer.close().await;
             return Err(e);
         }
@@ -951,16 +1050,8 @@ pub async fn reject_file_transfer(
     state: State<'_, Arc<AppState>>,
     session_id: String,
 ) -> Result<(), String> {
-    let pending = {
-        let mut transfers = state.file_transfers.lock().await;
-        match transfers.remove(&session_id) {
-            Some(TransferRecord::PendingIncoming(pending)) => pending,
-            Some(other) => {
-                transfers.insert(session_id.clone(), other);
-                return Err("transfer is not waiting for rejection".to_string());
-            }
-            None => return Ok(()),
-        }
+    let Some(pending) = take_pending_for_rejection(state.inner(), &session_id).await? else {
+        return Ok(());
     };
     let (topic, epoch) = current_room_topic_epoch(state.inner()).await?;
     let recipient = active_device_identity(state.inner(), &pending.sender_id).await?;
@@ -1020,7 +1111,9 @@ pub async fn cancel_file_transfer(
             )
             .await
         }
-        Some(TransferRecord::PendingIncoming(_)) | None => Ok(()),
+        Some(TransferRecord::PendingIncoming(_))
+        | Some(TransferRecord::AcceptingIncoming(_))
+        | None => Ok(()),
     }
 }
 

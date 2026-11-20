@@ -94,9 +94,12 @@ use transfer::{
 };
 #[cfg(test)]
 use transfer::{
-    cleanup_transfer, cleanup_transfer_if_timeout_token, completed_received_file_path,
+    begin_accepting_pending_transfer, cleanup_transfer, cleanup_transfer_if_timeout_token,
+    collect_pending_file_offers, completed_received_file_path,
     ensure_receive_destination_available, finalize_received_file_no_overwrite,
-    remember_completed_received_file, safe_default_file_name, take_transfer,
+    remember_completed_received_file, remove_transfer_matching_sender,
+    restore_accepting_pending_transfer, safe_default_file_name, take_accepting_pending_transfer,
+    take_pending_for_rejection, take_transfer,
 };
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
