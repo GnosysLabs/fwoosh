@@ -59,6 +59,9 @@ apple-native-keyring-store = { version = "1.0.0", features = ["keychain"] }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 apple-native-keyring-store = { version = "1.0.0", features = ["protected"] }
+# libc 0.2.190+ removed sockaddr_ctl on iOS, breaking nix 0.26.4 (via webrtc-util).
+# Tracking: https://github.com/rust-lang/libc/issues/5693
+libc = ">=0.2.150, <0.2.190"
 
 [target.'cfg(target_os = "android")'.dependencies]
 android-native-keyring-store = "1.0.0"

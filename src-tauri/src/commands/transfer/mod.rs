@@ -192,7 +192,8 @@ fn android_display_name(app: &tauri::AppHandle, uri: &str) -> Option<String> {
                         return Ok(None);
                     }
                     let name = JString::from(name);
-                    Ok(Some(env.get_string(&name)?.into()))
+                    let display_name: String = env.get_string(&name)?.into();
+                    Ok(Some(display_name))
                 })()
                 .ok()
                 .flatten();
