@@ -37,10 +37,35 @@ iOS development and signing require macOS, full Xcode, CocoaPods, and Rust's
 iOS targets:
 
 ```bash
+rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+brew install cocoapods
 npm ci
 npm run mobile:ios:init
+```
+
+### Install on a physical iPhone via Xcode (macOS)
+
+1. Connect your iPhone to your Mac via USB (and trust the computer on the iPhone).
+2. On the iPhone, enable **Settings -> Privacy & Security -> Developer Mode** (restart if prompted).
+3. Open the generated Xcode project (or launch it via Tauri):
+   ```bash
+   open src-tauri/gen/apple/fwoosh.xcodeproj
+   # or build & run directly from the CLI:
+   # npm run mobile:ios:dev
+   ```
+4. In Xcode, select the **fwoosh_iOS** target -> **Signing & Capabilities**:
+   - Check **Automatically manage signing** and pick your **Team** (a free Apple ID personal team works for 7-day dev installs; a paid Apple Developer account signs for 1 year).
+   - If Xcode says `com.aramo.fwoosh` is unavailable for your team, change the **Bundle Identifier** to a unique value (e.g. `com.<yourname>.fwoosh`).
+   - If keychain storage reports `-34018` (`errSecMissingEntitlement`), click **+ Capability** and add **Keychain Sharing**.
+5. Pick your connected iPhone from Xcode's device selector at the top and press **Run** (`Cmd+R`).
+6. First launch with a free Apple ID: on the iPhone, open **Settings -> General -> VPN & Device Management**, tap your developer certificate, and tap **Trust**, then open Fwoosh.
+
+To build from the CLI instead of Xcode's Run button:
+
+```bash
 npm run mobile:ios:dev
-# or: npm run mobile:ios:build
+# or release archive:
+npm run mobile:ios:build
 ```
 
 The generated native projects live under `src-tauri/gen/`. They are generated

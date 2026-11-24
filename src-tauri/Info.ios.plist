@@ -4,5 +4,7 @@
 <dict>
   <key>NSCameraUsageDescription</key>
   <string>Scan Fwoosh pairing QR codes.</string>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Transfer encrypted files directly with your paired Fwoosh devices on the local network.</string>
 </dict>
 </plist>
